@@ -1133,6 +1133,19 @@ pub async fn list_traces(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    // 拉一份凭据快照：既用于把 ?group= 转成 cred_ids 白名单，
+    // 也给响应附加 email 字段，避免重复查询。
+    let snapshot = state.service.get_all_credentials();
+    let group_filter = parse_group_filter(&params);
+    let credential_ids: Option<Vec<u64>> = group_filter.as_deref().map(|g| {
+        snapshot
+            .credentials
+            .iter()
+            .filter(|c| c.groups.iter().any(|cg| cg == g))
+            .map(|c| c.id)
+            .collect()
+    });
+
     let query = TraceQuery {
         status: params.get("status").filter(|s| !s.is_empty()).cloned(),
         error_type: params.get("errorType").filter(|s| !s.is_empty()).cloned(),
@@ -1144,6 +1157,7 @@ pub async fn list_traces(
             .get("failedAttemptCredentialId")
             .and_then(|s| s.parse::<u64>().ok()),
         model: params.get("model").filter(|s| !s.is_empty()).cloned(),
+        credential_ids,
         only_failed: params
             .get("onlyFailed")
             .map(|s| s == "true" || s == "1")
@@ -1161,7 +1175,6 @@ pub async fn list_traces(
     let (records, total) = state.trace_store.query_paged(&query);
 
     // 附加 credential email 方便前端展示（与 stats_by_credential 一致）
-    let snapshot = state.service.get_all_credentials();
     let email_map: HashMap<u64, Option<String>> = snapshot
         .credentials
         .iter()
