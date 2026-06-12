@@ -39,6 +39,7 @@ import { useTraces } from '@/hooks/use-traces'
 import { useClientKeys } from '@/hooks/use-client-keys'
 import { useGroupOptions } from '@/hooks/use-groups'
 import {
+  useCredentials,
   useLogGovernanceConfig,
   useSetLogGovernanceConfig,
 } from '@/hooks/use-credentials'
@@ -229,7 +230,7 @@ function TokenCell({ rec }: { rec: TraceRecord }) {
   )
 }
 
-function TraceRow({ rec }: { rec: TraceRecord }) {
+function TraceRow({ rec, groups }: { rec: TraceRecord; groups: string[] }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
   return (
@@ -262,7 +263,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
         <td className="py-2.5 pr-3">
           <StatusBadge status={rec.finalStatus} />
         </td>
-        <TraceCredentialCell rec={rec} />
+        <TraceCredentialCell rec={rec} groups={groups} />
         <td className="py-2.5 pr-3 text-[12px] tabular-nums">
           <TokenCell rec={rec} />
         </td>
@@ -287,12 +288,22 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
   )
 }
 
-function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
+function TraceCredentialCell({ rec, groups }: { rec: TraceRecord; groups: string[] }) {
   return (
     <td className="py-2.5 pr-3 text-[13px]">
       <span className="inline-block max-w-[220px] truncate align-middle">
         {credLabel(rec.finalCredentialId, rec.finalEmail)}
       </span>
+      {/* 已分组：显示分组 Badge；未分组：留空，不显示标签 */}
+      {groups.length > 0 && (
+        <span className="ml-1.5 inline-flex flex-wrap gap-1 align-middle">
+          {groups.map((g) => (
+            <Badge key={g} variant="outline" className="text-[11px]" title="账号分组">
+              {g}
+            </Badge>
+          ))}
+        </span>
+      )}
     </td>
   )
 }
@@ -490,7 +501,12 @@ export function TraceLogPage() {
   const [page, setPage] = useState(0)
 
   const { data: keysData } = useClientKeys()
+  const { data: credsData } = useCredentials()
   const groupNames = useGroupOptions()
+  // 凭据 id → groups 映射，用于 trace 行展示「凭据归属分组」标签
+  const groupsByCredId = new Map<number, string[]>(
+    (credsData?.credentials ?? []).map((c) => [c.id, c.groups ?? []]),
+  )
   const keyOptions = [
     { value: '', label: '全部 Key' },
     { value: '0', label: 'master' },
@@ -589,7 +605,11 @@ export function TraceLogPage() {
                 </thead>
                 <tbody>
                   {records.map((rec) => (
-                    <TraceRow key={rec.traceId} rec={rec} />
+                    <TraceRow
+                      key={rec.traceId}
+                      rec={rec}
+                      groups={groupsByCredId.get(rec.finalCredentialId) ?? []}
+                    />
                   ))}
                 </tbody>
               </table>

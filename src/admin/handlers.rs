@@ -950,20 +950,29 @@ fn parse_group_filter(params: &HashMap<String, String>) -> Option<String> {
 /// 把 group 名转换为该分组下所有凭据 id 的白名单，给 UsageAggregator 用。
 /// 返回 None 表示未指定分组（不过滤）；返回 Some(空集) 也是合法值——意味着该分组下没有凭据，
 /// 所有 query 都会自然返回空结果。
+///
+/// 特殊哨兵 `__none__` 代表"未分组"：返回 groups 字段为空的凭据 ID 集合。
 fn group_to_cred_ids(
     state: &AdminState,
     group: Option<&str>,
 ) -> Option<std::collections::HashSet<u64>> {
     let g = group?;
     let snapshot = state.service.get_all_credentials();
-    Some(
+    Some(if g == "__none__" {
+        snapshot
+            .credentials
+            .iter()
+            .filter(|c| c.groups.is_empty())
+            .map(|c| c.id)
+            .collect()
+    } else {
         snapshot
             .credentials
             .iter()
             .filter(|c| c.groups.iter().any(|cg| cg == g))
             .map(|c| c.id)
-            .collect(),
-    )
+            .collect()
+    })
 }
 
 fn parse_granularity(params: &HashMap<String, String>) -> Result<StatsGranularity, String> {
@@ -1100,12 +1109,21 @@ pub async fn stats_by_credential(
         .map(|c| (c.id, c.email.clone()))
         .collect();
     let cred_ids: Option<std::collections::HashSet<u64>> = group.as_deref().map(|g| {
-        snapshot
-            .credentials
-            .iter()
-            .filter(|c| c.groups.iter().any(|cg| cg == g))
-            .map(|c| c.id)
-            .collect()
+        if g == "__none__" {
+            snapshot
+                .credentials
+                .iter()
+                .filter(|c| c.groups.is_empty())
+                .map(|c| c.id)
+                .collect()
+        } else {
+            snapshot
+                .credentials
+                .iter()
+                .filter(|c| c.groups.iter().any(|cg| cg == g))
+                .map(|c| c.id)
+                .collect()
+        }
     });
     let data = state.usage_aggregator.query_by_credential(window, key_id, cred_ids.as_ref());
     let enriched: Vec<serde_json::Value> = data

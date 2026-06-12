@@ -299,7 +299,8 @@ function KeyFilterCard({
             <div className="text-sm font-medium">统计筛选</div>
             <div className="truncate text-[12px] text-muted-foreground">
               {selectedLabel}
-              {groupFilter !== 'all' && ` · 分组：${groupFilter}`}
+              {groupFilter !== 'all' &&
+                ` · 分组：${groupFilter === '__none__' ? '未分组' : groupFilter}`}
             </div>
           </div>
           <div className="flex flex-col gap-2 sm:flex-row">
@@ -325,6 +326,7 @@ function KeyFilterCard({
               </SelectTrigger>
               <SelectContent align="end">
                 <SelectItem value="all">全部分组</SelectItem>
+                <SelectItem value="__none__">未分组</SelectItem>
                 {groupOptions.map((g) => (
                   <SelectItem key={g} value={g}>
                     {g}
