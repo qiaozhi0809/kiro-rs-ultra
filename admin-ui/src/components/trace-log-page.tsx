@@ -496,9 +496,11 @@ export function TraceLogPage() {
     { value: '0', label: 'master' },
     ...(keysData?.keys ?? []).map((k) => ({ value: String(k.id), label: k.name })),
   ]
-  // 分组下拉选项：全部 + 注册表里所有分组
+  // 分组下拉选项：全部 + 未分组 + 注册表里所有分组
+  // 与凭据列表筛选保持一致：__none__ 哨兵代表"未分组凭据"
   const groupOptions = [
     { value: '', label: '全部分组' },
+    { value: '__none__', label: '未分组' },
     ...groupNames.map((g) => ({ value: g, label: g })),
   ]
 

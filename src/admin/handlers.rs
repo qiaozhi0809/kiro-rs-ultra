@@ -1137,13 +1137,24 @@ pub async fn list_traces(
     // 也给响应附加 email 字段，避免重复查询。
     let snapshot = state.service.get_all_credentials();
     let group_filter = parse_group_filter(&params);
+    // group=__none__ 是前端约定的"未分组"哨兵：返回 groups 字段为空的凭据 ID 集合。
+    // 普通 group 名 → 返回 groups 包含该名的凭据 ID 集合。
     let credential_ids: Option<Vec<u64>> = group_filter.as_deref().map(|g| {
-        snapshot
-            .credentials
-            .iter()
-            .filter(|c| c.groups.iter().any(|cg| cg == g))
-            .map(|c| c.id)
-            .collect()
+        if g == "__none__" {
+            snapshot
+                .credentials
+                .iter()
+                .filter(|c| c.groups.is_empty())
+                .map(|c| c.id)
+                .collect()
+        } else {
+            snapshot
+                .credentials
+                .iter()
+                .filter(|c| c.groups.iter().any(|cg| cg == g))
+                .map(|c| c.id)
+                .collect()
+        }
     });
 
     let query = TraceQuery {
