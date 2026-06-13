@@ -18,6 +18,7 @@ use crate::model::config::Config;
 
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
+use super::trace_db::{TraceAttempt, TraceKeySource, TraceRecord};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
     AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
@@ -746,15 +747,74 @@ impl AdminService {
 
     /// 测活：用指定凭据查询上游使用额度，验证 token 有效性与账号是否可用。
     ///
-    /// 和余额查询走同一条上游路径，但返回结构化测活结果（不走 balance 缓存，强制实时查询）。
+    /// 和余额查询走同一条上游路径，但强制实时查询（不走 balance 缓存），
+    /// 且测活结果写入 traces.db，在请求日志页可见。
+    ///
     /// 与"对话真正可用"之间仍有差距（余额查询不校验 profileArn 与对话权限），
     /// 但比凭据启用状态更可靠——能发现 token 失效、账号被封、region 错误等常见问题。
     pub async fn test_conversation(&self, id: u64) -> Result<(), AdminServiceError> {
-        self.token_manager
-            .get_usage_limits_for(id)
-            .await
-            .map_err(|e| self.classify_balance_error(e, id))?;
-        Ok(())
+        let start = std::time::Instant::now();
+        let result = self.token_manager.get_usage_limits_for(id).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let ts = Utc::now().to_rfc3339();
+
+        // 写入 traces.db，请求日志页可见
+        if let Some(trace_store) = &self.trace_store {
+            let (status, error_msg, error_type, outcome_str) = match &result {
+                Ok(_) => ("success".to_string(), None, None, "success"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    let etype: &str = if msg.contains("403") || msg.contains("权限不足")
+                        || msg.contains("凭证已过期")
+                    {
+                        "auth_failed"
+                    } else if msg.contains("429") || msg.contains("限流")
+                        || msg.contains("暂时被封")
+                    {
+                        "account_throttled"
+                    } else if msg.contains("余额") || msg.contains("超出")
+                    {
+                        "quota_exhausted"
+                    } else {
+                        "unknown"
+                    };
+                    ("error".to_string(), Some(msg.clone()), Some(etype.to_string()), etype)
+                }
+            };
+            let trace = TraceRecord {
+                trace_id: uuid::Uuid::new_v4().to_string(),
+                ts,
+                key_id: 0,
+                key_source: TraceKeySource::MasterApiKey,
+                model: "测活".to_string(),
+                is_stream: false,
+                final_status: status,
+                final_credential_id: id,
+                error_type,
+                error_message: error_msg,
+                total_attempts: 1,
+                duration_ms,
+                interrupted_after_bytes: None,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                credits: 0.0,
+                first_token_ms: None,
+                attempts: vec![TraceAttempt {
+                    attempt: 0,
+                    credential_id: id,
+                    endpoint: "test".to_string(),
+                    http_status: None,
+                    outcome: outcome_str.to_string(),
+                    error_snippet: None,
+                    duration_ms,
+                }],
+            };
+            trace_store.insert(&trace);
+        }
+
+        result.map(|_| Ok(())).map_err(|e| self.classify_balance_error(e, id))?
     }
 
     /// 批量刷新所有非禁用凭据的余额（用于后台调度）

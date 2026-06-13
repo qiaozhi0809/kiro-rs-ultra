@@ -733,7 +733,7 @@ export function CredentialCard({
                 <RefreshCw
                   className={`h-3.5 w-3.5 ${forceRefresh.isPending ? "animate-spin" : ""}`}
                 />
-                <span className="hidden sm:inline">刷新 Token</span>
+                <span className="hidden sm:inline">Token</span>
               </Button>
               <Button
                 size="sm"
@@ -746,20 +746,7 @@ export function CredentialCard({
                 <RefreshCw
                   className={`h-3.5 w-3.5 ${loadingBalance ? "animate-spin" : ""}`}
                 />
-                <span className="hidden sm:inline">刷新余额</span>
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
-                onClick={handleTestConversation}
-                disabled={testCred.isPending || credential.disabled}
-                title={credential.disabled ? "已禁用" : "对话测活（真实发一条请求）"}
-              >
-                <Zap
-                  className={`h-3.5 w-3.5 ${testCred.isPending ? "animate-spin" : ""}`}
-                />
-                <span className="hidden sm:inline">测活</span>
+                <span className="hidden sm:inline">余额</span>
               </Button>
             </div>
 
@@ -780,6 +767,18 @@ export function CredentialCard({
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      handleTestConversation();
+                    }}
+                    disabled={testCred.isPending || credential.disabled}
+                    title={credential.disabled ? "已禁用" : "测活（实时查询上游）"}
+                  >
+                    <Zap className={testCred.isPending ? "animate-spin" : ""} />
+                    测活
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
                   <DropdownMenuItem
                     onSelect={(e) => {
                       e.preventDefault();
