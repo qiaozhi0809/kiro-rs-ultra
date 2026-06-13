@@ -697,25 +697,25 @@ export function CredentialCard({
           </div>
 
           {/* 操作区 */}
-          <div className="mt-auto flex flex-col gap-2 border-t border-border/50 pt-3 min-[420px]:flex-row min-[420px]:items-center min-[420px]:justify-between">
-            <div className="grid grid-cols-3 gap-1 min-[420px]:flex min-[420px]:items-center">
+          <div className="mt-auto flex flex-col gap-2 border-t border-border/50 pt-3 min-[420px]:flex-row min-[420px]:items-center">
+            <div className="grid grid-cols-4 gap-1 min-[420px]:flex min-[420px]:flex-1 min-[420px]:min-w-0 min-[420px]:items-center">
               <Button
                 ref={setActivatorNodeRef}
                 size="icon"
                 variant="ghost"
                 data-no-rect-select
-                className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9"
+                className="w-full cursor-grab touch-none active:cursor-grabbing min-[420px]:w-9 min-[420px]:shrink-0"
                 title="拖拽调整优先级"
                 {...attributes}
                 {...listeners}
               >
                 <GripVertical className="h-4 w-4 text-muted-foreground" />
               </Button>
-              <span className="mx-1 hidden h-5 w-px bg-border/70 min-[420px]:inline-block" />
+              <span className="mx-1 hidden h-5 w-px bg-border/70 min-[420px]:inline-block min-[420px]:shrink-0" />
               <Button
                 size="sm"
                 variant="ghost"
-                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
+                className="w-full px-2 min-[420px]:flex-1 min-[420px]:px-2"
                 onClick={handleForceRefresh}
                 disabled={
                   forceRefresh.isPending ||
@@ -738,7 +738,7 @@ export function CredentialCard({
               <Button
                 size="sm"
                 variant="ghost"
-                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
+                className="w-full px-2 min-[420px]:flex-1 min-[420px]:px-2"
                 onClick={onRefreshBalance}
                 disabled={loadingBalance || credential.disabled}
                 title={credential.disabled ? "已禁用" : "刷新余额"}
@@ -748,9 +748,22 @@ export function CredentialCard({
                 />
                 <span className="hidden sm:inline">余额</span>
               </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="w-full px-2 min-[420px]:flex-1 min-[420px]:px-2"
+                onClick={handleTestConversation}
+                disabled={testCred.isPending || credential.disabled}
+                title={credential.disabled ? "已禁用" : "测活（实时查询上游）"}
+              >
+                <Zap
+                  className={`h-3.5 w-3.5 ${testCred.isPending ? "animate-spin" : ""}`}
+                />
+                <span className="hidden sm:inline">测活</span>
+              </Button>
             </div>
 
-            <div className="grid grid-cols-[1fr_auto] gap-1 min-[420px]:flex min-[420px]:items-center">
+            <div className="grid grid-cols-[1fr_auto] gap-1 min-[420px]:flex min-[420px]:shrink-0 min-[420px]:items-center">
               <Button
                 size="sm"
                 variant="outline"
@@ -767,18 +780,6 @@ export function CredentialCard({
                   </Button>
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end">
-                  <DropdownMenuItem
-                    onSelect={(e) => {
-                      e.preventDefault();
-                      handleTestConversation();
-                    }}
-                    disabled={testCred.isPending || credential.disabled}
-                    title={credential.disabled ? "已禁用" : "测活（实时查询上游）"}
-                  >
-                    <Zap className={testCred.isPending ? "animate-spin" : ""} />
-                    测活
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
                   <DropdownMenuItem
                     onSelect={(e) => {
                       e.preventDefault();
