@@ -2522,6 +2522,81 @@ impl MultiTokenManager {
         get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
     }
 
+    /// 对话测活：对指定凭据发一条真实的 `generateAssistantResponse` 请求。
+    ///
+    /// 与余额查询走的是完全不同的 API 端点——余额查询可能通过（如账号被临时封禁
+    /// 时 getUsageLimits 仍返回 200），但对话接口会直接返回 403。
+    /// 这里注入真实的 profileArn（与对话路径完全一致），确保测活结果与真实使用场景吻合。
+    pub async fn test_conversation_for(&self, id: u64) -> anyhow::Result<()> {
+        let (token, credentials) = self.prepare_request_token(id).await?;
+        let region = credentials.effective_api_region(&self.config);
+        let host = format!("q.{}.amazonaws.com", region);
+        let url = format!("https://{}/generateAssistantResponse", host);
+        let machine_id = machine_id::generate_from_credentials(&credentials, &self.config);
+        let kiro_version = &self.config.kiro_version;
+
+        // 构建最小对话请求体，在根对象注入 profileArn（与 IDE endpoint 完全一致）
+        let mut body = serde_json::json!({
+            "conversationState": {
+                "chatTriggerType": "MANUAL",
+                "conversationId": uuid::Uuid::new_v4().to_string(),
+                "currentMessage": {
+                    "userInputMessage": {
+                        "content": "ping",
+                        "modelId": "claude-sonnet-4.5",
+                        "origin": "AI_EDITOR",
+                    }
+                },
+                "history": [],
+            }
+        });
+        // streaming_profile_arn() 与正常对话路径一致：
+        // - 真实 ARN → 注入；占位符 ARN → 返回 None 不注入（避免 403）
+        if let Some(arn) = credentials.streaming_profile_arn() {
+            body["profileArn"] = serde_json::Value::String(arn);
+        }
+
+        let user_agent = format!(
+            "aws-sdk-js/1.0.34 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererstreaming#1.0.34 m/E KiroIDE-{}-{}",
+            self.config.system_version, self.config.node_version, kiro_version, machine_id,
+        );
+        let amz_user_agent = format!("aws-sdk-js/1.0.34 KiroIDE-{}-{}", kiro_version, machine_id);
+
+        let global_proxy = self.proxy.lock().clone();
+        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        let client = build_client(effective_proxy.as_ref(), 30, self.config.tls_backend)?;
+
+        let mut request = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("x-amzn-codewhisperer-optout", "true")
+            .header("x-amzn-kiro-agent-mode", "vibe")
+            .header("x-amz-user-agent", &amz_user_agent)
+            .header("user-agent", &user_agent)
+            .header("host", &host)
+            .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+            .header("amz-sdk-request", "attempt=1; max=1")
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Connection", "close");
+
+        // 注入真实的 profileArn（与实际对话路径完全一致）
+        // 这是之前失败的根因：缺 profileArn → 400，带占位 ARN → 403
+        if let Some(ref arn) = credentials.profile_arn {
+            request = request.header("x-amzn-kiro-profile-arn", arn);
+        }
+        if credentials.is_api_key_credential() {
+            request = request.header("tokentype", "API_KEY");
+        }
+
+        let response = request.body(body.to_string()).send().await?;
+        let status = response.status();
+        if !status.is_success() {
+            let err_body = response.text().await.unwrap_or_default();
+            bail!("HTTP {} {}", status, err_body);
+        }
+        Ok(())
+    }
+
     /// 设置用户偏好（开启/关闭超额）— Admin API
     ///
     /// 与 `get_usage_limits_for` 类似的 token 准备流程，最后调用上游

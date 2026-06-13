@@ -745,16 +745,18 @@ impl AdminService {
         Ok(AvailableModelsResponse { id, models })
     }
 
-    /// 测活：用指定凭据查询上游使用额度，验证 token 有效性与账号是否可用。
+    /// 对话测活：对指定凭据发一条真实的 `generateAssistantResponse` 请求。
     ///
-    /// 和余额查询走同一条上游路径，但强制实时查询（不走 balance 缓存），
-    /// 且测活结果写入 traces.db，在请求日志页可见。
+    /// 与余额查询（get_usage_limits_for）走完全不同的 API 端点——之前出现过：
+    /// - 余额查询返回 200（凭据活着）
+    /// - 但对话请求 403（账号被 AWS 临时封禁，或 profileArn 权限不足）
     ///
-    /// 与"对话真正可用"之间仍有差距（余额查询不校验 profileArn 与对话权限），
-    /// 但比凭据启用状态更可靠——能发现 token 失效、账号被封、region 错误等常见问题。
+    /// 这里注入真实 profileArn，测活结果与真实使用场景完全一致。
+    /// 失败时根据错误内容分类写入 traces.db（auth_failed / account_throttled 等），
+    /// 请求日志页可直接看到。
     pub async fn test_conversation(&self, id: u64) -> Result<(), AdminServiceError> {
         let start = std::time::Instant::now();
-        let result = self.token_manager.get_usage_limits_for(id).await;
+        let result = self.token_manager.test_conversation_for(id).await;
         let duration_ms = start.elapsed().as_millis() as u64;
         let ts = Utc::now().to_rfc3339();
 
