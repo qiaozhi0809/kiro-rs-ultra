@@ -2398,20 +2398,37 @@ impl MultiTokenManager {
             }
         }
 
-        // 回填邮箱：仅在凭据尚无邮箱、且上游返回了邮箱时写入
+        // 回填邮箱：当凭据尚无邮箱，或现有 email 不是合法邮箱（如 KAM
+        // durable 导出里的 "mrdev47" 这种本地昵称）时，用上游 userInfo.email 覆盖
         if let Some(email) = usage_limits.email() {
             let changed = {
                 let mut entries = self.entries.lock();
                 if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                    let is_empty = entry
+                    let needs_fill = entry
                         .credentials
                         .email
                         .as_deref()
-                        .map(|s| s.is_empty())
+                        .map(|s| {
+                            // 轻量校验：含 @ 且 @ 后有 . 才视为合法邮箱
+                            !s.contains('@')
+                                || !s
+                                    .split_once('@')
+                                    .map(|(_, domain)| domain.contains('.'))
+                                    .unwrap_or(false)
+                        })
                         .unwrap_or(true);
-                    if is_empty {
+                    if needs_fill {
+                        let prev = entry.credentials.email.clone();
                         entry.credentials.email = Some(email.to_string());
-                        tracing::info!("凭据 #{} 邮箱已回填: {}", id, email);
+                        match prev.as_deref() {
+                            Some(old) if !old.is_empty() => tracing::info!(
+                                "凭据 #{} 邮箱已覆盖: {} -> {}",
+                                id,
+                                old,
+                                email
+                            ),
+                            _ => tracing::info!("凭据 #{} 邮箱已回填: {}", id, email),
+                        }
                         true
                     } else {
                         false
