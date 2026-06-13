@@ -252,6 +252,14 @@ function TraceRow({ rec, groups }: { rec: TraceRecord; groups: string[] }) {
         <td className="py-2.5 pr-3 text-[13px]">
           <span className="inline-block max-w-[220px] truncate align-middle">{rec.model}</span>
           {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
+          {rec.attempts[0]?.endpoint === "test" && (
+            <Badge
+              variant="outline"
+              className="ml-1.5 border-amber-500/40 text-amber-600 dark:text-amber-400"
+            >
+              测活
+            </Badge>
+          )}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
           {rec.keyId === 0 ? (

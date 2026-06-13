@@ -33,6 +33,8 @@ use crate::model::config::Config;
 /// 测活产出 — 写入 traces.db 时复用真实对话路径的 token / credit 字段
 #[derive(Debug, Clone, Default)]
 pub struct TestActiveOutcome {
+    /// 真实使用的模型 ID（写入 trace.model，UI 列显示这个值）
+    pub model_id: String,
     /// 输入 tokens：来自 contextUsageEvent + 模型窗口换算（与正常对话同口径）
     pub input_tokens: i32,
     /// 输出 tokens：基于上游返回文本估算（与正常对话同口径）
@@ -41,6 +43,8 @@ pub struct TestActiveOutcome {
     pub credits: f64,
     /// 上游下发的 contextUsagePercentage（用于排查，可选）
     pub context_usage_percentage: Option<f64>,
+    /// 第一个 AssistantResponse 文本字节出现的耗时（毫秒）
+    pub first_token_ms: Option<u64>,
 }
 
 /// 检查 Token 是否在指定时间内过期
@@ -2631,6 +2635,7 @@ impl MultiTokenManager {
             request = request.header("tokentype", "API_KEY");
         }
 
+        let request_started_at = Instant::now();
         let response = request.body(body.to_string()).send().await?;
         let status = response.status();
         if !status.is_success() {
@@ -2648,12 +2653,16 @@ impl MultiTokenManager {
         let mut text_content = String::new();
         let mut credits = 0.0_f64;
         let mut context_usage_percentage: Option<f64> = None;
+        let mut first_token_at: Option<Instant> = None;
         for result in decoder.decode_iter() {
             match result {
                 Ok(frame) => {
                     if let Ok(event) = KiroStreamEvent::from_frame(frame) {
                         match event {
                             KiroStreamEvent::AssistantResponse(resp) => {
+                                if first_token_at.is_none() && !resp.content.is_empty() {
+                                    first_token_at = Some(Instant::now());
+                                }
                                 text_content.push_str(&resp.content);
                             }
                             KiroStreamEvent::ContextUsage(ctx) => {
@@ -2685,12 +2694,16 @@ impl MultiTokenManager {
                 "text": text_content,
             })])
         };
+        let first_token_ms = first_token_at
+            .map(|t| t.duration_since(request_started_at).as_millis() as u64);
 
         Ok(TestActiveOutcome {
+            model_id: test_model.to_string(),
             input_tokens,
             output_tokens,
             credits,
             context_usage_percentage,
+            first_token_ms,
         })
     }
 

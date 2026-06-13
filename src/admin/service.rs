@@ -794,20 +794,27 @@ impl AdminService {
             let outcome_ref = result.as_ref().ok();
             if let Some(outcome) = outcome_ref {
                 tracing::debug!(
-                    "测活成功 #{}: input_tokens={} output_tokens={} credits={:.6} ctx_pct={:?}",
+                    "测活成功 #{}: model={} input_tokens={} output_tokens={} credits={:.6} first_token_ms={:?} ctx_pct={:?}",
                     id,
+                    outcome.model_id,
                     outcome.input_tokens,
                     outcome.output_tokens,
                     outcome.credits,
+                    outcome.first_token_ms,
                     outcome.context_usage_percentage,
                 );
             }
+            // 真实模型名（成功路径来自 outcome；失败路径用默认值，UI 仍可通过
+            // attempts[0].endpoint == "test" 区分这是测活记录）
+            let trace_model = outcome_ref
+                .map(|o| o.model_id.clone())
+                .unwrap_or_else(|| "claude-sonnet-4.5".to_string());
             let trace = TraceRecord {
                 trace_id: uuid::Uuid::new_v4().to_string(),
                 ts,
                 key_id: 0,
                 key_source: TraceKeySource::MasterApiKey,
-                model: "测活".to_string(),
+                model: trace_model,
                 is_stream: false,
                 final_status: status,
                 final_credential_id: id,
@@ -821,7 +828,7 @@ impl AdminService {
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
                 credits: outcome_ref.map(|o| o.credits).unwrap_or(0.0),
-                first_token_ms: None,
+                first_token_ms: outcome_ref.and_then(|o| o.first_token_ms),
                 attempts: vec![TraceAttempt {
                     attempt: 0,
                     credential_id: id,
