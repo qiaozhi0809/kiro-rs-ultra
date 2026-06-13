@@ -401,7 +401,13 @@ pub(crate) async fn get_usage_limits(
 
         let status = response.status();
         if status.is_success() {
-            let data: UsageLimitsResponse = response.json().await?;
+            let raw_body = response.text().await?;
+            tracing::debug!(
+                "getUsageLimits raw body (region={}): {}",
+                region,
+                raw_body
+            );
+            let data: UsageLimitsResponse = serde_json::from_str(&raw_body)?;
             return Ok(data);
         }
 

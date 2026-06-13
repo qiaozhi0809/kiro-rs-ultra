@@ -128,11 +128,19 @@ pub async fn clear_throttle(
 
 /// GET /api/admin/credentials/:id/balance
 /// 获取指定凭据的余额
+///
+/// 查询参数：
+/// - `force=true` / `force=1` 跳过 5 分钟内存缓存，直接拉上游（用户主动点「刷新余额」按钮的场景）
 pub async fn get_credential_balance(
     State(state): State<AdminState>,
     Path(id): Path<u64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    match state.service.get_balance(id).await {
+    let force = params
+        .get("force")
+        .map(|v| matches!(v.as_str(), "true" | "1"))
+        .unwrap_or(false);
+    match state.service.get_balance(id, force).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

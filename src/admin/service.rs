@@ -651,9 +651,16 @@ impl AdminService {
     }
 
     /// 获取凭据余额（带缓存）
-    pub async fn get_balance(&self, id: u64) -> Result<BalanceResponse, AdminServiceError> {
-        // 先查缓存
-        {
+    ///
+    /// `force_refresh=true` 时跳过缓存直接拉上游，用于用户主动点「刷新余额」按钮的场景；
+    /// 后台调度器走 `refresh_all_balances` → `fetch_balance` 直拉，不经过这里。
+    pub async fn get_balance(
+        &self,
+        id: u64,
+        force_refresh: bool,
+    ) -> Result<BalanceResponse, AdminServiceError> {
+        // 非强制刷新时优先查缓存
+        if !force_refresh {
             let cache = self.balance_cache.lock();
             if let Some(cached) = cache.get(&id) {
                 let now = Utc::now().timestamp() as f64;
@@ -664,7 +671,7 @@ impl AdminService {
             }
         }
 
-        // 缓存未命中或已过期，从上游获取
+        // 缓存未命中、已过期，或调用方强制刷新 → 从上游拉取
         let balance = self.fetch_balance(id).await?;
 
         // 更新缓存
@@ -1045,7 +1052,7 @@ impl AdminService {
 
         // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
         // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.get_balance(credential_id).await {
+        if let Err(e) = self.get_balance(credential_id, false).await {
             tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
         }
 
@@ -2560,7 +2567,7 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
-        if let Err(e) = self.get_balance(credential_id).await {
+        if let Err(e) = self.get_balance(credential_id, false).await {
             tracing::warn!("Social 登录后刷新余额失败（不影响登录）: {}", e);
         }
 
@@ -2779,7 +2786,7 @@ impl AdminService {
                     .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
                 // 主动刷新余额（含订阅等级 / 邮箱）并写入缓存，登录后立即可见
-                if let Err(e) = self.get_balance(credential_id).await {
+                if let Err(e) = self.get_balance(credential_id, false).await {
                     tracing::warn!("IdC 登录后刷新余额失败（不影响登录）: {}", e);
                 }
 

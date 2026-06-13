@@ -31,3 +31,8 @@
 .ace-tool/
 .codegraph/
 .claude/
+
+# Playwright artifacts (从测试 / 截图脚本生成)
+.playwright-mcp/
+credential-cards-current.png
+wintansunintan-card.png

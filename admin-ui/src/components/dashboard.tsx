@@ -590,7 +590,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         return n;
       });
       try {
-        const balance = await getCredentialBalance(id);
+        const balance = await getCredentialBalance(id, true);
         s++;
         setBalanceMap((prev) => {
           const n = new Map(prev);
@@ -620,7 +620,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return n;
     });
     try {
-      const balance = await getCredentialBalance(id);
+      const balance = await getCredentialBalance(id, true);
       setBalanceMap((prev) => {
         const n = new Map(prev);
         n.set(id, balance);
@@ -664,7 +664,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         return n;
       });
       try {
-        const balance = await getCredentialBalance(id);
+        const balance = await getCredentialBalance(id, true);
         successCount++;
         setVerifyResults((prev) => {
           const n = new Map(prev);
@@ -799,7 +799,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         return n;
       });
       try {
-        const balance = await getCredentialBalance(id);
+        const balance = await getCredentialBalance(id, true);
         s++;
         setBalanceMap((prev) => {
           const n = new Map(prev);

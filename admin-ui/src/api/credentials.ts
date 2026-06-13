@@ -145,8 +145,17 @@ export async function clearThrottle(id: number): Promise<SuccessResponse> {
 }
 
 // 获取凭据余额
-export async function getCredentialBalance(id: number): Promise<BalanceResponse> {
-  const { data } = await api.get<BalanceResponse>(`/credentials/${id}/balance`)
+//
+// `force=true` 时附带 ?force=true 查询参数，让后端跳过 5 分钟内存缓存直接拉上游。
+// 用于用户主动点「刷新余额」/ 验活 / 导入后等期望立即拿到真实状态的场景。
+export async function getCredentialBalance(
+  id: number,
+  force = false,
+): Promise<BalanceResponse> {
+  const url = force
+    ? `/credentials/${id}/balance?force=true`
+    : `/credentials/${id}/balance`
+  const { data } = await api.get<BalanceResponse>(url)
   return data
 }
 
