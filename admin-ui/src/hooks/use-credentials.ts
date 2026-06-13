@@ -20,6 +20,7 @@ import {
   setLogGovernanceConfig,
   resetSuccessCount,
   resetAllSuccessCount,
+  testCredential,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
 
@@ -148,6 +149,18 @@ export function useResetAllSuccessCount() {
   return useMutation({
     mutationFn: () => resetAllSuccessCount(),
     onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+/** 对话测活：对指定凭据发一次最小对话请求，验证能否真正对话 */
+export function useTestCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => testCredential(id),
+    onSuccess: () => {
+      // 测活成功可能更新了凭据状态（如首次成功设 successCount），刷缓存
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })

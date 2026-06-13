@@ -744,6 +744,19 @@ impl AdminService {
         Ok(AvailableModelsResponse { id, models })
     }
 
+    /// 测活：用指定凭据查询上游使用额度，验证 token 有效性与账号是否可用。
+    ///
+    /// 和余额查询走同一条上游路径，但返回结构化测活结果（不走 balance 缓存，强制实时查询）。
+    /// 与"对话真正可用"之间仍有差距（余额查询不校验 profileArn 与对话权限），
+    /// 但比凭据启用状态更可靠——能发现 token 失效、账号被封、region 错误等常见问题。
+    pub async fn test_conversation(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .get_usage_limits_for(id)
+            .await
+            .map_err(|e| self.classify_balance_error(e, id))?;
+        Ok(())
+    }
+
     /// 批量刷新所有非禁用凭据的余额（用于后台调度）
     ///
     /// 串行执行以避免对上游产生瞬时高并发，每次成功的查询都会更新内存缓存

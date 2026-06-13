@@ -72,9 +72,40 @@ interface VerificationResult {
 
 
 // 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
+/// 把 durable credentials（snake_case 平铺）归一化为 camelCase。
+/// 兼容两种导出格式：
+/// - KAM（camelCase）：直接返回
+/// - kiro-durable（snake_case）：映射到 camelCase 再返回
+/// 两种格式都保留原字段不动，只是**追加** camelCase 版，
+/// 这样 normalizeKamAccount 下游逻辑只认 camelCase。
+function normalizeSnakeCase(obj: Record<string, unknown>): Record<string, unknown> {
+  const need = (snake: string, camel: string) =>
+    typeof obj[snake] === 'string' && typeof obj[camel] !== 'string'
+  const pick = (snake: string, camel: string) => {
+    if (need(snake, camel)) (obj as Record<string, unknown>)[camel] = obj[snake]
+  }
+  pick('refresh_token', 'refreshToken')
+  pick('client_id', 'clientId')
+  pick('client_secret', 'clientSecret')
+  pick('access_token', 'accessToken')
+  pick('auth_method', 'authMethod')
+  pick('profile_arn', 'profileArn')
+  // expires_at 可以是字符串也可以是数字，都要兼容
+  if (typeof obj['expires_at'] !== 'undefined' && typeof obj['expiresAt'] === 'undefined') {
+    obj['expiresAt'] = obj['expires_at']
+  }
+  return obj
+}
+
 function normalizeKamAccount(item: unknown): unknown {
   if (typeof item !== 'object' || item === null) return item
   const obj = item as Record<string, unknown>
+  // 归一化 snake_case（kiro-durable 导出格式）→ camelCase
+  normalizeSnakeCase(obj)
+  // credentials 子对象也需要归一化（旧版嵌套格式下 snake_case 字段也在此处）
+  if (obj.credentials && typeof obj.credentials === 'object') {
+    normalizeSnakeCase(obj.credentials as Record<string, unknown>)
+  }
   // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
   if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
     const email = typeof obj.email === 'string' ? obj.email : undefined
@@ -153,12 +184,16 @@ function parseKamJson(raw: string): KamAccount[] {
   else if (parsed.credentials && typeof parsed.credentials === 'object') {
     rawItems = [parsed]
   }
-  // 单个账号对象（新格式，refreshToken 平铺）
+  // 单个账号对象（新格式，refreshToken 平铺，camelCase）
   else if (typeof parsed.refreshToken === 'string') {
     rawItems = [parsed]
   }
+  // 单个账号对象（kiro-durable 格式，snake_case）
+  else if (typeof parsed.refresh_token === 'string') {
+    rawItems = [parsed]
+  }
   else {
-    throw new Error('无法识别的 KAM JSON 格式')
+    throw new Error('无法识别的 KAM / durable JSON 格式')
   }
 
   // 兼容新格式：将平铺账号统一转换为 credentials 嵌套结构

@@ -48,6 +48,7 @@ import {
   useForceRefreshToken,
   useResetSuccessCount,
   useClearThrottle,
+  useTestCredential,
 } from "@/hooks/use-credentials";
 import { setCredentialOverage } from "@/api/credentials";
 import { useQueryClient } from "@tanstack/react-query";
@@ -211,6 +212,7 @@ export function CredentialCard({
   const forceRefresh = useForceRefreshToken();
   const resetSuccess = useResetSuccessCount();
   const clearThrottle = useClearThrottle();
+  const testCred = useTestCredential();
   const queryClient = useQueryClient();
 
   // 拖拽排序：手柄触发，整卡随拖动位移
@@ -315,6 +317,12 @@ export function CredentialCard({
     forceRefresh.mutate(credential.id, {
       onSuccess: (res) => toast.success(res.message),
       onError: (err) => toast.error("刷新失败: " + extractErrorMessage(err)),
+    });
+
+  const handleTestConversation = () =>
+    testCred.mutate(credential.id, {
+      onSuccess: () => toast.success("测活成功：该凭据可以正常对话"),
+      onError: (err) => toast.error("测活失败: " + extractErrorMessage(err)),
     });
 
   const handleResetSuccess = () =>
@@ -739,6 +747,19 @@ export function CredentialCard({
                   className={`h-3.5 w-3.5 ${loadingBalance ? "animate-spin" : ""}`}
                 />
                 <span className="hidden sm:inline">刷新余额</span>
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="w-full px-2 min-[420px]:w-auto min-[420px]:px-3"
+                onClick={handleTestConversation}
+                disabled={testCred.isPending || credential.disabled}
+                title={credential.disabled ? "已禁用" : "对话测活（真实发一条请求）"}
+              >
+                <Zap
+                  className={`h-3.5 w-3.5 ${testCred.isPending ? "animate-spin" : ""}`}
+                />
+                <span className="hidden sm:inline">测活</span>
               </Button>
             </div>
 

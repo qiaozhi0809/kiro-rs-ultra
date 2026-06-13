@@ -150,6 +150,20 @@ pub async fn get_credential_models(
     }
 }
 
+/// POST /api/admin/credentials/:id/test
+///
+/// 对话测活：用该凭据发一条最小 `generateAssistantResponse` 请求（content="ping"）。
+/// 返回成功/失败信息，不写入 UsageRecord（不污染统计）。
+pub async fn test_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.test_conversation(id).await {
+        Ok(()) => Json(super::types::SuccessResponse::new("测活成功：该凭据可以正常对话")).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/disable-quota-exceeded
 /// 一键禁用所有"已超额"凭据（remaining ≤ 0 或 usage_percentage ≥ 100）
 pub async fn disable_quota_exceeded(State(state): State<AdminState>) -> impl IntoResponse {

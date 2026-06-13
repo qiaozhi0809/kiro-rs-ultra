@@ -513,3 +513,9 @@ export async function pollIdcRelogin(
   )
   return data
 }
+
+/** 对话测活：对该凭据发一条最小对话请求，验证能否正常对话（不只是余额查询） */
+export async function testCredential(id: number): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/test`)
+  return data
+}
