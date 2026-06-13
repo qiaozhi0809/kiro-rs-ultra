@@ -37,3 +37,6 @@ mod websearch_loop;
 #[allow(unused_imports)]
 pub use router::create_router_with_provider;
 pub use router::create_router_with_shared_key;
+
+// 跨模块复用：测活路径需要按模型计算上下文窗口换算 input_tokens
+pub use converter::get_context_window_size;

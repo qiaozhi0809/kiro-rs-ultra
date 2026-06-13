@@ -22,11 +22,26 @@ use crate::kiro::machine_id;
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::model::events::Event as KiroStreamEvent;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
+use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::model::config::Config;
+
+/// 测活产出 — 写入 traces.db 时复用真实对话路径的 token / credit 字段
+#[derive(Debug, Clone, Default)]
+pub struct TestActiveOutcome {
+    /// 输入 tokens：来自 contextUsageEvent + 模型窗口换算（与正常对话同口径）
+    pub input_tokens: i32,
+    /// 输出 tokens：基于上游返回文本估算（与正常对话同口径）
+    pub output_tokens: i32,
+    /// 上游下发的 credit 计费量（meteringEvent.usage 累加）
+    pub credits: f64,
+    /// 上游下发的 contextUsagePercentage（用于排查，可选）
+    pub context_usage_percentage: Option<f64>,
+}
 
 /// 检查 Token 是否在指定时间内过期
 pub(crate) fn is_token_expiring_within(
@@ -2550,13 +2565,18 @@ impl MultiTokenManager {
     /// 与余额查询走的是完全不同的 API 端点——余额查询可能通过（如账号被临时封禁
     /// 时 getUsageLimits 仍返回 200），但对话接口会直接返回 403。
     /// 这里注入真实的 profileArn（与对话路径完全一致），确保测活结果与真实使用场景吻合。
-    pub async fn test_conversation_for(&self, id: u64) -> anyhow::Result<()> {
+    ///
+    /// 成功时解析流式响应（AWS Event Stream），从 contextUsage / metering 事件
+    /// 提取真实的 input_tokens / output_tokens / credits 写入 trace。
+    pub async fn test_conversation_for(&self, id: u64) -> anyhow::Result<TestActiveOutcome> {
         let (token, credentials) = self.prepare_request_token(id).await?;
         let region = credentials.effective_api_region(&self.config);
         let host = format!("q.{}.amazonaws.com", region);
         let url = format!("https://{}/generateAssistantResponse", host);
         let machine_id = machine_id::generate_from_credentials(&credentials, &self.config);
         let kiro_version = &self.config.kiro_version;
+        // 测活默认请求模型：与 Kiro IDE 的轻量「ping」一致
+        let test_model = "claude-sonnet-4.5";
 
         // 构建最小对话请求体，在根对象注入 profileArn（与 IDE endpoint 完全一致）
         let mut body = serde_json::json!({
@@ -2566,7 +2586,7 @@ impl MultiTokenManager {
                 "currentMessage": {
                     "userInputMessage": {
                         "content": "ping",
-                        "modelId": "claude-sonnet-4.5",
+                        "modelId": test_model,
                         "origin": "AI_EDITOR",
                     }
                 },
@@ -2617,7 +2637,61 @@ impl MultiTokenManager {
             let err_body = response.text().await.unwrap_or_default();
             bail!("HTTP {} {}", status, err_body);
         }
-        Ok(())
+
+        // 流式响应一次性 buffer 解析（测活仅一次 ping，体积小）
+        let body_bytes = response.bytes().await?;
+        let mut decoder = EventStreamDecoder::new();
+        if let Err(e) = decoder.feed(&body_bytes) {
+            tracing::warn!("测活解码缓冲区溢出: {}", e);
+        }
+
+        let mut text_content = String::new();
+        let mut credits = 0.0_f64;
+        let mut context_usage_percentage: Option<f64> = None;
+        for result in decoder.decode_iter() {
+            match result {
+                Ok(frame) => {
+                    if let Ok(event) = KiroStreamEvent::from_frame(frame) {
+                        match event {
+                            KiroStreamEvent::AssistantResponse(resp) => {
+                                text_content.push_str(&resp.content);
+                            }
+                            KiroStreamEvent::ContextUsage(ctx) => {
+                                context_usage_percentage = Some(ctx.context_usage_percentage);
+                            }
+                            KiroStreamEvent::Metering(m) => {
+                                credits += m.usage;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("测活解码事件失败（可忽略）: {}", e);
+                }
+            }
+        }
+
+        // 计算 input/output tokens（与正常对话同口径）
+        let window_size = crate::anthropic::get_context_window_size(test_model);
+        let input_tokens = context_usage_percentage
+            .map(|pct| (pct * (window_size as f64) / 100.0) as i32)
+            .unwrap_or(0);
+        let output_tokens = if text_content.is_empty() {
+            0
+        } else {
+            crate::token::estimate_output_tokens(&[serde_json::json!({
+                "type": "text",
+                "text": text_content,
+            })])
+        };
+
+        Ok(TestActiveOutcome {
+            input_tokens,
+            output_tokens,
+            credits,
+            context_usage_percentage,
+        })
     }
 
     /// 设置用户偏好（开启/关闭超额）— Admin API

@@ -790,6 +790,18 @@ impl AdminService {
                     ("error".to_string(), Some(msg.clone()), Some(etype.to_string()), etype)
                 }
             };
+            // 成功路径：从测活结果中提取真实 token / credit（与正常对话同口径）
+            let outcome_ref = result.as_ref().ok();
+            if let Some(outcome) = outcome_ref {
+                tracing::debug!(
+                    "测活成功 #{}: input_tokens={} output_tokens={} credits={:.6} ctx_pct={:?}",
+                    id,
+                    outcome.input_tokens,
+                    outcome.output_tokens,
+                    outcome.credits,
+                    outcome.context_usage_percentage,
+                );
+            }
             let trace = TraceRecord {
                 trace_id: uuid::Uuid::new_v4().to_string(),
                 ts,
@@ -804,11 +816,11 @@ impl AdminService {
                 total_attempts: 1,
                 duration_ms,
                 interrupted_after_bytes: None,
-                input_tokens: 0,
-                output_tokens: 0,
+                input_tokens: outcome_ref.map(|o| o.input_tokens.max(0) as u64).unwrap_or(0),
+                output_tokens: outcome_ref.map(|o| o.output_tokens.max(0) as u64).unwrap_or(0),
                 cache_creation_tokens: 0,
                 cache_read_tokens: 0,
-                credits: 0.0,
+                credits: outcome_ref.map(|o| o.credits).unwrap_or(0.0),
                 first_token_ms: None,
                 attempts: vec![TraceAttempt {
                     attempt: 0,
