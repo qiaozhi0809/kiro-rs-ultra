@@ -620,7 +620,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return n;
     });
     try {
-      const balance = await getCredentialBalance(id, true);
+      // 单卡刷新走缓存（5 分钟内）— 体验近瞬时，状态变化由后台调度器或顶栏批量刷新覆盖
+      const balance = await getCredentialBalance(id, false);
       setBalanceMap((prev) => {
         const n = new Map(prev);
         n.set(id, balance);
