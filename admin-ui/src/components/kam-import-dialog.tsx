@@ -13,49 +13,15 @@ import { Button } from '@/components/ui/button'
 import { useCredentials, useAddCredential, useDeleteCredential } from '@/hooks/use-credentials'
 import { getCredentialBalance, setCredentialDisabled, getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, sha256Hex } from '@/lib/utils'
+import {
+  type KamAccount,
+  normalizeExpiresAt,
+  parseKamJson,
+} from '@/lib/kam-normalize'
 
 interface KamImportDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
-}
-
-// KAM 导出 JSON 中的账号结构
-interface KamAccount {
-  email?: string
-  userId?: string | null
-  nickname?: string
-  idp?: string
-  credentials: {
-    refreshToken: string
-    accessToken?: string
-    profileArn?: string
-    // KAM 1.6.9+ 新版导出为毫秒时间戳数字，旧版为 RFC3339 字符串
-    expiresAt?: string | number
-    clientId?: string
-    clientSecret?: string
-    region?: string
-    authMethod?: string
-    provider?: string
-    startUrl?: string
-  }
-  machineId?: string
-  status?: string
-}
-
-// 把 KAM 的 expiresAt 字段统一规范化为 RFC3339 字符串
-// - 数字（毫秒时间戳）→ 转 ISO 字符串
-// - 字符串 → trim 后返回，空串视为 undefined
-// - 其他 → undefined
-function normalizeExpiresAt(value: unknown): string | undefined {
-  if (typeof value === 'number' && Number.isFinite(value)) {
-    const date = new Date(value)
-    return Number.isNaN(date.getTime()) ? undefined : date.toISOString()
-  }
-  if (typeof value === 'string') {
-    const trimmed = value.trim()
-    return trimmed.length > 0 ? trimmed : undefined
-  }
-  return undefined
 }
 
 interface VerificationResult {
@@ -67,149 +33,6 @@ interface VerificationResult {
   credentialId?: number
   rollbackStatus?: 'success' | 'failed' | 'skipped'
   rollbackError?: string
-}
-
-
-
-// 兼容 KAM 1.8.3 新版平铺格式，统一转换为旧格式（credentials 嵌套结构）
-/// 把 durable credentials（snake_case 平铺）归一化为 camelCase。
-/// 兼容两种导出格式：
-/// - KAM（camelCase）：直接返回
-/// - kiro-durable（snake_case）：映射到 camelCase 再返回
-/// 两种格式都保留原字段不动，只是**追加** camelCase 版，
-/// 这样 normalizeKamAccount 下游逻辑只认 camelCase。
-function normalizeSnakeCase(obj: Record<string, unknown>): Record<string, unknown> {
-  const need = (snake: string, camel: string) =>
-    typeof obj[snake] === 'string' && typeof obj[camel] !== 'string'
-  const pick = (snake: string, camel: string) => {
-    if (need(snake, camel)) (obj as Record<string, unknown>)[camel] = obj[snake]
-  }
-  pick('refresh_token', 'refreshToken')
-  pick('client_id', 'clientId')
-  pick('client_secret', 'clientSecret')
-  pick('access_token', 'accessToken')
-  pick('auth_method', 'authMethod')
-  pick('profile_arn', 'profileArn')
-  // expires_at 可以是字符串也可以是数字，都要兼容
-  if (typeof obj['expires_at'] !== 'undefined' && typeof obj['expiresAt'] === 'undefined') {
-    obj['expiresAt'] = obj['expires_at']
-  }
-  return obj
-}
-
-function normalizeKamAccount(item: unknown): unknown {
-  if (typeof item !== 'object' || item === null) return item
-  const obj = item as Record<string, unknown>
-  // 归一化 snake_case（kiro-durable 导出格式）→ camelCase
-  normalizeSnakeCase(obj)
-  // credentials 子对象也需要归一化（旧版嵌套格式下 snake_case 字段也在此处）
-  if (obj.credentials && typeof obj.credentials === 'object') {
-    normalizeSnakeCase(obj.credentials as Record<string, unknown>)
-  }
-  // 新格式：refreshToken 直接在账号对象上，无 credentials 嵌套
-  if (typeof obj.refreshToken === 'string' && typeof obj.credentials === 'undefined') {
-    const email = typeof obj.email === 'string' ? obj.email : undefined
-    const userId =
-      typeof obj.userId === 'string' || obj.userId === null ? (obj.userId as string | null) : undefined
-    const nickname =
-      typeof obj.nickname === 'string'
-        ? obj.nickname
-        : typeof obj.label === 'string'
-          ? (obj.label as string)
-          : undefined
-    const status = typeof obj.status === 'string' ? obj.status : undefined
-    const idp = typeof obj.idp === 'string' ? obj.idp : undefined
-    const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
-    const accessToken = typeof obj.accessToken === 'string' ? obj.accessToken : undefined
-    const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
-    const expiresAt =
-      typeof obj.expiresAt === 'string' || typeof obj.expiresAt === 'number'
-        ? (obj.expiresAt as string | number)
-        : undefined
-    const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
-    const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
-    const region = typeof obj.region === 'string' ? obj.region : undefined
-    const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
-    const provider = typeof obj.provider === 'string' ? obj.provider : undefined
-    const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
-
-    return {
-      email,
-      userId,
-      nickname,
-      idp,
-      status,
-      machineId,
-      credentials: {
-        refreshToken: obj.refreshToken,
-        accessToken,
-        profileArn,
-        expiresAt,
-        clientId,
-        clientSecret,
-        region,
-        authMethod,
-        provider,
-        startUrl,
-      },
-    }
-  }
-  return item
-}
-
-// 校验元素是否为有效的 KAM 账号结构
-function isValidKamAccount(item: unknown): item is KamAccount {
-  if (typeof item !== 'object' || item === null) return false
-  const obj = item as Record<string, unknown>
-  if (typeof obj.credentials !== 'object' || obj.credentials === null) return false
-  const cred = obj.credentials as Record<string, unknown>
-  return typeof cred.refreshToken === 'string' && cred.refreshToken.trim().length > 0
-}
-
-// 解析 KAM 导出 JSON，支持单账号和多账号格式
-function parseKamJson(raw: string): KamAccount[] {
-  const parsed = JSON.parse(raw)
-
-  let rawItems: unknown[]
-
-  // 标准 KAM 导出格式：{ version, accounts: [...] }
-  if (parsed.accounts && Array.isArray(parsed.accounts)) {
-    rawItems = parsed.accounts
-  }
-  // 直接数组（含 KAM 1.8.3 新版平铺格式）
-  else if (Array.isArray(parsed)) {
-    rawItems = parsed
-  }
-  // 单个账号对象（旧格式，有 credentials 字段）
-  else if (parsed.credentials && typeof parsed.credentials === 'object') {
-    rawItems = [parsed]
-  }
-  // 单个账号对象（新格式，refreshToken 平铺，camelCase）
-  else if (typeof parsed.refreshToken === 'string') {
-    rawItems = [parsed]
-  }
-  // 单个账号对象（kiro-durable 格式，snake_case）
-  else if (typeof parsed.refresh_token === 'string') {
-    rawItems = [parsed]
-  }
-  else {
-    throw new Error('无法识别的 KAM / durable JSON 格式')
-  }
-
-  // 兼容新格式：将平铺账号统一转换为 credentials 嵌套结构
-  const normalizedItems = rawItems.map(normalizeKamAccount)
-  const validAccounts = normalizedItems.filter(isValidKamAccount)
-
-  if (rawItems.length > 0 && validAccounts.length === 0) {
-    throw new Error(`共 ${rawItems.length} 条记录，但均缺少有效的 credentials.refreshToken`)
-  }
-
-  if (validAccounts.length < rawItems.length) {
-    const skipped = rawItems.length - validAccounts.length
-    console.warn(`KAM 导入：跳过 ${skipped} 条缺少有效 credentials.refreshToken 的记录`)
-  }
-
-  return validAccounts
 }
 
 export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
