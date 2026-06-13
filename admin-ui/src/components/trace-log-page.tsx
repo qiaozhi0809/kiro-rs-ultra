@@ -126,7 +126,6 @@ function credLabel(id: number, email?: string | null): string {
 
 function keyLabel(keyId: number, keyName?: string | null): string {
   if (keyName) return keyName
-  if (keyId === 0) return '管理员API密钥'
   return `#${keyId}`
 }
 
@@ -513,7 +512,6 @@ export function TraceLogPage() {
   )
   const keyOptions = [
     { value: '', label: '全部 Key' },
-    { value: '0', label: '管理员API密钥' },
     ...(keysData?.keys ?? []).map((k) => ({ value: String(k.id), label: k.name })),
   ]
   // 分组下拉选项：全部 + 未分组 + 注册表里所有分组
