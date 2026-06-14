@@ -138,6 +138,16 @@ Complete all chunked operations without commentary.";
 
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
+/// 非 Claude 模型透传白名单 — 上游 Kiro Pro 下发但 kiro-rs 自身不做改写的 modelId。
+/// 这些 ID 完全等同于上游真实 modelId，无 thinking 后缀拆分。
+const PASSTHROUGH_MODELS: &[&str] = &[
+    "deepseek-3.2",
+    "minimax-m2.5",
+    "minimax-m2.1",
+    "glm-5",
+    "qwen3-coder-next",
+];
+
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
@@ -166,7 +176,11 @@ pub fn map_model(model: &str) -> Option<String> {
     } else if model_lower.contains("haiku") {
         Some("claude-haiku-4.5".to_string())
     } else {
-        None
+        // 非 Claude 白名单透传（deepseek / minimax / glm / qwen 等多供应商模型）
+        PASSTHROUGH_MODELS
+            .iter()
+            .find(|m| model_lower == **m)
+            .map(|m| (*m).to_string())
     }
 }
 
@@ -1185,6 +1199,24 @@ mod tests {
     #[test]
     fn test_map_model_unsupported() {
         assert!(map_model("gpt-4").is_none());
+        // 不在白名单的「类似」非 Claude 模型仍应拒绝（防 typo / 误透传）
+        assert!(map_model("deepseek-3.1").is_none());
+        assert!(map_model("qwen2-72b").is_none());
+    }
+
+    #[test]
+    fn test_map_model_passthrough_non_claude() {
+        // 上游 Kiro Pro 下发的非 Claude 模型 ID 透传不变
+        assert_eq!(map_model("deepseek-3.2"), Some("deepseek-3.2".to_string()));
+        assert_eq!(map_model("minimax-m2.5"), Some("minimax-m2.5".to_string()));
+        assert_eq!(map_model("minimax-m2.1"), Some("minimax-m2.1".to_string()));
+        assert_eq!(map_model("glm-5"), Some("glm-5".to_string()));
+        assert_eq!(
+            map_model("qwen3-coder-next"),
+            Some("qwen3-coder-next".to_string())
+        );
+        // 大小写不敏感
+        assert_eq!(map_model("DeepSeek-3.2"), Some("deepseek-3.2".to_string()));
     }
 
     #[test]

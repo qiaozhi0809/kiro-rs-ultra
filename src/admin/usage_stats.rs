@@ -742,7 +742,7 @@ mod tests {
         assert_eq!(ov.today_input_tokens, 2000);
 
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
-        let series = agg.query_timeseries(window, None);
+        let series = agg.query_timeseries(window, None, None);
         assert!(!series.is_empty());
 
         let by_model = agg.query_by_model(window, None);
@@ -750,7 +750,7 @@ mod tests {
         assert_eq!(by_model[0].model, "claude-opus-4-7");
         assert_eq!(by_model[0].calls, 2);
 
-        let by_cred = agg.query_by_credential(window, None);
+        let by_cred = agg.query_by_credential(window, None, None);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
     }
@@ -789,7 +789,7 @@ mod tests {
         agg.ingest(&rec_b);
 
         let window = StatsQueryWindow::preset(Range::Last24h, StatsGranularity::Hour);
-        let series = agg.query_timeseries(window, Some(1));
+        let series = agg.query_timeseries(window, Some(1), None);
         assert_eq!(series.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(series.iter().map(|p| p.input_tokens).sum::<u64>(), 100);
 
@@ -797,7 +797,7 @@ mod tests {
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].model, "m-a");
 
-        let by_cred = agg.query_by_credential(window, Some(1));
+        let by_cred = agg.query_by_credential(window, Some(1), None);
         assert_eq!(by_cred.len(), 1);
         assert_eq!(by_cred[0].credential_id, 5);
     }
@@ -876,11 +876,11 @@ mod tests {
             granularity: StatsGranularity::Day,
         };
 
-        let hourly = agg.query_timeseries(hour_window, None);
+        let hourly = agg.query_timeseries(hour_window, None, None);
         assert_eq!(hourly.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(hourly.iter().map(|p| p.input_tokens).sum::<u64>(), 300);
 
-        let daily = agg.query_timeseries(day_window, None);
+        let daily = agg.query_timeseries(day_window, None, None);
         assert_eq!(daily.iter().map(|p| p.calls).sum::<u64>(), 1);
         assert_eq!(daily.iter().map(|p| p.output_tokens).sum::<u64>(), 40);
     }

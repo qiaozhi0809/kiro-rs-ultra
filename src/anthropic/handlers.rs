@@ -509,6 +509,54 @@ fn available_models() -> Vec<Model> {
             model_type: "chat".to_string(),
             max_tokens: 64000,
         },
+        // 非 Claude 模型（Kiro Pro 上游下发的多供应商模型 ID 透传）
+        // 上游协议对所有 modelId 共用同一套 generateAssistantResponse + Event Stream，
+        // 这里仅做名单暴露与透传；如出现非 Claude 特有的事件 / 错误，再单独适配。
+        Model {
+            id: "deepseek-3.2".to_string(),
+            object: "model".to_string(),
+            created: 1781913600, // 2026-06-13 发现日，统一占位
+            owned_by: "deepseek".to_string(),
+            display_name: "Deepseek v3.2".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "minimax-m2.5".to_string(),
+            object: "model".to_string(),
+            created: 1781913600,
+            owned_by: "minimax".to_string(),
+            display_name: "MiniMax M2.5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "minimax-m2.1".to_string(),
+            object: "model".to_string(),
+            created: 1781913600,
+            owned_by: "minimax".to_string(),
+            display_name: "MiniMax M2.1".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "glm-5".to_string(),
+            object: "model".to_string(),
+            created: 1781913600,
+            owned_by: "z-ai".to_string(),
+            display_name: "GLM 5".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "qwen3-coder-next".to_string(),
+            object: "model".to_string(),
+            created: 1781913600,
+            owned_by: "alibaba".to_string(),
+            display_name: "Qwen3 Coder Next".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
     ]
 }
 
