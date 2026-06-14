@@ -450,12 +450,13 @@ impl ClientKeyManager {
 
     /// 校验 Key，命中且未禁用则返回 id；同时更新 `last_used_at`/`total_calls`
     ///
-    /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击；
-    /// 之前的 HashMap 直接 lookup 仅作快速短路（命中后还会再做一次常量时间比较）。
+    /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击。
+    ///
+    /// **不在此处做 `csk_` 前缀过滤**：系统密钥（id=0，由 config.json apiKey 导入）
+    /// 历史明文是 `sk-kiro-...` 形式，没有 `csk_` 前缀；早先版本在这里硬卡前缀
+    /// 导致系统密钥永远 401。常量时间 entry 扫描已经足够安全，前缀过滤反而引入
+    /// 不一致 — 直接对所有 entry 做 ct_eq 比对，命中即接受。
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
-        if !presented.starts_with(CLIENT_KEY_PREFIX) {
-            return None;
-        }
         let mut inner = self.inner.write();
         // 第一遍：扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
         let mut hit_id: Option<u64> = None;
@@ -557,8 +558,27 @@ mod tests {
         let entry = mgr.create("test".to_string(), None, None);
         assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
-        // 不带前缀的拒绝
+        // 任意不在表中的字符串都拒绝（不再做前缀短路过滤）
         assert_eq!(mgr.verify_and_touch("nope"), None);
+        assert_eq!(mgr.verify_and_touch("csk_random_unknown"), None);
+    }
+
+    #[test]
+    fn system_key_without_csk_prefix_can_authenticate() {
+        // 系统密钥（id=0，由 config.json apiKey 导入）历史明文是 "sk-kiro-..." 形式，
+        // 不带 csk_ 前缀。verify_and_touch 必须能接受这种 key，否则系统密钥无法
+        // 调用 /v1/messages（曾经的 bug：前缀检查直接 401）。
+        let mgr = ClientKeyManager::new();
+        mgr.ensure_system_key(
+            "默认密钥".into(),
+            None,
+            "sk-kiro-rs-AbCdEfGhIjKlMnOp".into(),
+        );
+        assert_eq!(
+            mgr.verify_and_touch("sk-kiro-rs-AbCdEfGhIjKlMnOp"),
+            Some(0),
+            "系统密钥应能通过校验"
+        );
     }
 
     #[test]
