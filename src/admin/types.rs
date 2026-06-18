@@ -426,6 +426,21 @@ pub struct EnableOverageAllResult {
     pub failure_messages: Vec<String>,
 }
 
+/// 预热结果
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarmupResult {
+    /// 总预热次数
+    pub total: u32,
+    /// 成功次数
+    pub success: u32,
+    /// 失败次数
+    pub failed: u32,
+    /// 最后一次失败原因（若有）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
 // ============ 负载均衡配置 ============
 
 /// 负载均衡模式响应

@@ -930,6 +930,38 @@ impl AdminService {
         result.map(|_| Ok(())).map_err(|e| self.classify_balance_error(e, id))?
     }
 
+    /// 预热：对指定账号串行连发 `count` 次最小对话请求，唤醒冷启动慢的模型。
+    ///
+    /// 与测活区分：不写 trace（预热是噪音，避免污染请求日志），串行执行
+    /// （逐次唤醒，并发无意义且可能触发风控）。count 夹取 [1, 50]。
+    pub async fn warmup_credential(
+        &self,
+        id: u64,
+        count: u32,
+    ) -> Result<crate::admin::types::WarmupResult, AdminServiceError> {
+        let total = count.clamp(1, 50);
+        let mut success = 0u32;
+        let mut failed = 0u32;
+        let mut last_error: Option<String> = None;
+
+        for _ in 0..total {
+            match self.token_manager.test_conversation_for(id).await {
+                Ok(_) => success += 1,
+                Err(e) => {
+                    failed += 1;
+                    last_error = Some(e.to_string());
+                }
+            }
+        }
+
+        Ok(crate::admin::types::WarmupResult {
+            total,
+            success,
+            failed,
+            last_error,
+        })
+    }
+
     /// 批量刷新所有非禁用凭据的余额（用于后台调度）
     ///
     /// 串行执行以避免对上游产生瞬时高并发，每次成功的查询都会更新内存缓存

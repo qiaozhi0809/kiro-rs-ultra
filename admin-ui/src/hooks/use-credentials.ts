@@ -22,6 +22,7 @@ import {
   resetSuccessCount,
   resetAllSuccessCount,
   testCredential,
+  warmupCredential,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
 
@@ -173,6 +174,18 @@ export function useTestCredential() {
     mutationFn: (id: number) => testCredential(id),
     onSuccess: () => {
       // 测活成功可能更新了凭据状态（如首次成功设 successCount），刷缓存
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+/** 预热：对指定凭据串行连发 N 次最小对话请求，唤醒冷启动慢的模型 */
+export function useWarmupCredential() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, count }: { id: number; count?: number }) =>
+      warmupCredential(id, count),
+    onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })

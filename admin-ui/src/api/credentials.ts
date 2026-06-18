@@ -654,3 +654,17 @@ export async function testCredential(id: number): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${id}/test`)
   return data
 }
+
+/** 预热结果 */
+export interface WarmupResult {
+  total: number
+  success: number
+  failed: number
+  lastError?: string
+}
+
+/** 预热：对该凭据串行连发 count 次最小对话请求，唤醒冷启动慢的模型 */
+export async function warmupCredential(id: number, count = 10): Promise<WarmupResult> {
+  const { data } = await api.post<WarmupResult>(`/credentials/${id}/warmup?count=${count}`)
+  return data
+}

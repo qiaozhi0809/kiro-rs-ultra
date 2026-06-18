@@ -189,6 +189,25 @@ pub async fn test_credential(
     }
 }
 
+/// POST /api/admin/credentials/:id/warmup?count=N
+///
+/// 预热：对该凭据串行连发 N 次最小对话请求（默认 10），唤醒冷启动慢的模型。
+/// 不写 UsageRecord / trace（避免污染统计与日志）。
+pub async fn warmup_credential(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let count = params
+        .get("count")
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(10);
+    match state.service.warmup_credential(id, count).await {
+        Ok(result) => Json(result).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/credentials/disable-quota-exceeded
 /// 一键禁用所有"已超额"凭据（remaining ≤ 0 或 usage_percentage ≥ 100）
 pub async fn disable_quota_exceeded(State(state): State<AdminState>) -> impl IntoResponse {

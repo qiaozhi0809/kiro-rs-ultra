@@ -16,6 +16,7 @@ import {
   Boxes,
   Wallet,
   Gauge,
+  Flame,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -51,6 +52,7 @@ import {
   useResetSuccessCount,
   useClearThrottle,
   useClearConcurrency,
+  useWarmupCredential,
   useTestCredential,
 } from "@/hooks/use-credentials";
 import { setCredentialOverage } from "@/api/credentials";
@@ -269,6 +271,18 @@ export function CredentialCard({
       onError: (err) => toast.error("清理失败: " + extractErrorMessage(err)),
     });
   }, [clearConcurrency, credential.id]);
+  const warmup = useWarmupCredential();
+  const handleWarmup = useCallback(() => {
+    toast.info("预热中（10 次）…");
+    warmup.mutate(
+      { id: credential.id, count: 10 },
+      {
+        onSuccess: (r) =>
+          toast.success(`预热完成：成功 ${r.success}/${r.total}`),
+        onError: (err) => toast.error("预热失败: " + extractErrorMessage(err)),
+      },
+    );
+  }, [warmup, credential.id]);
   const [overageBusy, setOverageBusy] = useState(false);
   const handleSetOverage = async (enabled: boolean) => {
     setOverageBusy(true);
@@ -489,6 +503,17 @@ export function CredentialCard({
         >
           <Boxes />
           查看可用模型
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onSelect={(e) => {
+            e.preventDefault();
+            handleWarmup();
+          }}
+          disabled={warmup.isPending || credential.disabled}
+          title={credential.disabled ? "已禁用" : "预热 10 次（唤醒冷启动慢的模型）"}
+        >
+          <Flame className={warmup.isPending ? "animate-pulse" : ""} />
+          预热
         </DropdownMenuItem>
         {throttleRemaining > 0 && (
           <DropdownMenuItem
