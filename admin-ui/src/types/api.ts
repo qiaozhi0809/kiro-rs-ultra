@@ -48,6 +48,18 @@ export interface CredentialStatusItem {
   billedRequests?: number
   /** 累计 credits 成本（本地估算） */
   accruedCost?: number
+  /** 累计被调度次数 */
+  totalDispatch?: number
+  /** 近期调度数（最近 10 秒） */
+  recentDispatch10s?: number
+  /** 近期调度数（最近 60 秒） */
+  recentDispatch60s?: number
+  /** 近期调度数（最近 5 分钟） */
+  recentDispatch5m?: number
+  /** 调度评分（越高越健康） */
+  dispatchScore?: number
+  /** 调度压力（越高越忙） */
+  dispatchPressure?: number
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */

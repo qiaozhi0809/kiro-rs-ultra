@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -783,6 +784,11 @@ struct CredentialEntry {
     billed_requests: u64,
     /// 累计 credits 成本（本地估算）。运行时易失指标。
     accrued_cost: f64,
+    /// 累计被调度（acquire_context 成功命中）次数。运行时易失指标。
+    total_dispatch: u64,
+    /// 最近调度时间戳环形缓冲（上限 1000，超限弹出最旧）。
+    /// 用于计算 10s/60s/5m 窗口的近期调度数。运行时易失指标。
+    dispatch_times: VecDeque<Instant>,
 }
 
 /// 禁用原因
@@ -885,6 +891,18 @@ pub struct CredentialEntrySnapshot {
     pub billed_requests: u64,
     /// 累计 credits 成本（本地估算）
     pub accrued_cost: f64,
+    /// 累计被调度次数
+    pub total_dispatch: u64,
+    /// 近期调度数（最近 10 秒）
+    pub recent_dispatch_10s: u32,
+    /// 近期调度数（最近 60 秒）
+    pub recent_dispatch_60s: u32,
+    /// 近期调度数（最近 5 分钟）
+    pub recent_dispatch_5m: u32,
+    /// 调度评分（越高越健康）：成功率*100 + 剩余并发奖励 - EWMA惩罚
+    pub dispatch_score: f64,
+    /// 调度压力（越高越忙）：60s 调度数 / 有效并发上限
+    pub dispatch_pressure: f64,
 }
 
 /// 凭据管理器状态快照
@@ -987,6 +1005,42 @@ pub struct CallContext {
     pub _slot: Option<ConcurrencySlot>,
 }
 
+/// 统计时间戳缓冲中落在最近 `window_secs` 秒内的数量。
+fn count_recent(times: &VecDeque<Instant>, now: Instant, window_secs: u64) -> u32 {
+    let window = StdDuration::from_secs(window_secs);
+    times
+        .iter()
+        .filter(|t| now.duration_since(**t) <= window)
+        .count() as u32
+}
+
+/// 计算调度评分（越高越健康）。
+///
+/// `成功率*100 + 剩余并发奖励 - EWMA惩罚`：
+/// - 成功率 = success / (success + total_failure)，无样本视为 1.0
+/// - 剩余并发奖励 = (limit - in_flight) / limit * 20（空闲越多越优先）
+/// - EWMA 惩罚 = min(ewma_ms / 100, 50)（越慢扣越多，封顶 50）
+fn compute_dispatch_score(
+    success: u64,
+    total_failure: u64,
+    in_flight: u32,
+    limit: u32,
+    ewma_latency_ms: Option<f64>,
+) -> f64 {
+    let total = success + total_failure;
+    let success_rate = if total == 0 {
+        1.0
+    } else {
+        success as f64 / total as f64
+    };
+    let limit_f = limit.max(1) as f64;
+    let free = (limit_f - in_flight as f64).max(0.0);
+    let concurrency_bonus = free / limit_f * 20.0;
+    let ewma_penalty = ewma_latency_ms.map(|e| (e / 100.0).min(50.0)).unwrap_or(0.0);
+    let score = success_rate * 100.0 + concurrency_bonus - ewma_penalty;
+    (score * 100.0).round() / 100.0
+}
+
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
 ///
 /// - `group = None`：Key 未绑定分组（含 master apiKey），匹配所有账号。
@@ -1075,6 +1129,8 @@ impl MultiTokenManager {
                     ewma_latency_ms: None,
                     billed_requests: 0,
                     accrued_cost: 0.0,
+                    total_dispatch: 0,
+                    dispatch_times: VecDeque::new(),
                 }
             })
             .collect();
@@ -1265,6 +1321,20 @@ impl MultiTokenManager {
         }
     }
 
+    /// 记录一次调度（acquire_context 成功命中该账号时调用）。
+    /// total_dispatch += 1，并把当前时刻压入环形缓冲（上限 1000，超限弹最旧）。
+    fn record_dispatch(&self, id: u64) {
+        const DISPATCH_RING_CAP: usize = 1000;
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.total_dispatch += 1;
+            entry.dispatch_times.push_back(Instant::now());
+            while entry.dispatch_times.len() > DISPATCH_RING_CAP {
+                entry.dispatch_times.pop_front();
+            }
+        }
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -1427,6 +1497,8 @@ impl MultiTokenManager {
                     if let Some(counter) = self.in_flight_counter(id) {
                         ctx._slot = Some(ConcurrencySlot::acquire(counter));
                     }
+                    // 记录调度（每次成功命中 +1，含后续可能失败的尝试）
+                    self.record_dispatch(id);
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -2233,6 +2305,28 @@ impl MultiTokenManager {
                     ewma_latency_ms: e.ewma_latency_ms,
                     billed_requests: e.billed_requests,
                     accrued_cost: e.accrued_cost,
+                    total_dispatch: e.total_dispatch,
+                    recent_dispatch_10s: count_recent(&e.dispatch_times, now, 10),
+                    recent_dispatch_60s: count_recent(&e.dispatch_times, now, 60),
+                    recent_dispatch_5m: count_recent(&e.dispatch_times, now, 300),
+                    dispatch_score: compute_dispatch_score(
+                        e.success_count,
+                        e.total_failure_count,
+                        e.in_flight.load(Ordering::SeqCst),
+                        e.credentials
+                            .concurrency_limit
+                            .unwrap_or(self.config.default_concurrency_limit)
+                            .max(1),
+                        e.ewma_latency_ms,
+                    ),
+                    dispatch_pressure: {
+                        let limit = e
+                            .credentials
+                            .concurrency_limit
+                            .unwrap_or(self.config.default_concurrency_limit)
+                            .max(1);
+                        count_recent(&e.dispatch_times, now, 60) as f64 / limit as f64
+                    },
                 })
                 .collect(),
             current_id,
@@ -3122,6 +3216,8 @@ impl MultiTokenManager {
                 ewma_latency_ms: None,
                 billed_requests: 0,
                 accrued_cost: 0.0,
+                total_dispatch: 0,
+                dispatch_times: VecDeque::new(),
             });
         }
 
@@ -4800,6 +4896,55 @@ mod tests {
         );
         assert_eq!(e.billed_requests, 2, "credits=0 不计价");
         assert!((e.accrued_cost - 1.0).abs() < 1e-9);
+    }
+
+    /// record_dispatch：计数 + 窗口统计 + cap 1000 弹出。
+    #[tokio::test]
+    async fn test_record_dispatch_and_recent_windows() {
+        let cred = grouped_cred("c1", &[]);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        for _ in 0..5 {
+            manager.record_dispatch(1);
+        }
+        let s = manager.snapshot();
+        let e = &s.entries[0];
+        assert_eq!(e.total_dispatch, 5);
+        assert_eq!(e.recent_dispatch_10s, 5, "刚记录的应落在 10s 窗口");
+        assert_eq!(e.recent_dispatch_60s, 5);
+        assert_eq!(e.recent_dispatch_5m, 5);
+    }
+
+    /// record_dispatch 环形缓冲上限 1000：total 持续增长，窗口数不超过 1000。
+    #[tokio::test]
+    async fn test_dispatch_ring_buffer_cap() {
+        let cred = grouped_cred("c1", &[]);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        for _ in 0..1200 {
+            manager.record_dispatch(1);
+        }
+        let s = manager.snapshot();
+        let e = &s.entries[0];
+        assert_eq!(e.total_dispatch, 1200, "total 累计不受缓冲上限影响");
+        assert_eq!(e.recent_dispatch_5m, 1000, "环形缓冲上限 1000");
+    }
+
+    /// compute_dispatch_score 公式验算。
+    #[test]
+    fn test_compute_dispatch_score() {
+        // 全成功、并发全空闲、无 EWMA：100 + 20 - 0 = 120
+        assert!((compute_dispatch_score(10, 0, 0, 10, None) - 120.0).abs() < 1e-9);
+        // 全成功、并发占满、无 EWMA：100 + 0 - 0 = 100
+        assert!((compute_dispatch_score(10, 0, 10, 10, None) - 100.0).abs() < 1e-9);
+        // 50% 成功率、全空闲、EWMA 1000ms：50 + 20 - 10 = 60
+        assert!((compute_dispatch_score(5, 5, 0, 10, Some(1000.0)) - 60.0).abs() < 1e-9);
+        // EWMA 惩罚封顶 50：100 + 20 - 50 = 70（ewma 10000ms → penalty 100 但封顶 50）
+        assert!((compute_dispatch_score(1, 0, 0, 10, Some(10000.0)) - 70.0).abs() < 1e-9);
+        // 无样本视为成功率 1.0
+        assert!((compute_dispatch_score(0, 0, 0, 10, None) - 120.0).abs() < 1e-9);
     }
 
     #[test]

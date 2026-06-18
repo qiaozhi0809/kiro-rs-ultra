@@ -577,6 +577,12 @@ impl AdminService {
                     ewma_latency_ms: entry.ewma_latency_ms,
                     billed_requests: entry.billed_requests,
                     accrued_cost: entry.accrued_cost,
+                    total_dispatch: entry.total_dispatch,
+                    recent_dispatch_10s: entry.recent_dispatch_10s,
+                    recent_dispatch_60s: entry.recent_dispatch_60s,
+                    recent_dispatch_5m: entry.recent_dispatch_5m,
+                    dispatch_score: entry.dispatch_score,
+                    dispatch_pressure: entry.dispatch_pressure,
                     balance,
                     balance_updated_at,
                 }

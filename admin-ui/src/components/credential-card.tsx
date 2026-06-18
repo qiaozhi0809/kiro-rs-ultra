@@ -1032,6 +1032,41 @@ export function CredentialCard({
                 </dd>
               </div>
             )}
+            {(credential.totalDispatch ?? 0) > 0 && (
+              <>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <dt className="shrink-0 text-muted-foreground">总调度</dt>
+                  <dd className="min-w-0 text-right font-medium tabular-nums">
+                    {credential.totalDispatch}
+                  </dd>
+                </div>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <dt className="shrink-0 text-muted-foreground">调度评分</dt>
+                  <dd className="min-w-0 text-right font-medium tabular-nums">
+                    {(credential.dispatchScore ?? 0).toFixed(2)}
+                  </dd>
+                </div>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <dt className="shrink-0 text-muted-foreground">近期调度</dt>
+                  <dd
+                    className="min-w-0 text-right font-medium tabular-nums"
+                    title="最近 10s / 60s / 5m 调度次数"
+                  >
+                    {credential.recentDispatch10s ?? 0}
+                    <span className="text-muted-foreground"> / </span>
+                    {credential.recentDispatch60s ?? 0}
+                    <span className="text-muted-foreground"> / </span>
+                    {credential.recentDispatch5m ?? 0}
+                  </dd>
+                </div>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <dt className="shrink-0 text-muted-foreground">调度压力</dt>
+                  <dd className="min-w-0 text-right font-medium tabular-nums">
+                    {(credential.dispatchPressure ?? 0).toFixed(2)}
+                  </dd>
+                </div>
+              </>
+            )}
             <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
               <dt className="shrink-0 text-muted-foreground">最后调用</dt>
               <dd className="min-w-0 truncate text-right font-medium">

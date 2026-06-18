@@ -88,6 +88,18 @@ pub struct CredentialStatusItem {
     pub billed_requests: u64,
     /// 累计 credits 成本（本地估算）
     pub accrued_cost: f64,
+    /// 累计被调度次数
+    pub total_dispatch: u64,
+    /// 近期调度数（最近 10 秒）
+    pub recent_dispatch_10s: u32,
+    /// 近期调度数（最近 60 秒）
+    pub recent_dispatch_60s: u32,
+    /// 近期调度数（最近 5 分钟）
+    pub recent_dispatch_5m: u32,
+    /// 调度评分（越高越健康）
+    pub dispatch_score: f64,
+    /// 调度压力（越高越忙）
+    pub dispatch_pressure: f64,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
