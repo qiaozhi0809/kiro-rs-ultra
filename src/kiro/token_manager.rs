@@ -789,6 +789,9 @@ struct CredentialEntry {
     /// 最近调度时间戳环形缓冲（上限 1000，超限弹出最旧）。
     /// 用于计算 10s/60s/5m 窗口的近期调度数。运行时易失指标。
     dispatch_times: VecDeque<Instant>,
+    /// 最近一次预热完成的时刻。用于前端展示「已预热」临时标签（10 分钟内）。
+    /// 运行时易失指标，不持久化。
+    last_warmup_at: Option<Instant>,
 }
 
 /// 禁用原因
@@ -903,6 +906,8 @@ pub struct CredentialEntrySnapshot {
     pub dispatch_score: f64,
     /// 调度压力（越高越忙）：60s 调度数 / 有效并发上限
     pub dispatch_pressure: f64,
+    /// 最近 10 分钟内是否预热过（用于前端「已预热」临时标签）
+    pub warmed_recently: bool,
 }
 
 /// 凭据管理器状态快照
@@ -1131,6 +1136,7 @@ impl MultiTokenManager {
                     accrued_cost: 0.0,
                     total_dispatch: 0,
                     dispatch_times: VecDeque::new(),
+                    last_warmup_at: None,
                 }
             })
             .collect();
@@ -1332,6 +1338,14 @@ impl MultiTokenManager {
             while entry.dispatch_times.len() > DISPATCH_RING_CAP {
                 entry.dispatch_times.pop_front();
             }
+        }
+    }
+
+    /// 标记某账号刚完成预热（记录当前时刻，供前端展示 10 分钟内的「已预热」标签）。
+    pub fn mark_warmed(&self, id: u64) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            entry.last_warmup_at = Some(Instant::now());
         }
     }
 
@@ -2327,6 +2341,10 @@ impl MultiTokenManager {
                             .max(1);
                         count_recent(&e.dispatch_times, now, 60) as f64 / limit as f64
                     },
+                    warmed_recently: e
+                        .last_warmup_at
+                        .map(|t| now.duration_since(t).as_secs() < 600)
+                        .unwrap_or(false),
                 })
                 .collect(),
             current_id,
@@ -3218,6 +3236,7 @@ impl MultiTokenManager {
                 accrued_cost: 0.0,
                 total_dispatch: 0,
                 dispatch_times: VecDeque::new(),
+                last_warmup_at: None,
             });
         }
 

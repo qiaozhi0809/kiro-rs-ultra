@@ -17,6 +17,7 @@ import {
   Wallet,
   Gauge,
   Flame,
+  Info,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -33,6 +34,12 @@ import {
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import { SubscriptionBadge } from "@/components/subscription-badge";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import {
   Dialog,
   DialogContent,
@@ -102,6 +109,37 @@ function formatNumber(n: number): string {
 function formatResetDate(ts: number | null): string {
   if (!ts) return "未知";
   return new Date(ts * 1000).toLocaleString("zh-CN");
+}
+
+/**
+ * 信息区标签 + 可选的 Info tooltip 提示。
+ * 用于解释指标含义（如近期调度的三个数字、调度评分公式等）。
+ */
+function MetricLabel({ label, tip }: { label: string; tip?: string }) {
+  if (!tip) {
+    return <dt className="shrink-0 text-muted-foreground">{label}</dt>;
+  }
+  return (
+    <dt className="flex shrink-0 items-center gap-1 text-muted-foreground">
+      {label}
+      <TooltipProvider delayDuration={100}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label={`${label}说明`}
+              className="inline-flex h-3.5 w-3.5 items-center justify-center text-muted-foreground/60 transition-colors hover:text-foreground focus-visible:outline-none"
+            >
+              <Info className="h-3.5 w-3.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="top" align="start" className="max-w-[240px] text-xs leading-relaxed">
+            {tip}
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
+    </dt>
+  );
 }
 
 /** 把秒数格式化为 `mm:ss` 或 `hh:mm:ss` */
@@ -440,6 +478,16 @@ export function CredentialCard({
           冷却 {formatThrottleCountdown(throttleRemaining)}
         </Badge>
       )}
+      {credential.warmedRecently && (
+        <Badge
+          variant="warning"
+          className="bg-amber-400/20 text-amber-700 dark:text-amber-300 border-amber-500/40"
+          title="最近 10 分钟内预热过，模型处于热启动状态"
+        >
+          <Flame className="mr-1 h-3 w-3" />
+          已预热
+        </Badge>
+      )}
       {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
       {/* 配置元信息合并为单个徽章，减少换行：endpoint · ARN */}
       {(credential.endpoint || credential.hasProfileArn) && (
@@ -504,17 +552,6 @@ export function CredentialCard({
           <Boxes />
           查看可用模型
         </DropdownMenuItem>
-        <DropdownMenuItem
-          onSelect={(e) => {
-            e.preventDefault();
-            handleWarmup();
-          }}
-          disabled={warmup.isPending || credential.disabled}
-          title={credential.disabled ? "已禁用" : "预热 10 次（唤醒冷启动慢的模型）"}
-        >
-          <Flame className={warmup.isPending ? "animate-pulse" : ""} />
-          预热
-        </DropdownMenuItem>
         {throttleRemaining > 0 && (
           <DropdownMenuItem
             onSelect={(e) => {
@@ -527,19 +564,21 @@ export function CredentialCard({
             解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
           </DropdownMenuItem>
         )}
-        {(credential.inFlight ?? 0) > 0 && (
-          <DropdownMenuItem
-            onSelect={(e) => {
-              e.preventDefault();
-              handleClearConcurrency();
-            }}
-            disabled={clearConcurrency.isPending}
-            title="强制清零并发计数（处理卡死/泄漏的槽位）"
-          >
-            <Gauge />
-            清理并发（{credential.inFlight}）
-          </DropdownMenuItem>
-        )}
+        <DropdownMenuItem
+          onSelect={(e) => {
+            e.preventDefault();
+            handleClearConcurrency();
+          }}
+          disabled={clearConcurrency.isPending || (credential.inFlight ?? 0) === 0}
+          title={
+            (credential.inFlight ?? 0) === 0
+              ? "当前无进行中请求，无需清理"
+              : "强制清零并发计数（处理卡死/泄漏的槽位）"
+          }
+        >
+          <Gauge />
+          清理并发（{credential.inFlight ?? 0}）
+        </DropdownMenuItem>
         {balance?.overageCapable === true &&
           (balance.overageEnabled ? (
             <DropdownMenuItem
@@ -805,6 +844,26 @@ export function CredentialCard({
           size="icon"
           variant="ghost"
           className="hidden h-9 w-9 sm:inline-flex"
+          onClick={handleWarmup}
+          disabled={warmup.isPending || credential.disabled}
+          title={credential.disabled ? "已禁用" : "预热 10 次（唤醒冷启动慢的模型）"}
+        >
+          <Flame className={`h-4 w-4 ${warmup.isPending ? "animate-pulse" : ""}`} />
+        </Button>
+        <Button
+          size="icon"
+          variant="ghost"
+          className="hidden h-9 w-9 sm:inline-flex"
+          onClick={handleTestConversation}
+          disabled={testCred.isPending || credential.disabled}
+          title={credential.disabled ? "已禁用" : "测活（实时查询上游）"}
+        >
+          <Zap className={`h-4 w-4 ${testCred.isPending ? "animate-spin" : ""}`} />
+        </Button>
+        <Button
+          size="icon"
+          variant="ghost"
+          className="hidden h-9 w-9 sm:inline-flex"
           onClick={handleForceRefresh}
           disabled={
             forceRefresh.isPending ||
@@ -869,7 +928,7 @@ export function CredentialCard({
         className={`group flex h-full min-w-0 flex-col ${
           isDragging
             ? "shadow-apple-lg opacity-80"
-            : "hover:-translate-y-0.5 hover:shadow-apple-lg"
+            : "transition-shadow duration-200 ease-apple hover:shadow-apple-lg"
         } ${stateClasses}`}
       >
         <CardHeader className="p-4 pb-3 sm:p-5 sm:pb-3">
@@ -1012,7 +1071,14 @@ export function CredentialCard({
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2">
-              <dt className="shrink-0 text-muted-foreground">并发</dt>
+              <MetricLabel
+                label="并发"
+                tip={
+                  credential.concurrencyLimitOverride != null
+                    ? "当前进行中请求数 / 并发上限（账号级覆盖）。达上限时该账号被跳过，调度到其他账号。"
+                    : "当前进行中请求数 / 并发上限（全局默认）。达上限时该账号被跳过，调度到其他账号。"
+                }
+              />
               <dd className="min-w-0 text-right">
                 {(() => {
                   const inFlight = credential.inFlight ?? 0;
@@ -1021,11 +1087,6 @@ export function CredentialCard({
                   return (
                     <span
                       className={`font-medium tabular-nums ${full ? "text-amber-600 dark:text-amber-400" : ""}`}
-                      title={
-                        credential.concurrencyLimitOverride != null
-                          ? "并发上限（账号级覆盖）"
-                          : "并发上限（全局默认）"
-                      }
                     >
                       {inFlight}/{limit}
                     </span>
@@ -1033,65 +1094,75 @@ export function CredentialCard({
                 })()}
               </dd>
             </div>
-            {credential.ewmaLatencyMs != null && (
-              <div className="flex min-w-0 items-center justify-between gap-2">
-                <dt className="shrink-0 text-muted-foreground">耗时 EWMA</dt>
-                <dd className="min-w-0 text-right font-medium tabular-nums">
-                  {Math.round(credential.ewmaLatencyMs)}ms
-                </dd>
-              </div>
-            )}
-            {(credential.billedRequests ?? 0) > 0 && (
-              <div className="flex min-w-0 items-center justify-between gap-2">
-                <dt className="shrink-0 text-muted-foreground">计价请求</dt>
-                <dd className="min-w-0 text-right font-medium tabular-nums">
-                  {credential.billedRequests}
-                </dd>
-              </div>
-            )}
-            {(credential.accruedCost ?? 0) > 0 && (
-              <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
-                <dt className="shrink-0 text-muted-foreground">估算成本</dt>
-                <dd className="min-w-0 text-right font-medium tabular-nums">
-                  ${formatNumber(credential.accruedCost ?? 0)}
-                </dd>
-              </div>
-            )}
-            {(credential.totalDispatch ?? 0) > 0 && (
-              <>
-                <div className="flex min-w-0 items-center justify-between gap-2">
-                  <dt className="shrink-0 text-muted-foreground">总调度</dt>
-                  <dd className="min-w-0 text-right font-medium tabular-nums">
-                    {credential.totalDispatch}
-                  </dd>
-                </div>
-                <div className="flex min-w-0 items-center justify-between gap-2">
-                  <dt className="shrink-0 text-muted-foreground">调度评分</dt>
-                  <dd className="min-w-0 text-right font-medium tabular-nums">
-                    {(credential.dispatchScore ?? 0).toFixed(2)}
-                  </dd>
-                </div>
-                <div className="flex min-w-0 items-center justify-between gap-2">
-                  <dt className="shrink-0 text-muted-foreground">近期调度</dt>
-                  <dd
-                    className="min-w-0 text-right font-medium tabular-nums"
-                    title="最近 10s / 60s / 5m 调度次数"
-                  >
-                    {credential.recentDispatch10s ?? 0}
-                    <span className="text-muted-foreground"> / </span>
-                    {credential.recentDispatch60s ?? 0}
-                    <span className="text-muted-foreground"> / </span>
-                    {credential.recentDispatch5m ?? 0}
-                  </dd>
-                </div>
-                <div className="flex min-w-0 items-center justify-between gap-2">
-                  <dt className="shrink-0 text-muted-foreground">调度压力</dt>
-                  <dd className="min-w-0 text-right font-medium tabular-nums">
-                    {(credential.dispatchPressure ?? 0).toFixed(2)}
-                  </dd>
-                </div>
-              </>
-            )}
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <MetricLabel
+                label="耗时 EWMA"
+                tip="请求耗时的指数滑动平均（α=0.2），只统计成功请求。反映该账号近期的响应速度，越低越快。"
+              />
+              <dd className="min-w-0 text-right font-medium tabular-nums">
+                {credential.ewmaLatencyMs != null
+                  ? `${Math.round(credential.ewmaLatencyMs)}ms`
+                  : "—"}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <MetricLabel
+                label="计价请求"
+                tip="本进程启动以来产生计费（credits>0）的请求数。进程重启后归零。"
+              />
+              <dd className="min-w-0 text-right font-medium tabular-nums">
+                {credential.billedRequests ?? 0}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <MetricLabel
+                label="估算成本"
+                tip="本进程启动以来累计的 credits 成本（来自上游 meteringEvent 真实计费量）。进程重启后归零。"
+              />
+              <dd className="min-w-0 text-right font-medium tabular-nums">
+                ${formatNumber(credential.accruedCost ?? 0)}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <MetricLabel
+                label="总调度"
+                tip="本进程启动以来该账号被选中调度的总次数（含后续可能失败的尝试）。进程重启后归零。"
+              />
+              <dd className="min-w-0 text-right font-medium tabular-nums">
+                {credential.totalDispatch ?? 0}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <MetricLabel
+                label="调度评分"
+                tip="账号健康度评分，越高越优先：成功率×100 + 空闲并发奖励(剩余/上限×20) − 耗时惩罚(EWMA/100，封顶50)。"
+              />
+              <dd className="min-w-0 text-right font-medium tabular-nums">
+                {(credential.dispatchScore ?? 0).toFixed(2)}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <MetricLabel
+                label="近期调度"
+                tip="最近 10秒 / 60秒 / 5分钟 内该账号被调度的次数，反映近期负载分布。"
+              />
+              <dd className="min-w-0 text-right font-medium tabular-nums">
+                {credential.recentDispatch10s ?? 0}
+                <span className="text-muted-foreground"> / </span>
+                {credential.recentDispatch60s ?? 0}
+                <span className="text-muted-foreground"> / </span>
+                {credential.recentDispatch5m ?? 0}
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <MetricLabel
+                label="调度压力"
+                tip="最近 60 秒调度数 / 并发上限。反映每个并发槽位的近期请求密度，越高越忙。"
+              />
+              <dd className="min-w-0 text-right font-medium tabular-nums">
+                {(credential.dispatchPressure ?? 0).toFixed(2)}
+              </dd>
+            </div>
             <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
               <dt className="shrink-0 text-muted-foreground">最后调用</dt>
               <dd className="min-w-0 truncate text-right font-medium">
@@ -1173,16 +1244,42 @@ export function CredentialCard({
                     </span>
                   </div>
                 </div>
-                <div className="break-words border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
-                  下次重置：
-                  <span className="font-medium text-foreground">
-                    {formatResetDate(balance.nextResetAt)}
+                <div className="flex items-center justify-between gap-2 break-words border-t border-border/50 pt-2 text-[11px] text-muted-foreground">
+                  <span className="min-w-0">
+                    下次重置：
+                    <span className="font-medium text-foreground">
+                      {formatResetDate(balance.nextResetAt)}
+                    </span>
                   </span>
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="h-6 w-6 shrink-0"
+                    onClick={onRefreshBalance}
+                    disabled={loadingBalance || credential.disabled}
+                    title={credential.disabled ? "已禁用" : "刷新余额"}
+                  >
+                    <RefreshCw
+                      className={`h-3.5 w-3.5 ${loadingBalance ? "animate-spin" : ""}`}
+                    />
+                  </Button>
                 </div>
               </div>
             ) : (
-              <div className="flex flex-1 items-center justify-center text-center text-[13px] text-muted-foreground">
-                余额未查询，点击顶部"刷新当前页余额"即可加载。
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 text-center text-[13px] text-muted-foreground">
+                <span>余额未查询</span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={onRefreshBalance}
+                  disabled={loadingBalance || credential.disabled}
+                  title={credential.disabled ? "已禁用" : "刷新余额"}
+                >
+                  <RefreshCw
+                    className={`h-3.5 w-3.5 ${loadingBalance ? "animate-spin" : ""}`}
+                  />
+                  刷新余额
+                </Button>
               </div>
             )}
           </div>
@@ -1207,6 +1304,32 @@ export function CredentialCard({
                 size="sm"
                 variant="ghost"
                 className="w-full px-2 min-[420px]:flex-1 min-[420px]:px-2"
+                onClick={handleWarmup}
+                disabled={warmup.isPending || credential.disabled}
+                title={credential.disabled ? "已禁用" : "预热 10 次（唤醒冷启动慢的模型）"}
+              >
+                <Flame
+                  className={`h-3.5 w-3.5 ${warmup.isPending ? "animate-pulse" : ""}`}
+                />
+                <span className="hidden sm:inline">预热</span>
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="w-full px-2 min-[420px]:flex-1 min-[420px]:px-2"
+                onClick={handleTestConversation}
+                disabled={testCred.isPending || credential.disabled}
+                title={credential.disabled ? "已禁用" : "测活（实时查询上游）"}
+              >
+                <Zap
+                  className={`h-3.5 w-3.5 ${testCred.isPending ? "animate-spin" : ""}`}
+                />
+                <span className="hidden sm:inline">测活</span>
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="w-full px-2 min-[420px]:flex-1 min-[420px]:px-2"
                 onClick={handleForceRefresh}
                 disabled={
                   forceRefresh.isPending ||
@@ -1225,32 +1348,6 @@ export function CredentialCard({
                   className={`h-3.5 w-3.5 ${forceRefresh.isPending ? "animate-spin" : ""}`}
                 />
                 <span className="hidden sm:inline">Token</span>
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="w-full px-2 min-[420px]:flex-1 min-[420px]:px-2"
-                onClick={onRefreshBalance}
-                disabled={loadingBalance || credential.disabled}
-                title={credential.disabled ? "已禁用" : "刷新余额"}
-              >
-                <RefreshCw
-                  className={`h-3.5 w-3.5 ${loadingBalance ? "animate-spin" : ""}`}
-                />
-                <span className="hidden sm:inline">余额</span>
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="w-full px-2 min-[420px]:flex-1 min-[420px]:px-2"
-                onClick={handleTestConversation}
-                disabled={testCred.isPending || credential.disabled}
-                title={credential.disabled ? "已禁用" : "测活（实时查询上游）"}
-              >
-                <Zap
-                  className={`h-3.5 w-3.5 ${testCred.isPending ? "animate-spin" : ""}`}
-                />
-                <span className="hidden sm:inline">测活</span>
               </Button>
             </div>
 

@@ -100,6 +100,8 @@ pub struct CredentialStatusItem {
     pub dispatch_score: f64,
     /// 调度压力（越高越忙）
     pub dispatch_pressure: f64,
+    /// 最近 10 分钟内是否预热过（用于「已预热」临时标签）
+    pub warmed_recently: bool,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,

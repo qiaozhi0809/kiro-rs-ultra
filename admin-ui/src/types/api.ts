@@ -60,6 +60,8 @@ export interface CredentialStatusItem {
   dispatchScore?: number
   /** 调度压力（越高越忙） */
   dispatchPressure?: number
+  /** 最近 10 分钟内是否预热过（用于「已预热」临时标签） */
+  warmedRecently?: boolean
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */

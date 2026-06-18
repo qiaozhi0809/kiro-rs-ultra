@@ -28,6 +28,8 @@ import {
   Copy,
   Wand2,
   Zap,
+  ZapOff,
+  Gauge,
   Tags,
   ChevronDown,
   LayoutGrid,
@@ -128,6 +130,9 @@ import {
   enableOverageForAllCapable,
   exportKamCredentials,
   updateAdminKey,
+  testCredential,
+  clearConcurrency,
+  setCredentialOverage,
 } from "@/api/credentials";
 import {
   extractErrorMessage,
@@ -582,6 +587,86 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       } catch {}
     }
     if (f === 0) toast.success(`成功恢复 ${s} 个凭据`);
+    else toast.warning(`成功 ${s} 个，失败 ${f} 个`);
+    deselectAll();
+  };
+
+  // 批量测活：对选中（未禁用）凭据逐个发最小对话请求验活
+  const handleBatchTest = async () => {
+    const ids = Array.from(selectedIds).filter((id) => {
+      const c = data?.credentials.find((x) => x.id === id);
+      return c && !c.disabled;
+    });
+    if (ids.length === 0) {
+      toast.error("选中的凭据中没有可测活的（未禁用）凭据");
+      return;
+    }
+    let s = 0,
+      f = 0;
+    toast.info(`批量测活 ${ids.length} 个…`);
+    for (const id of ids) {
+      try {
+        await testCredential(id);
+        s++;
+      } catch {
+        f++;
+      }
+    }
+    await queryClient.invalidateQueries({ queryKey: ["credentials"] });
+    if (f === 0) toast.success(`测活完成：成功 ${s} 个`);
+    else toast.warning(`测活完成：成功 ${s} 个，失败 ${f} 个`);
+    deselectAll();
+  };
+
+  // 批量清理并发：对选中且 inFlight>0 的凭据强制清零并发计数
+  const handleBatchClearConcurrency = async () => {
+    const ids = Array.from(selectedIds).filter((id) => {
+      const c = data?.credentials.find((x) => x.id === id);
+      return c && (c.inFlight ?? 0) > 0;
+    });
+    if (ids.length === 0) {
+      toast.error("选中的凭据中没有进行中的并发可清理");
+      return;
+    }
+    let s = 0,
+      f = 0;
+    for (const id of ids) {
+      try {
+        await clearConcurrency(id);
+        s++;
+      } catch {
+        f++;
+      }
+    }
+    await queryClient.invalidateQueries({ queryKey: ["credentials"] });
+    if (f === 0) toast.success(`已清理 ${s} 个凭据的并发`);
+    else toast.warning(`成功 ${s} 个，失败 ${f} 个`);
+    deselectAll();
+  };
+
+  // 批量开关超额：对选中且支持超额的凭据统一开/关
+  const handleBatchOverage = async (enabled: boolean) => {
+    const ids = Array.from(selectedIds).filter((id) => {
+      const c = data?.credentials.find((x) => x.id === id);
+      return c && c.balance?.overageCapable === true;
+    });
+    if (ids.length === 0) {
+      toast.error("选中的凭据中没有支持超额的（需先刷新余额）");
+      return;
+    }
+    let s = 0,
+      f = 0;
+    toast.info(`批量${enabled ? "开启" : "关闭"}超额 ${ids.length} 个…`);
+    for (const id of ids) {
+      try {
+        await setCredentialOverage(id, enabled);
+        s++;
+      } catch {
+        f++;
+      }
+    }
+    await queryClient.invalidateQueries({ queryKey: ["credentials"] });
+    if (f === 0) toast.success(`已${enabled ? "开启" : "关闭"} ${s} 个凭据的超额`);
     else toast.warning(`成功 ${s} 个，失败 ${f} 个`);
     deselectAll();
   };
@@ -1501,10 +1586,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     onClick={() => setBatchEditDialogOpen(true)}
                     size="sm"
                     variant="outline"
-                    title="批量编辑分组 / 来源渠道"
+                    title="批量编辑（分组 / 来源 / 优先级 / 并发上限）"
                   >
                     <Tags className="h-3.5 w-3.5" />
-                    分组/来源
+                    批量编辑
                   </Button>
                   <Button
                     onClick={handleBatchDelete}
@@ -1607,6 +1692,46 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   >
                     <CheckCircle2 />
                     批量验活
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      handleBatchTest();
+                    }}
+                    disabled={selectedIds.size === 0}
+                  >
+                    <Zap />
+                    批量测活
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      handleBatchClearConcurrency();
+                    }}
+                    disabled={selectedIds.size === 0}
+                  >
+                    <Gauge />
+                    批量清理并发
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      handleBatchOverage(true);
+                    }}
+                    disabled={selectedIds.size === 0}
+                  >
+                    <Zap />
+                    批量开启超额
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={(e) => {
+                      e.preventDefault();
+                      handleBatchOverage(false);
+                    }}
+                    disabled={selectedIds.size === 0}
+                  >
+                    <ZapOff />
+                    批量关闭超额
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onSelect={(e) => {

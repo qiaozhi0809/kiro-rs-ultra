@@ -583,6 +583,7 @@ impl AdminService {
                     recent_dispatch_5m: entry.recent_dispatch_5m,
                     dispatch_score: entry.dispatch_score,
                     dispatch_pressure: entry.dispatch_pressure,
+                    warmed_recently: entry.warmed_recently,
                     balance,
                     balance_updated_at,
                 }
@@ -952,6 +953,11 @@ impl AdminService {
                     last_error = Some(e.to_string());
                 }
             }
+        }
+
+        // 至少成功一次才标记「已预热」（10 分钟内前端展示临时标签）
+        if success > 0 {
+            self.token_manager.mark_warmed(id);
         }
 
         Ok(crate::admin::types::WarmupResult {
