@@ -420,13 +420,7 @@ pub(crate) async fn get_usage_limits(
 
         let status = response.status();
         if status.is_success() {
-            let raw_body = response.text().await?;
-            tracing::debug!(
-                "getUsageLimits raw body (region={}): {}",
-                region,
-                raw_body
-            );
-            let data: UsageLimitsResponse = serde_json::from_str(&raw_body)?;
+            let data: UsageLimitsResponse = response.json().await?;
             return Ok(data);
         }
 
@@ -894,10 +888,16 @@ pub struct MultiTokenManager {
     entries: Mutex<Vec<CredentialEntry>>,
     /// 当前活动凭据 ID
     current_id: Mutex<u64>,
+    /// 下一个待分配凭据 ID。进程内单调递增，避免删除账号后新账号复用旧 ID，
+    /// 从而继承旧账号按 credential_id 聚合的 trace/usage 历史。
+    next_id: AtomicU64,
     /// Token 刷新锁，确保同一时间只有一个刷新操作
     refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
+    /// 凭据文件写入锁。`persist_credentials` 用整文件覆写，并发调用会互相踩踏，
+    /// 故用此锁串行化所有写盘操作（批量导入等场景会并发触发）。
+    persist_lock: Mutex<()>,
     /// 是否为多凭据格式（数组格式才回写；通过 add_credential 动态升级为 true）
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
@@ -940,6 +940,22 @@ fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
         None => true,
         Some(g) => cred_groups.iter().any(|cg| cg == g),
     }
+}
+
+fn credential_matches_request(
+    credentials: &KiroCredentials,
+    model: Option<&str>,
+    group: Option<&str>,
+) -> bool {
+    let is_opus = model
+        .map(|m| m.to_ascii_lowercase().contains("opus"))
+        .unwrap_or(false);
+
+    if is_opus && !credentials.supports_opus() {
+        return false;
+    }
+
+    group_matches(&credentials.groups, group)
 }
 
 impl MultiTokenManager {
@@ -1051,8 +1067,10 @@ impl MultiTokenManager {
             proxy: Mutex::new(proxy),
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
+            next_id: AtomicU64::new(next_id),
             refresh_lock: TokioMutex::new(()),
             credentials_path,
+            persist_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
             account_throttle_failover: AtomicBool::new(throttle_failover),
@@ -1144,11 +1162,6 @@ impl MultiTokenManager {
         let entries = self.entries.lock();
         let now = Instant::now();
 
-        // 检查是否是 opus 模型
-        let is_opus = model
-            .map(|m| m.to_lowercase().contains("opus"))
-            .unwrap_or(false);
-
         // 过滤可用凭据
         let available: Vec<_> = entries
             .iter()
@@ -1160,8 +1173,8 @@ impl MultiTokenManager {
                 if e.throttled_until.map(|t| t > now).unwrap_or(false) {
                     return false;
                 }
-                // 如果是 opus 模型，需要检查订阅等级
-                if is_opus && !e.credentials.supports_opus() {
+                // 模型/分组隔离：请求模型必须由该账号支持，且账号必须匹配请求分组
+                if !credential_matches_request(&e.credentials, model, group) {
                     return false;
                 }
                 // 账号分组隔离：Key 绑定分组时只用该分组内的账号
@@ -1238,7 +1251,7 @@ impl MultiTokenManager {
                             e.id == current_id
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
-                                && group_matches(&e.credentials.groups, group)
+                                && credential_matches_request(&e.credentials, model, group)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -1475,6 +1488,8 @@ impl MultiTokenManager {
         let json = serde_json::to_string_pretty(&credentials).context("序列化凭据失败")?;
 
         // 写入文件（在 Tokio runtime 内使用 block_in_place 避免阻塞 worker）
+        // 持 persist_lock 串行化整文件覆写，避免批量导入等并发场景下写盘互相踩踏。
+        let _write_guard = self.persist_lock.lock();
         if tokio::runtime::Handle::try_current().is_ok() {
             tokio::task::block_in_place(|| std::fs::write(path, &json))
                 .with_context(|| format!("回写凭据文件失败: {:?}", path))?;
@@ -2885,11 +2900,24 @@ impl MultiTokenManager {
             refresh_token(&new_cred, &self.config, effective_proxy.as_ref()).await?
         };
 
-        // 4. 分配新 ID
-        let new_id = {
-            let entries = self.entries.lock();
-            entries.iter().map(|e| e.id).max().unwrap_or(0) + 1
+        // 捕获原始输入的去重指纹。刷新可能轮换 refreshToken，且下方 step 5 会把
+        // new_cred 的字段 move 走，故必须在此处（字段尚完整时）取指纹，
+        // 供插入临界区的权威去重重检使用。
+        let dedup_is_api_key = new_cred.is_api_key_credential();
+        let dedup_hash: Option<String> = if dedup_is_api_key {
+            new_cred
+                .kiro_api_key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .map(sha256_hex)
+        } else {
+            new_cred.refresh_token.as_deref().map(sha256_hex)
         };
+
+        // 4. 分配新 ID。必须使用单调计数器，不能按当前 entries 最大值重算；
+        // 否则删除最后一个账号后再添加会复用旧 ID，导致 trace/usage/kiro_stats
+        // 这类按 credential_id 聚合的历史被新账号继承。
+        let new_id = self.next_id.fetch_add(1, Ordering::Relaxed);
 
         // 5. 设置 ID 并保留用户输入的元数据
         validated_cred.id = Some(new_id);
@@ -2920,6 +2948,28 @@ impl MultiTokenManager {
 
         {
             let mut entries = self.entries.lock();
+            // 并发安全：token 刷新（网络）在锁外完成，期间可能有其它并发的
+            // add_credential 通过了步骤 2 的预去重并已插入同一凭据。故在持锁的
+            // 插入点用原始输入指纹再做一次权威去重，关闭 TOCTOU（如命中则 bail，
+            // next_id 即便已自增也只是跳号，无副作用）。
+            if let Some(hash) = &dedup_hash {
+                let dup = entries.iter().any(|e| {
+                    let entry_hash = if dedup_is_api_key {
+                        e.credentials.kiro_api_key.as_deref().map(sha256_hex)
+                    } else {
+                        e.credentials.refresh_token.as_deref().map(sha256_hex)
+                    };
+                    entry_hash.as_deref() == Some(hash.as_str())
+                });
+                if dup {
+                    let msg = if dedup_is_api_key {
+                        "凭据已存在（kiroApiKey 重复）"
+                    } else {
+                        "凭据已存在（refreshToken 重复）"
+                    };
+                    anyhow::bail!(msg);
+                }
+            }
             entries.push(CredentialEntry {
                 id: new_id,
                 credentials: validated_cred,
@@ -3381,6 +3431,7 @@ impl Drop for MultiTokenManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_is_token_expired_with_expired_token() {
@@ -4204,6 +4255,89 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_add_credential_does_not_reuse_deleted_id() {
+        let path = tmp_creds_path("add_cred_no_reuse_deleted_id");
+        let mut cred1 = KiroCredentials::default();
+        cred1.id = Some(1);
+        cred1.kiro_api_key = Some("ksk_existing_1".to_string());
+        cred1.auth_method = Some("api_key".to_string());
+
+        let mut cred2 = KiroCredentials::default();
+        cred2.id = Some(2);
+        cred2.kiro_api_key = Some("ksk_existing_2".to_string());
+        cred2.auth_method = Some("api_key".to_string());
+
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![cred1, cred2],
+            None,
+            Some(path.clone()),
+            true,
+        )
+        .unwrap();
+
+        manager.delete_credential(2).unwrap();
+
+        let mut new_cred = KiroCredentials::default();
+        new_cred.kiro_api_key = Some("ksk_new_3".to_string());
+        new_cred.auth_method = Some("api_key".to_string());
+
+        let new_id = manager.add_credential(new_cred).await.unwrap();
+        assert_eq!(
+            new_id, 3,
+            "new credential IDs must not reuse deleted IDs, otherwise historical failure logs attach to the new account"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── 并发去重（TOCTOU 回归守卫） ───────────────────────────────────────────
+
+    /// 并发添加多个相同的 API Key 凭据，必须只插入一条。
+    ///
+    /// `add_credential` 的去重预检（步骤 2）与插入（步骤 5）不在同一临界区，
+    /// token 刷新（网络）在锁外完成。8 个并发任务极易有多个同时通过预检，
+    /// 此时不带"插入点权威重检"的实现会让重复凭据全部插入。本测试即为此回归守卫。
+    /// 选用 API Key 凭据是为了跳过网络刷新，使竞态可在纯本地复现。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_add_same_api_key_inserts_once() {
+        let path = tmp_creds_path("concurrent_dedup");
+        let manager = Arc::new(
+            MultiTokenManager::new(Config::default(), vec![], None, Some(path.clone()), true).unwrap(),
+        );
+
+        const N: usize = 8;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let m = Arc::clone(&manager);
+            handles.push(tokio::spawn(async move {
+                let mut c = KiroCredentials::default();
+                c.kiro_api_key = Some("ksk_duplicate".to_string());
+                c.auth_method = Some("api_key".to_string());
+                m.add_credential(c).await
+            }));
+        }
+
+        let mut ok_count = 0_usize;
+        for h in handles {
+            if h.await.unwrap().is_ok() {
+                ok_count += 1;
+            }
+        }
+        assert_eq!(ok_count, 1, "并发添加同一凭据应只成功一次，实际成功 {ok_count} 次");
+
+        let snapshot = manager.snapshot();
+        assert_eq!(
+            snapshot.entries.len(),
+            1,
+            "应只插入一条相同凭据，实际 {} 条",
+            snapshot.entries.len()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     // ── try_reload_credential_from_file ─────────────────────────────────────
 
     /// 文件中有新 refreshToken 时，reload 返回 true 并更新内存凭据
@@ -4374,6 +4508,33 @@ mod tests {
         assert!(manager.select_next_credential(None, Some("nope")).is_none());
         // 未绑定分组(None) → 可选到账号
         assert!(manager.select_next_credential(None, None).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_priority_current_respects_model_support() {
+        let mut free_cred = grouped_cred("free", &[]);
+        free_cred.subscription_title = Some("KIRO FREE".to_string());
+
+        let mut pro_cred = grouped_cred("pro", &[]);
+        pro_cred.subscription_title = Some("KIRO PRO".to_string());
+        pro_cred.priority = 10;
+
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![free_cred, pro_cred], None, None, false)
+                .unwrap();
+
+        // Warm current_id with the highest-priority Free account.
+        let current = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(current.id, 1);
+
+        let opus = manager
+            .acquire_context(Some("claude-opus-4.6"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            opus.id, 2,
+            "priority current_id must not bypass Opus subscription filtering"
+        );
     }
 
     #[test]

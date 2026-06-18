@@ -22,7 +22,7 @@ use super::trace_db::{TraceAttempt, TraceKeySource, TraceRecord};
 use super::types::{
     AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
     AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
-    BalanceResponse, BatchAddProxyRequest,
+    BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
     GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
     CredentialsExportResponse,
@@ -50,6 +50,54 @@ struct CachedBalance {
     cached_at: f64,
     /// 缓存的余额数据
     data: BalanceResponse,
+}
+
+/// 单条凭据导入结果（服务端内部用，映射为 SSE 事件）
+pub(crate) enum ImportStatus {
+    Verified,
+    /// 直接导入（未验活）成功
+    Imported,
+    Duplicate,
+    Failed,
+}
+
+pub(crate) struct ImportItemResult {
+    pub status: ImportStatus,
+    pub credential_id: Option<u64>,
+    pub email: Option<String>,
+    pub balance: Option<BalanceResponse>,
+    pub error: Option<String>,
+    pub rolled_back: bool,
+}
+
+impl ImportItemResult {
+    /// 转换为 SSE 事件（携带在数组中的下标）
+    pub fn into_event(self, index: usize) -> BatchImportEvent {
+        let status = match self.status {
+            ImportStatus::Verified => "verified",
+            ImportStatus::Imported => "imported",
+            ImportStatus::Duplicate => "duplicate",
+            ImportStatus::Failed => "failed",
+        }
+        .to_string();
+        BatchImportEvent {
+            index: Some(index),
+            status,
+            credential_id: self.credential_id,
+            email: self.email,
+            usage: self.balance.as_ref().map(|b| {
+                format!(
+                    "{:.0}/{:.0}",
+                    b.current_usage.round(),
+                    b.usage_limit.round()
+                )
+            }),
+            subscription: self.balance.and_then(|b| b.subscription_title),
+            error: self.error,
+            rolled_back: if self.rolled_back { Some(true) } else { None },
+            summary: None,
+        }
+    }
 }
 
 /// 缓存的"检查更新"结果
@@ -133,10 +181,26 @@ struct SocialAuthSession {
     callback_rx: tokio::sync::Mutex<tokio::sync::oneshot::Receiver<social::OAuthCallbackData>>,
     cred_template: KiroCredentials,
     proxy: Option<ProxyConfig>,
-    /// Drop 时自动关闭回调服务器并释放端口
-    _server_handle: social::ServerHandle,
+    /// Drop 时自动关闭回调服务器并释放端口（本地模式 Some；远程模式 None）
+    _server_handle: Option<social::ServerHandle>,
+    /// 远程模式：公网 GET 回调路由通过此 Sender 投递回调数据（本地模式 None）。
+    /// 取出后即 None，保证只投递一次。
+    remote_callback_tx:
+        Option<Mutex<Option<tokio::sync::oneshot::Sender<social::OAuthCallbackData>>>>,
     /// 重新登录时更新此凭据的 Token（非 None 时更新已有凭据而非创建新凭据）
     relogin_target_id: Option<u64>,
+}
+
+/// 远程公网回调投递结果（供 GET 回调路由渲染提示页）
+pub enum RemoteCallbackOutcome {
+    /// 已成功投递，等待轮询完成 token 兑换
+    Delivered,
+    /// 会话不存在（state 不匹配 / 非远程模式会话）
+    NotFound,
+    /// 会话已过期
+    Expired,
+    /// 回调已被处理过（重复点击 / 并发完成）
+    AlreadyCompleted,
 }
 
 /// IdC 设备授权会话状态
@@ -1019,6 +1083,21 @@ impl AdminService {
         &self,
         req: AddCredentialRequest,
     ) -> Result<AddCredentialResponse, AdminServiceError> {
+        // 默认获取余额（保持单条添加 / 登录路径的既有行为：加完即可见订阅等级）
+        self.add_credential_inner(req, true).await
+    }
+
+    /// 添加凭据的核心实现。
+    ///
+    /// - `fetch_balance = true`：添加后主动拉取余额（含订阅等级 / 邮箱）并写入缓存，
+    ///   既是"加完即可见"，也作为 API Key 的有效性校验（即"验活"）。
+    /// - `fetch_balance = false`：跳过余额拉取，仅落库（"直接导入"路径），
+    ///   订阅信息留待首次请求时按需获取。
+    async fn add_credential_inner(
+        &self,
+        req: AddCredentialRequest,
+        fetch_balance: bool,
+    ) -> Result<AddCredentialResponse, AdminServiceError> {
         // 校验端点名：未指定则默认合法，指定则必须已注册
         if let Some(ref name) = req.endpoint {
             if !self.known_endpoints.contains(name) {
@@ -1070,9 +1149,12 @@ impl AdminService {
             .map_err(|e| self.classify_add_error(e))?;
 
         // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
-        // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤
-        if let Err(e) = self.get_balance(credential_id, false).await {
-            tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
+        // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
+        // 仅验活路径需要；"直接导入"路径跳过以省掉这次上游往返。
+        if fetch_balance {
+            if let Err(e) = self.get_balance(credential_id, false).await {
+                tracing::warn!("添加凭据后刷新余额失败（不影响凭据添加）: {}", e);
+            }
         }
 
         Ok(AddCredentialResponse {
@@ -1081,6 +1163,86 @@ impl AdminService {
             credential_id,
             email,
         })
+    }
+
+    /// 批量导入的单条处理。
+    ///
+    /// - `verify = true`（验活路径）：add（内部 refresh + 缓存 balance）→ 显式取余额验活
+    ///   → 失败回滚删除。镜像前端旧流程的"add → getCredentialBalance → 失败回滚"。
+    /// - `verify = false`（直接导入路径）：仅 add 落库，不取余额、不回滚。
+    ///
+    /// 全部在服务端完成，便于在 `buffer_unordered` 下有界并发。
+    pub async fn import_one_credential(
+        &self,
+        req: AddCredentialRequest,
+        verify: bool,
+    ) -> ImportItemResult {
+        // 1. add：去重 / 未知端点 / token 刷新失败在此暴露，未插入即无需回滚。
+        //    verify=false 时跳过内部余额拉取。
+        let resp = match self.add_credential_inner(req, verify).await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                let is_duplicate =
+                    msg.contains("凭据已存在") || msg.contains("重复");
+                return ImportItemResult {
+                    status: if is_duplicate {
+                        ImportStatus::Duplicate
+                    } else {
+                        ImportStatus::Failed
+                    },
+                    credential_id: None,
+                    email: None,
+                    balance: None,
+                    error: Some(msg),
+                    rolled_back: false,
+                };
+            }
+        };
+
+        // 2. 直接导入：add 成功即完成，不做余额验活、不回滚。
+        if !verify {
+            return ImportItemResult {
+                status: ImportStatus::Imported,
+                credential_id: Some(resp.credential_id),
+                email: resp.email.clone(),
+                balance: None,
+                error: None,
+                rolled_back: false,
+            };
+        }
+
+        // 3. 验活路径：显式取余额验活（OAuth 正常路径命中 add 内缓存；
+        //    API Key 无 token 刷新，余额拉取即真正的验活，失败则回滚）。
+        match self.get_balance(resp.credential_id, true).await {
+            Ok(balance) => ImportItemResult {
+                status: ImportStatus::Verified,
+                credential_id: Some(resp.credential_id),
+                email: resp.email.clone(),
+                balance: Some(balance),
+                error: None,
+                rolled_back: false,
+            },
+            Err(e) => {
+                let msg = e.to_string();
+                tracing::warn!(
+                    "批量导入凭据 #{} 验活失败，回滚删除: {}",
+                    resp.credential_id,
+                    msg
+                );
+                // 回滚：直接删除（delete_credential 会清理 balance 缓存与 trace）。
+                // 不先 disable——delete 是整条移除，无 enabled 守卫，足够原子。
+                let rolled_back = self.delete_credential(resp.credential_id).is_ok();
+                ImportItemResult {
+                    status: ImportStatus::Failed,
+                    credential_id: Some(resp.credential_id),
+                    email: resp.email,
+                    balance: None,
+                    error: Some(msg),
+                    rolled_back,
+                }
+            }
+        }
     }
 
     /// 更新凭据的可编辑字段（email、proxy 等）
@@ -1118,6 +1280,10 @@ impl AdminService {
             cache.remove(&id);
         }
         self.save_balance_cache();
+
+        if let Some(trace_store) = &self.trace_store {
+            trace_store.delete_for_credential(id);
+        }
 
         Ok(())
     }
@@ -2375,9 +2541,9 @@ impl AdminService {
 
     /// 发起 Social 登录，返回 portal URL 供用户在浏览器打开
     ///
-    /// 模式选择：
-    /// - `callback_base_url` 为 Some → 远程模式：redirect_uri 使用服务端公网地址，不启动本地端口
-    /// - `callback_base_url` 为 None  → 本地模式：启动本地 TCP 回调服务器（浏览器与服务端须同机）
+    /// 回调模式由 `config.callbackBaseUrl` 决定：
+    /// - 已配置 → 远程模式：redirect_uri 使用公网地址，由本服务的 `/auth/callback` GET 路由接收回调
+    /// - 未配置 → 本地模式：启动临时 TCP 回调服务器（浏览器与服务端须同机）
     pub async fn start_social_login(
         &self,
         req: StartSocialLoginRequest,
@@ -2396,14 +2562,32 @@ impl AdminService {
         let (code_verifier, code_challenge) = social::generate_pkce();
         let state = uuid::Uuid::new_v4().to_string();
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-
-        // 启动本地 TCP 回调服务器（本地模式）
-        // 远程访问时用户须从浏览器地址栏复制回调 URL，通过 complete_social_login 接口手动完成
-        let (port, server_handle) = social::start_callback_server(tx)
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        let redirect_uri = format!("http://127.0.0.1:{}", port);
+        // 回调模式：配置了 callbackBaseUrl → 远程模式（公网回调路由自动接收）；
+        // 否则本地模式（启动临时 TCP 端口，仅本机浏览器可达）。
+        let remote_base = self.resolve_callback_base(req.callback_base_url.as_deref());
+        let (redirect_uri, server_handle, remote_callback_tx, rx) = match remote_base.clone() {
+            Some(base) => {
+                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+                // 远程模式：暂存 Sender，由公网 GET 回调路由投递回调数据
+                (
+                    base,
+                    None,
+                    Some(Mutex::new(Some(tx))),
+                    rx,
+                )
+            }
+            None => {
+                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+                let (port, server_handle) = social::start_callback_server(tx)
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+                (
+                    format!("http://127.0.0.1:{}", port),
+                    Some(server_handle),
+                    None,
+                    rx,
+                )
+            }
+        };
         let portal_url = social::build_portal_url(&state, &code_challenge, &redirect_uri);
 
         let expires_at = Utc::now() + Duration::minutes(10);
@@ -2427,6 +2611,7 @@ impl AdminService {
             cred_template,
             proxy,
             _server_handle: server_handle,
+            remote_callback_tx,
             relogin_target_id: None,
         };
 
@@ -2438,6 +2623,7 @@ impl AdminService {
             session_id,
             portal_url,
             expires_at: expires_at.to_rfc3339(),
+            remote: remote_base.is_some(),
         })
     }
 
@@ -2621,6 +2807,74 @@ impl AdminService {
             state,
         };
         self.do_complete_social_login(session_id, callback).await
+    }
+
+    /// 解析远程回调 base，优先级：`config.callbackBaseUrl`（显式覆盖 / 逃生口）> 请求自带 base > None（本地模式）。
+    ///
+    /// 返回 None 表示回落本地模式（都未提供 / 提供的值非法时记 warn）。
+    fn resolve_callback_base(&self, req_base: Option<&str>) -> Option<String> {
+        // 优先用 config 显式配置；否则用前端按当前访问地址派生的请求值
+        let raw = self
+            .token_manager
+            .config()
+            .callback_base_url
+            .as_deref()
+            .map(str::to_string)
+            .or_else(|| req_base.map(str::to_string))?;
+        let trimmed = raw.trim().trim_end_matches('/');
+        if trimmed.is_empty() {
+            return None;
+        }
+        if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+            tracing::warn!(
+                "callbackBaseUrl 非法（须以 http:// 或 https:// 开头），回落本地回调模式: {}",
+                raw
+            );
+            return None;
+        }
+        Some(trimmed.to_string())
+    }
+
+    /// 公网 GET 回调路由调用：按 OAuth state 定位会话并投递回调数据。
+    ///
+    /// 命中且未过期 → 投递进会话 oneshot channel（由 poll_social_login 统一完成 token 兑换）；
+    /// 不存在 / 已过期 / 非远程会话 → 返回相应结果，由调用方渲染提示页。
+    pub fn deliver_remote_social_callback(
+        &self,
+        state: &str,
+        data: social::OAuthCallbackData,
+    ) -> RemoteCallbackOutcome {
+        let sessions = self.social_sessions.lock();
+        // 找到 state 匹配的会话（state 每会话随机，提供 CSRF 保护）
+        let session_id = sessions
+            .iter()
+            .find_map(|(id, s)| (s.state == state).then_some(id.clone()));
+
+        let Some(session_id) = session_id else {
+            return RemoteCallbackOutcome::NotFound;
+        };
+        let session = sessions.get(&session_id).expect("刚查到的会话必然存在");
+        if Utc::now() >= session.expires_at {
+            return RemoteCallbackOutcome::Expired;
+        }
+        let tx_slot = match session.remote_callback_tx.as_ref() {
+            Some(slot) => slot,
+            None => return RemoteCallbackOutcome::NotFound, // 本地模式会话：不应由公网路由投递
+        };
+        // 释放外层锁后再投递（send 不阻塞，但避免持锁发送）
+        let tx = tx_slot.lock().take();
+        drop(sessions);
+        match tx {
+            Some(tx) => {
+                if tx.send(data).is_ok() {
+                    RemoteCallbackOutcome::Delivered
+                } else {
+                    // 接收端已消失（会话被并发完成/移除）→ 视为已处理
+                    RemoteCallbackOutcome::AlreadyCompleted
+                }
+            }
+            None => RemoteCallbackOutcome::AlreadyCompleted,
+        }
     }
 
     /// 分类删除凭据错误
@@ -2855,12 +3109,25 @@ impl AdminService {
         let (code_verifier, code_challenge) = social::generate_pkce();
         let state = uuid::Uuid::new_v4().to_string();
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
-
-        let (port, server_handle) = social::start_callback_server(tx)
-            .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
-
-        let redirect_uri = format!("http://127.0.0.1:{}", port);
+        // 回调模式同 start_social_login：远程模式走公网回调路由，本地模式走临时端口
+        let remote_base = self.resolve_callback_base(req.callback_base_url.as_deref());
+        let (redirect_uri, server_handle, remote_callback_tx, rx) = match remote_base.clone() {
+            Some(base) => {
+                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+                (base, None, Some(Mutex::new(Some(tx))), rx)
+            }
+            None => {
+                let (tx, rx) = tokio::sync::oneshot::channel::<social::OAuthCallbackData>();
+                let (port, server_handle) = social::start_callback_server(tx)
+                    .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+                (
+                    format!("http://127.0.0.1:{}", port),
+                    Some(server_handle),
+                    None,
+                    rx,
+                )
+            }
+        };
         let portal_url = social::build_portal_url(&state, &code_challenge, &redirect_uri);
 
         let expires_at = Utc::now() + Duration::minutes(10);
@@ -2876,6 +3143,7 @@ impl AdminService {
             cred_template: KiroCredentials::default(),
             proxy,
             _server_handle: server_handle,
+            remote_callback_tx,
             relogin_target_id: Some(target_id),
         };
 
@@ -2887,6 +3155,7 @@ impl AdminService {
             session_id,
             portal_url,
             expires_at: expires_at.to_rfc3339(),
+            remote: remote_base.is_some(),
         })
     }
 

@@ -6,12 +6,14 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
+import { Trash2 } from 'lucide-react'
 
 export interface VerifyResult {
   id: number
   status: 'pending' | 'verifying' | 'success' | 'failed'
   usage?: string
   error?: string
+  email?: string
 }
 
 interface BatchVerifyDialogProps {
@@ -21,6 +23,12 @@ interface BatchVerifyDialogProps {
   progress: { current: number; total: number }
   results: Map<number, VerifyResult>
   onCancel: () => void
+  /** 删除单个失败凭据 */
+  onDelete?: (id: number) => void
+  /** 一键删除全部失败凭据 */
+  onDeleteFailed?: () => void
+  /** 删除进行中（禁用按钮） */
+  deleting?: boolean
 }
 
 export function BatchVerifyDialog({
@@ -30,6 +38,9 @@ export function BatchVerifyDialog({
   progress,
   results,
   onCancel,
+  onDelete,
+  onDeleteFailed,
+  deleting,
 }: BatchVerifyDialogProps) {
   const resultsArray = Array.from(results.values())
   const successCount = resultsArray.filter(r => r.status === 'success').length
@@ -61,12 +72,27 @@ export function BatchVerifyDialog({
 
           {/* 统计信息 */}
           {results.size > 0 && (
-            <div className="flex justify-between text-sm font-medium">
+            <div className="flex justify-between items-center text-sm font-medium">
               <span>验活结果</span>
               <span>
                 成功: {successCount} / 失败: {failedCount}
               </span>
             </div>
+          )}
+
+          {/* 一键删除失败凭据 */}
+          {!verifying && failedCount > 0 && onDeleteFailed && (
+            <Button
+              type="button"
+              variant="destructive"
+              size="sm"
+              className="w-full"
+              disabled={deleting}
+              onClick={onDeleteFailed}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              {deleting ? '删除中…' : `删除全部失败（${failedCount}）`}
+            </Button>
           )}
 
           {/* 结果列表 */}
@@ -86,20 +112,36 @@ export function BatchVerifyDialog({
                   }`}
                 >
                   <div className="flex items-start justify-between gap-2">
-                    <div className="flex items-center gap-2">
-                      <span className="font-medium">凭据 #{result.id}</span>
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="font-medium shrink-0">凭据 #{result.id}</span>
+                      {result.email && (
+                        <span className="text-xs opacity-80 truncate">{result.email}</span>
+                      )}
                       {result.status === 'success' && result.usage && (
-                        <Badge variant="secondary" className="text-xs">
+                        <Badge variant="secondary" className="text-xs shrink-0">
                           {result.usage}
                         </Badge>
                       )}
                     </div>
-                    <span>
-                      {result.status === 'success' && '✓'}
-                      {result.status === 'failed' && '✗'}
-                      {result.status === 'verifying' && '⏳'}
-                      {result.status === 'pending' && '⋯'}
-                    </span>
+                    <div className="flex items-center gap-2 shrink-0">
+                      {!verifying && result.status === 'failed' && onDelete && (
+                        <button
+                          type="button"
+                          title="删除该失败凭据"
+                          disabled={deleting}
+                          onClick={() => onDelete(result.id)}
+                          className="text-red-500 hover:text-red-700 disabled:opacity-40"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      <span>
+                        {result.status === 'success' && '✓'}
+                        {result.status === 'failed' && '✗'}
+                        {result.status === 'verifying' && '⏳'}
+                        {result.status === 'pending' && '⋯'}
+                      </span>
+                    </div>
                   </div>
                   {result.error && (
                     <div className="text-xs mt-1 opacity-90">
@@ -114,7 +156,7 @@ export function BatchVerifyDialog({
           {/* 提示信息 */}
           {verifying && (
             <p className="text-xs text-muted-foreground">
-              💡 验活过程中每次请求间隔 2 秒，防止被封号。你可以关闭此窗口，验活会在后台继续进行。
+              💡 验活在后台并发进行，你可以关闭此窗口，验活会继续。完成后可在此窗口删除失效/封号的账号。
             </p>
           )}
         </div>

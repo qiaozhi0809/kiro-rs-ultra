@@ -163,7 +163,8 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
       } else {
         window.open(resp.portalUrl, '_blank')
       }
-      if (!isRemote) scheduleSocialPoll(resp.sessionId)
+      // 始终轮询：服务端远程模式（resp.remote）由公网回调路由自动完成，本地模式由本地回调完成。
+      scheduleSocialPoll(resp.sessionId)
     } catch (e) {
       loginWindow?.close()
       toast.error('发起登录失败：' + extractErrorMessage(e))
@@ -403,7 +404,8 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
                 <ExternalLink className="h-3.5 w-3.5" />
               </a>
             </div>
-            {isRemote ? (
+            {isRemote && !socialSession.remote ? (
+              // 浏览器远程访问且服务端未配置 callbackBaseUrl：手动粘贴兜底
               <div className="space-y-2">
                 <p className="text-sm text-amber-600 dark:text-amber-400">
                   完成登录后，从地址栏复制完整 URL 粘贴到下方：
@@ -419,7 +421,9 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
             ) : (
               <div className="flex items-center gap-2 text-sm text-muted-foreground">
                 <Loader2 className="h-4 w-4 animate-spin" />
-                正在等待登录完成…
+                {socialSession.remote
+                  ? '完成登录后浏览器会自动跳回本服务，正在等待自动完成…'
+                  : '正在等待登录完成…'}
               </div>
             )}
           </div>
@@ -546,7 +550,7 @@ export function ReloginDialog({ open, onOpenChange, credential }: ReloginDialogP
           {step === 'waiting' && method === 'social' && (
             <>
               <Button variant="outline" onClick={handleClose} disabled={isCompleting}>取消</Button>
-              {isRemote && (
+              {isRemote && socialSession && !socialSession.remote && (
                 <Button
                   onClick={handleCompleteSocialManually}
                   disabled={isCompleting || !callbackUrl.trim()}

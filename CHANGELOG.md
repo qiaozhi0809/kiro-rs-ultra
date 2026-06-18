@@ -4,7 +4,231 @@ All notable changes to this project are documented in this file. The format
 loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.6.7] - 2026-06-17
+
+主题：**远程部署 Social 登录零配置化（OAuth 回调地址自动派生）+ 凭据列表卡片 / 列表双视图与分页增强 + 来源渠道模糊搜索与移动端体验优化 + output_config.effort 分级归一化**。这一版解决了远程部署（Render / Docker / VPS）下 Social 登录回调指向 `127.0.0.1` 无法使用的痛点——前端按当前访问地址自动派生公网回调地址，远程部署零配置即可完成 Google / GitHub 登录；凭据列表新增 iOS 风格的卡片 / 列表双视图切换、可配置每页数量与跨页全选；同时归一化 `output_config.effort` 分级，避免较老模型收到不支持的 `xhigh` 报错，并在删除凭据时清理其历史失败记录。凭据管理页面还新增按来源渠道（备注）/ 邮箱的模糊搜索、批量导入 / 验活 / 刷新余额的 8 路并发化，以及一轮移动端工具栏布局与下拉菜单渲染异常的修复。
+
+### ✨ 新功能 — 远程部署 Social 登录（Issue #20）
+
+- **OAuth 回调地址自动派生**：前端发起 Social 登录时按当前浏览器访问地址自动算出回调地址（`${origin}/api/admin/auth/callback`）随请求发送。远程部署（Render / Docker / VPS）下浏览器知道自己的公网地址，授权后会落到同源的本服务回调路由，**零配置即可用**；本地访问（`http://localhost:8990`）同样适用。
+- **公网回调路由自动接收**：新增免鉴权 `GET /api/admin/auth/callback/{*tail}`，浏览器授权后导航至此路由，服务端按 OAuth `state` 定位会话并把回调数据投递进既有轮询通路，由 `poll_social_login` 统一完成 token 兑换——无需重复实现、无并发消费竞态。Admin UI 自动轮询并在回调到达后显示登录成功。CSRF 仍由每会话随机 `state` 保障，与本地回调服务器同等信任级别。
+- **`callbackBaseUrl` 配置逃生口**：当浏览器看到的地址 ≠ 真正可达公网地址（如经内网 IP 访问面板）时，可在 `config.json` 配置 `callbackBaseUrl` 强制覆盖，优先级高于前端派生值；未配置则完全自动。
+
+### ✨ 新功能 — 凭据列表卡片 / 列表双视图 + 分页增强
+
+- **卡片 / 列表视图切换**：凭据列表工具栏新增 iOS 分段控件，可在卡片视图与紧凑列表视图间切换；列表行完整继承卡片的全部操作（拖拽排序、勾选、优先级编辑、刷新 Token / 余额、启用 / 禁用、编辑、更多菜单），并在窄屏渐进隐藏次要信息保证可读；切换偏好持久化到本地。
+- **每页数量可配置**：翻页区新增每页数量下拉（12 / 24 / 48 / 96 / 全部），`pageSize=0` 即单页展示全部已筛选凭据；选择即复位到第 1 页并持久化。
+- **跨页全选**：筛选结果跨多页时显示「全选所有页」按钮，支持跨页批量删除 / 验活 / 刷新等操作；取消时仅清除筛选范围内的选择，保留筛选外已选项。
+
+### ✨ 新功能 — 来源渠道（备注）模糊搜索
+
+- **凭据列表新增模糊搜索**：筛选栏新增搜索框，按来源渠道（`sourceChannel`，即账号备注）与邮箱做大小写不敏感的子串匹配，与分组 / 分级筛选叠加生效；输入或切换筛选时自动复位到第 1 页。移动端整行展示、桌面端 200px 内联，非空时右侧一键清除。
+
+### ⚡ 优化 — 批量操作并发化（导入 / 验活 / 刷新余额）
+
+- **批量导入并发化**：批量导入改为一次性提交（请求携带 `concurrency: 8`），由服务端有界并发处理、逐条通过 SSE 实时回传导入 / 验活结果，告别前端逐条串行等待。
+- **批量验活并发化**：批量验活改为客户端 8 路并发 worker pool（去掉原先逐条之间的固定 2s 间隔），逐条更新验活结果与进度。
+- **「刷新当前页余额」并发化**：由原先逐条串行查询改为 8 路并发 worker pool（与批量验活一致），逐条更新卡片余额与进度，大批量刷新耗时大幅下降。
+
+### 🛠 修复 / 改进 — 凭据管理页面体验
+
+- **修复「更多操作」菜单在移动端导致页面渲染异常**：页内所有 DropdownMenu 改为非模态（`modal={false}`），避免 Radix 在 `<html>` 上施加 `overflow:hidden` 滚动锁——该锁在 iOS Safari 下与背景层 `backdrop-blur` / 固定定位叠加，会触发整页渲染错乱或横向位移。
+- **工具栏响应式重构**：筛选 + 操作行在移动端改为上下两段堆叠（筛选下拉两列并排、操作按钮两列网格、视图切换整行），桌面端保持「左筛选右操作」单行，消除窄屏下筛选器与按钮交错拥挤。
+- **修复列表视图优先级编辑被相邻列遮挡**：编辑栏改用绝对定位浮层（带背景与 `z-index`），输入框加宽以完整显示数字，并支持 Enter 确认 / Esc 取消；卡片视图优先级输入框字号在移动端提升至 16px，避免 iOS 聚焦自动放大整页。
+
+### 🛠 修复 / 改进 — 来自社区贡献
+
+> 以下改进来自 PR #21（@emojiiii），感谢 🙏
+
+- **`output_config.effort` 分级归一化**：`effort` 值会先归一化大小写与空格；已知较老的 4.5 / 4.6 系列（Opus / Sonnet / Haiku）不接受 `xhigh`，会自动降级为最接近的 `high`，避免上游返回 `Invalid additionalModelRequestFields`；Opus 4.7 / 4.8、Fable 5、Mythos 5、Claude 5 等较新模型保留 `xhigh`；其它未知模型对已知 effort 值保持原样（用紧凑黑名单而非易过期的模型白名单），未知 effort 值回退到 `high`。README 同步更新 effort 兼容说明。
+- **删除凭据清理历史失败记录**：删除凭据时同步清除其在 `traces.db` 的失败统计（`delete_for_credential`），配合凭据 ID 单调递增不复用已删除 ID，确保新增账号以干净的失败 / trace 历史起步，不会继承同 ID 旧账号的失败 baggage。
+
+## [0.6.6] - 2026-06-13
+
+主题：**账号分组管理（独立实体 + 调度隔离）+ 密钥模型重构（系统默认密钥 id=0）+ Native web_search 工具检测收窄**。分组从依附于凭据 / Key 的字符串标签提升为一等实体，独立持久化、改名 / 删除自动级联，并打通凭据列表筛选、概览页按分组统计与客户端 Key 的调度隔离；同时重构密钥模型——移除 `/v1` 流量主密钥概念，`apiKey` 每次启动幂等导入为不可删除的系统「默认密钥」（固定 `id=0` 对齐历史用量），`adminApiKey` 保留为管理面板登录密钥；此外收窄原生 web_search 工具识别，避免客户端自定义的同名普通工具被误判进内部搜索循环。
+
+### ✨ 新功能 — 账号分组管理（独立实体 + 调度隔离）
+
+- **分组提升为一等实体**：分组在 `groups.json` 独立持久化，凭据 / 客户端 Key 通过名字引用；增删改时校验引用，防 typo 漂移。改名 / 删除自动级联同步所有引用，强删支持 `?force=true` 级联清理。新增 4 个 Admin API（`GET/POST /groups`、`PATCH/DELETE /groups/:name`）。
+- **启动平滑迁移**：首次升级时扫描已有凭据 `groups` + 客户端 Key.group 反向写入注册表，老用户零改动切换。
+- **分组管理页 `/admin#/groups`**：卡片网格展示凭据 / Key 引用计数，创建 / 编辑 / 删除（有引用二次确认 + force 级联）。
+- **凭据列表分组筛选**：dashboard 顶部新增分组下拉，切换时分页自动复位。
+- **概览页按分组统计**：时序与按凭据分布支持 `?group=` 过滤；模型分布卡片在分组筛选时给出明确限制提示。
+- **客户端 Key 调度隔离**：Key 绑定分组后只调度该分组内账号（严格隔离，分组内无可用账号时请求失败不回退）。
+- **429 限流退避优化**：上游 429 改用更长退避（base 1s / cap 8s），总重试上限下调，避免多账号同时触顶连环撞墙。
+
+> 以上分组管理能力来自社区贡献 PR #19（@daniellee2015），感谢 🙏
+
+### ✨ 新功能 — 密钥模型重构
+
+- **移除 `/v1` 流量主密钥概念**：`apiKey` 不再作为独立的 master 鉴权分支，所有 `/v1` 流量统一走客户端 Key 系统。
+- **系统「默认密钥」固定 id=0**：每次启动幂等确保 `config.apiKey` 作为系统密钥存在，占用 `id=0` 以对齐历史 master 用量桶（`keyId=0`），保证「默认密钥」可查到升级前全部用量；旧版误建在其它 id 时启动自动迁移到 id=0。
+- **系统密钥不可删除、可轮换**：轮换时同步写回 `config.json` 的 apiKey，保留名称 / 描述 / 绑定分组 / 累计统计，避免重复导入。
+
+### 🛠 修复 / 改进
+
+- **保留 `adminApiKey` 为登录密钥**：管理面板登录仍用 `adminApiKey`，可在后台「修改登录API密钥」修改；Admin 鉴权走登录密钥校验。
+- **凭证删除行为统一**：单个卡片删除不再因凭证处于启用态而阻止确认，与批量删除行为一致。
+- **请求日志支持按分组筛选**：Trace 查询新增 `group` 参数（转为凭据 id 白名单过滤），前端日志页新增分组下拉。
+- **客户端 Key 列表显示 ID 列**：按 id 升序，系统密钥居首并显示「系统」徽章。
+- **移除「管理员API密钥」筛选项**：概览页与请求日志不再单列该选项（`keyId=0` 已由系统默认密钥覆盖），历史 `keyId=0` 记录回退显示 `#0`。
+
+### 🛠 修复 — 来自社区贡献
+
+- **Native web_search 工具检测收窄为类型匹配**（PR #17 @XuDONGCui）：`web_search` 工具识别从仅按名称匹配改为「名称 + `tool_type` 前缀」双重判定——只有 `name == "web_search"` 且 `tool_type` 以 `web_search_` 开头的 Anthropic 原生工具才会触发内部搜索循环。客户端自定义的、恰巧也命名为 `web_search` 的普通工具不再被误判，确保混合工具集请求走正常的对话路径。新增对应单测验证两类工具的区分行为，同步覆盖纯 web_search、混合工具及自定义同名工具的识别场景。
+
+## [0.6.5] - 2026-06-11
+
+主题：**Claude Code 字面工具调用容错 + 退化复读熔断**。这一版聚焦 Anthropic 兼容层在上游退化输出下的稳定性：当 Claude Code 场景中本应结构化返回的工具调用泄漏成字面 `<invoke>` 文本时，中转层会在严格边界内恢复为真实 `tool_use`；同时新增异常引导词复读熔断，避免 `call` / `count` / `card` 等垃圾文本刷屏、耗尽输出预算或污染会话历史。
+
+### ✨ 新功能 — 来自社区贡献
+
+感谢以下 PR 贡献者 🙏
+
+- **字面 `<invoke>` 工具调用泄漏容错**（PR #15 @xiaojiou176）：当上游把 `<invoke name="...">...</invoke>` 作为普通文本输出时，流式路径会在行首、非代码围栏、工具名已声明的前提下恢复为结构化 `tool_use`，避免客户端看到原始 XML 或漏执行真实工具调用。web_search agentic loop 复用同一嗅探逻辑，但 `web_search` 本身仍作为内部搜索处理，不会作为 raw client `tool_use` 暴露给宿主。
+- **退化 stray token 复读熔断**（PR #16 @xiaojiou176）：流式文本出口会检测 `call` / `count` / `card` 等引导词的连续独占行复读，超过阈值后丢弃本轮后续文本，避免上游退化输出刷屏和耗尽 `max_tokens`。非流式与 web_search 路径也会在 `<invoke>` 嗅探前折叠同类复读洪水，避免垃圾文本进入最终响应或后续会话历史。
+
+### 🛠 修复
+
+- **避免重复执行同一工具调用**（PR #15 @xiaojiou176）：若退化模型同时返回文本泄漏和结构化 `tool_use`，会按工具名与规范化 input 去重，防止客户端收到两个相同调用并重复执行。超长工具名被缩短发送给上游后，泄漏恢复路径会识别短名并还原为客户端原始工具名。
+- **保留 stray token 剥离前的换行**（PR #16 @xiaojiou176）：剥离 `call` / `count` / `card` 独占行时保留前一行换行，避免把叙述文本和后续 `<invoke>` 压到同一行而漏判真实工具调用。
+
+### ⚡ 优化
+
+- **减少 invoke 嗅探缓冲复制**（PR #16 @xiaojiou176）：`drain_invoke_sniff_buffer` 改为一次性取出本地 buffer 处理，避免退化大缓冲下每轮 clone 带来的额外开销。
+
+## [0.6.4] - 2026-06-09
+
+主题：**入口 Key 级用量分析 + 请求链路入口来源追踪 + Admin UI 移动端体验优化**。这一版把概览页从固定时间窗扩展为可按日期、粒度与入口 Key 过滤的分析面板；请求日志和凭据失败详情会区分“管理员API密钥”与已分发的客户端 Key；同时重排后台顶栏工具、统计图表、凭据卡片和表格在移动端的显示，减少窄屏溢出与操作拥挤。
+
+### ✨ 新功能 — 入口 Key 级用量分析
+
+- **概览页支持入口 Key 筛选**：统计页新增“全部入口 Key / 管理员API密钥 / 指定客户端 Key”筛选，调用量、Token、Credit、模型分布和上游凭据分布可按入口来源查看，方便定位某个客户端 Key 的成本与错误情况。
+- **支持自定义日期范围与统计粒度**：统计接口新增 `startDate` / `endDate` / `granularity` 参数，前端可在预设 24h / 7d / 30d 之外选择自定义日期，并在按小时 / 按天聚合之间切换。
+- **后端聚合按 Key 维度保留明细**：`UsageAggregator` 新增按 `key_id`、`key_id + model`、`key_id + credential` 的桶内聚合，`/stats/timeseries`、`/stats/by-model`、`/stats/by-credential` 均可用 `keyId` 过滤；非法 range、granularity、日期和 keyId 会返回明确的 400 错误。
+
+### ✨ 改进 — 请求日志与失败详情可追踪入口 Key
+
+- **Trace 记录入口 Key 类型**：请求链路新增 `keySource`，区分管理员API密钥与客户端 Key；鉴权中间件会在请求上下文中标记来源，trace 入库时持久化该字段。
+- **请求日志显示入口 Key**：请求日志表格新增“入口 Key”列，客户端 Key 会显示名称（缺失时回退 id），管理员业务 Key 显示为“管理员API密钥”；展开链路仍保留最终凭据与每跳尝试详情。
+- **凭据失败详情补充入口来源**：单个凭据的失败日志行现在同步显示触发该失败的入口 Key，便于区分是哪个客户端或管理员密钥导致某个凭据累计失败。
+
+### 🎨 改进 — Admin UI 全局工具与移动端布局
+
+- **顶栏工具全局化**：负载均衡切换、账号级风控故障转移、刷新、镜像在线更新和密钥管理从凭据页抽到全局顶栏，概览、凭据、客户端 Key、请求日志页面都可直接访问；移动端顶栏收敛为“更多操作”菜单。
+- **凭据管理移动端重排**：凭据页统计卡压缩为窄屏可读布局，工具栏改为两列按钮网格；凭据卡片增加长文本截断、单列信息行、余额面板稳定三列和底部操作区两行布局，避免小屏横向滚动和按钮挤压。
+- **概览图表移动端适配**：趋势图、模型饼图、凭据柱状图改用响应式高度与更紧凑边距，图例和坐标轴在窄屏下减少占用；趋势图系列名改为中文，图表空态高度同步收窄。
+- **表格窄屏可横向浏览**：客户端 Key 表格和请求日志表格设置稳定最小宽度、单行表头和单元格截断，避免列内容在移动端被压到不可读。
+
+### 🛠 修复 — 登录与文案细节
+
+- **Social 无痕登录链接复制更可靠**：复制登录链接前检查 Clipboard 权限与安全上下文；浏览器拒绝写入剪贴板时会选中链接并提示用户手动 `Ctrl+C`，避免无痕登录流程卡在“复制失败”。
+- **统一密钥命名**：后台文案将管理面板登录用 Key 统一为“登录API密钥”，将 `/v1/*` 客户端调用用 Key 统一为“管理员API密钥”，减少 Admin API Key / 业务 API Key 命名混用。
+
+## [0.6.3] - 2026-06-08
+
+主题：**Claude Code Thinking 兼容 + Kiro 原生 reasoning 事件 + 后台弹窗表单体验修复**。这一版聚焦暂存区中的协议兼容与 Admin UI 表单体验：转换层按上游模型能力处理 Opus / Sonnet Thinking 请求，流式 / 非流式路径支持 Kiro 原生 `reasoningContentEvent`，后台管理页修复导入 / 登录类弹窗的焦点裁切、标签间距和 textarea 拖拽卡顿问题。
+
+### 🛠 修复 — Claude Code / Opus 与 Sonnet Thinking 兼容
+
+- **Opus / Sonnet Thinking 兼容**：Claude Code 可能在普通模型名或 `-thinking` 模型下发送 `thinking` / `output_config`；转换层现在按上游模型能力决定是否发送 `additionalModelRequestFields`，不再因为开启 thinking 或客户端携带 `output_config` 就直接透传不受支持的字段，避免 `additionalModelRequestFields is not supported for this model`。
+- **收窄 `output_config.effort` 透传范围**：`additionalModelRequestFields.output_config` 只在已知可接受的 Opus 4.6 adaptive thinking 路径上传递；Opus 4.6 非 adaptive thinking、Opus 4.7 / 4.8、Sonnet 系列与其它模型会显式跳过该字段。
+
+### ✨ 新功能 — Kiro 原生 reasoning 事件
+
+- **支持 `reasoningContentEvent`**：新增 Kiro 原生 reasoning 事件解析，流式响应会把 `text` 转为 Anthropic `thinking_delta`、把 `signature` 转为 `signature_delta`、把 `redactedContent` 转为 `redacted_thinking`。
+- **非流式响应保留原生 thinking**：非流式路径会优先使用上游原生 thinking / signature / redacted content 组装 Anthropic content block；没有原生 reasoning 时仍保留旧的 `<thinking>...</thinking>` 文本提取兼容路径。
+- **thinking disabled 明确降级**：请求未启用 thinking 时，原生 reasoning 明文会作为普通 text 输出，不输出签名或 redacted thinking，避免客户端收到未请求的 thinking block。
+- **token 估算覆盖 thinking 内容**：输出 token 估算现在计入 `thinking` block，并为 `redacted_thinking` 计入固定开销，减少用量统计漏算。
+- **补充边界测试与真实 Claude Code 验证**：新增请求转换、流式顺序、非流式内容组装、redacted thinking、signature-only、thinking disabled 降级和 token 估算测试；真实 Claude Code 请求验证普通 Sonnet 4.5 与 `-thinking` 模型均可返回 thinking/signature/text 合法事件序列。
+
+### 🎨 改进 — 后台弹窗表单体验
+
+- **修复表单控件焦点态裁切 / 贴边**：`Input` / `Select` / `Textarea` 与按钮焦点环改为内嵌显示，避免在 Dialog 滚动区域、KAM 导入、批量导入、重新登录、重新导入、远程登录回调和代理池批量导入等窗口中被容器边缘裁掉。
+- **恢复标签与控件垂直间距**：普通 `label` 改为块级显示，修复 `space-y-*` 不能作用于 inline label 导致标签和输入框 / 下拉框过近的问题，同时保留 checkbox / switch 这类 flex label 布局。
+- **改善 textarea 拖拽调整高度体验**：textarea 不再使用 `transition-all` 过渡高度，只保留边框、背景和阴影过渡；拖动改变高度会立即跟手，KAM 导入、批量导入、Token 重新导入、远程登录回调和代理池批量导入中的原生 textarea 样式同步统一。
+
+## [0.6.2] - 2026-06-07
+
+主题：**Builder ID/free 流式对话 profileArn 400 修复 + 后台前端依赖清理**。上一版为规避占位符 ARN 的 403 风险，在流式请求中剥离了 BuilderID 占位 `profileArn`；但 `q.* /generateAssistantResponse` 对 Builder ID/free 账号仍强制要求该字段，调用 `claude-sonnet-4.5` 等模型会报 `400 "profileArn is required for this request."`。这一版恢复纯 Builder ID/free 流式请求体的占位 ARN，同时保留 Enterprise / IdC 账号解析真实 ARN 的路径。
+
+### 🛠 修复 — Builder ID/free 流式对话 profileArn 400
+
+- **恢复 Builder ID 占位 profileArn 注入**：`KiroCredentials::streaming_profile_arn()` 对 OAuth Builder ID/free 凭据会原样返回显式占位 ARN；未填充时按官方 IDE 行为回退到 Builder ID 默认占位 ARN，避免流式端点因缺少 `profileArn` 直接返回 400。
+- **保留 Enterprise / IdC 真实 ARN 优先级**：发起流式请求前仍会通过 `resolve_profile_arn_for` 尝试解析并回填 Enterprise / IdC 真实 `profileArn`；解析成功后使用真实 ARN，纯 Builder ID 无 Enterprise profile 时才回退占位 ARN。
+- **补充回归测试**：新增断言覆盖显式 Builder ID 占位 ARN、未填充 Builder ID/free 凭据、Social 固定 ARN、真实 ARN 与 API Key 凭据的流式 `profileArn` 行为。
+
+### 🧹 清理 — 后台前端依赖
+
+- **移除未使用的 `@radix-ui/react-select` 依赖**：后台下拉框已在 0.6.1 改为基于 `DropdownMenu` 的实现，本版清理残留依赖，避免前端依赖树继续携带未使用包。
+
+## [0.6.1] - 2026-06-07
+
+主题：**缓存命中/创建 token 精确计量 + 流式对话 profileArn 占位符 403 修复 + 后台前端组件统一**。上一版把流式端点改成始终发送 profileArn（含 BuilderID 占位符），但占位符指向调用者无权访问的 profile，仍会被上游以 `403 "User is not authorized to make this call"` 拒绝；这一版改为只发送真实 / Social 共享 ARN。同时把中转层缓存计量从粗略估算重写为按前缀链匹配 + 互斥口径分摊的精确计量，请求日志新增 token 列；后台前端把原生确认框 / 下拉框统一为风格一致的组件。
+
+### 🛠 修复 — 流式对话 profileArn 占位符 403
+
+- **占位符 ARN 不再发送**：`KiroCredentials::streaming_profile_arn()` 对 BuilderID 占位符（及未填充 profileArn 的 BuilderID 账号）返回 `None`。占位符指向调用者无权访问的 profile，发送会触发 `403 "User is not authorized to make this call"`；该端点本就不强制此字段。Enterprise / IdC 的真实 ARN 已由 `resolve_profile_arn_for` 回填，与 Social 共享 ARN 一并原样发送。
+
+### ✨ 改进 — 缓存命中 / 创建 token 精确计量
+
+- **前缀链匹配替代锚点**：缓存命中模拟改用「最长公共前缀」链式匹配，消除 `tool_result`（role=user）导致的「倒数第二个 user」锚点漂移，跨轮对话命中稳定。
+- **会话隔离**：按 `metadata` 的 user / session（缺失时回退 client key id）派生隔离种子，不同会话不会互相串缓存。
+- **互斥口径分摊**：`input` / `cache_creation` / `cache_read` 按比例分摊，保证三者互斥且总和等于 total，不再重复计入被缓存覆盖的前缀。
+- **token 估算与签名解耦**：哈希用签名、计量用原文，去除签名噪声对 token 数的污染。
+- **图片 token 估算**：按 `(宽 × 高) / 750` 估算（长边封顶 1568px），图片块的媒体类型 + 数据纳入缓存哈希。
+- **请求日志记录 token**：`traces.db` 新增 input / output / cache_creation / cache_read 列（幂等迁移），日志接口返回并合计 totalTokens。
+- 模块 `prompt_cache` 更名为 `cache_metering`，持久化文件相应更名。
+
+### ✨ 改进 — 后台前端组件统一
+
+- **统一二次确认弹窗**：新增 `useConfirm` / `ConfirmProvider`，全站确认操作改用风格一致的弹窗替代原生 `confirm()`。
+- **重写下拉框**：以 `DropdownMenu`（`modal={false}`）重写 `Select`，替换原生 `select` 与 radix `Select`。后者 Content 硬编码 `disableOutsidePointerEvents`，经 `DismissableLayer` 给 `body` 上 `pointer-events` 锁，嵌套在 Dialog 内同时关闭时卸载顺序竞态会把 body 误留为 `none` 导致整页不可点；non-modal 分支不触碰 body 锁，从源头规避。下拉默认值改为从 children 静态推导，修复菜单未打开时默认值显示为空。
+
+## [0.6.0] - 2026-06-07
+
+主题：**Enterprise / IAM Identity Center 凭据全链路打通 + 流式对话 profileArn 修复 + 登录体验对齐官方 IDE**。此前导入或登录企业（Enterprise）IdC 账号后，获取订阅/用量会报 `403 {"message":"Invalid token"}`，且发起对话会报 `400 profileArn is required` / `403 bearer token invalid`——根因是这类账号在请求里带了 BuilderID 占位 profileArn 或缺失真实 profileArn。这一版定位并修复了用量查询与流式对话两条链路，同时把添加凭据 / 登录 / 导出的整体行为与官方 IDE / 账号管理器对齐，并新增 Enterprise 登录入口与一批凭据管理体验改进。
+
+### 🛠 修复 — 流式对话 400「profileArn is required」/ 403「bearer token invalid」
+
+新版上游对流式端点（`generateAssistantResponse`）强制要求请求体携带 `profileArn`，且校验其与 token 身份匹配。表现为对话直接失败（新模型如 `claude-opus-4-8-thinking` 同样命中）：
+
+- 不带 profileArn → `400 {"message":"profileArn is required for this request."}`；
+- 带 BuilderID 占位符 ARN → `403 {"message":"The bearer token included in the request is invalid."}`。
+
+按官方 Kiro IDE 的行为分两类账号修复：
+
+- **流式端点始终发送 profileArn（含 BuilderID 占位符）**：新增 `KiroCredentials::streaming_profile_arn()`，流式端点不再像用量类接口那样剥离占位符。纯 BuilderID 账号的占位符与其 token 身份匹配，可正常使用。
+- **Enterprise / IdC 账号解析并回填真实 profileArn**：这类账号的占位符与 token 不匹配（403），必须使用真实 profileArn——而真实 ARN 既不是占位符也不在 OIDC 刷新响应里返回。新增 `ListAvailableProfiles` 上游调用（AWS JSON 1.0，target `AmazonCodeWhispererService.ListAvailableProfiles`，端点 `q.us-east-1` / `q.eu-central-1`）与 `MultiTokenManager::resolve_profile_arn_for()`：首次请求时按需解析真实 profileArn、写回凭据并持久化，之后直接命中。无 Enterprise profile 的账号（纯 BuilderID）进程内只查询一次，回退到占位符逻辑。
+- 用量类接口（getUsageLimits / ListAvailableModels / setUserPreference）继续使用 `effective_profile_arn()`（跳过占位符）；回填真实 ARN 后它们也会带上真实 profileArn，行为更贴近官方 IDE。
+
+### 🛠 修复 — Enterprise/IdC 用量查询 403
+
+- **跳过占位 profileArn**：新增 `KiroCredentials::effective_profile_arn()` 与 `is_placeholder_profile_arn()`——只向上游发送真实 ARN（含 Social 共享 ARN），跳过 `BUILDER_ID_PROFILE_ARN` 占位符。BuilderID / Enterprise / IdC 账号本就没有可用 profileArn，发送占位符会被上游以 403 "Invalid token" 拒绝。`getUsageLimits` / `ListAvailableModels` / `setUserPreference` 以及流式端点（ide/cli）的请求体与 `x-amzn-kiro-profile-arn` 头全部改用它。
+- **用量类接口固定使用兼容版本**：`getUsageLimits` / `ListAvailableModels` / `setUserPreference` 固定以 `0.9.2` 作为 `KiroIDE-<version>` 标识——新版上游对这些接口强制要求 profileArn，对无 profileArn 的 Enterprise/IdC 账号会失败；该版本下无需 profileArn 即可返回订阅与用量。
+- **区域映射 + 403 回退**：上述接口仅在 `us-east-1` / `eu-central-1` 两个端点提供服务，依据凭据 SSO 区域选择主端点（`eu-*` → eu-central-1，其余 → us-east-1），主端点 403 时自动回退到另一个端点。
+- **解析并回填邮箱**：`getUsageLimits` 响应的 `userInfo.email` 现在会被解析，凭据无邮箱时自动回填。
+
+### ✨ 新功能 — Kiro IDE 版本自动获取
+
+- 新增 `src/kiro/kiro_version.rs`：启动时从官方稳定版元数据端点（`prod.download.desktop.kiro.dev/stable/metadata-linux-x64-stable.json` 的 `currentRelease`）拉取当前 Kiro IDE 版本，进程内缓存 + 每 12h 后台刷新，失败回退到 `config.kiroVersion`。流式端点 User-Agent 与 Social 刷新随真实版本走，替代写死的版本号。
+
+### ✨ 新功能 — Enterprise 登录入口与登录体验
+
+- **新增 Enterprise (IAM Identity Center) 登录入口**：仅显示 SSO Start URL（必填）+ SSO 区域，与官方交互一致；登录成功的凭据带 `provider=Enterprise`、`startUrl`、`region`。
+- **SSO 区域可选 / 自定义**：登录对话框区域字段改为「分组下拉（US / Europe / Asia Pacific / Other 常用区域）+ 始终可输入的自定义文本框」。
+- **AWS SSO 与 Enterprise 均支持无痕登录**：勾选后复制验证链接，由用户在无痕 / 隐身窗口打开，避免与已登录的 AWS 账号串号。
+- **IdC 登录对齐官方**：注册客户端使用 5 个 codewhisperer 作用域并带上 `issuerUrl`（Builder ID 为默认 Start URL，Enterprise 为组织 Start URL）。
+- **新增 `startUrl` 字段**：凭据模型新增 SSO Start URL 字段，登录 / 导入 / 导出全链路保留。
+
+### ✨ 改进 — 凭据管理体验
+
+- **添加 / 登录成功后自动刷新余额**：添加凭据、Social 登录、IdC/Enterprise 登录成功后主动拉取一次余额（含订阅等级、邮箱）并写入缓存，新凭据卡片立即显示余额。
+- **凭据标签按登录方式显示**：卡片身份标签根据 `provider` 细分为 GitHub / Google / Builder ID / Enterprise / IAM SSO / API Key，不再统一显示 Social / IdC。
+- **删除登录与添加凭据中的优先级输入项**：保留卡片上对已有凭据的优先级编辑与拖拽排序。
+- **无需先停用即可直接删除凭据**：单个与批量删除都不再要求凭据处于禁用状态（仍有二次确认）。
+- **一键超额遇 403 友好提示**：开启超额（一键 / 单条）命中 403 / 权限不足时统一提示「请联系您的组织管理员以获取支持」。
+- **导出格式调整**：凭据导出改为嵌套 `Account` 结构（凭据收进 `credentials` 子对象、`expiresAt` 毫秒时间戳、含顶层 `groups`/`tags` 数组），便于第三方账号管理工具直接重新导入。
 
 ## [0.6.6] - 2026-06-13
 

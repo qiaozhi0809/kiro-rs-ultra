@@ -8,7 +8,8 @@ use axum::{
 use super::{
     handlers::{
         add_credential, add_proxy, apply_image_update, assign_proxies_round_robin,
-        assign_proxy_to_credential, batch_add_proxies, check_all_proxies, check_proxy,
+        assign_proxy_to_credential, batch_add_proxies, batch_import_credentials,
+        check_all_proxies, check_proxy,
         check_rate_limit, check_update, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
@@ -23,9 +24,10 @@ use super::{
         set_account_throttle_config, set_client_key_disabled, set_credential_disabled,
         set_credential_overage, set_credential_priority, set_global_proxy,
         set_load_balancing_mode, set_log_governance_config, set_proxy_enabled, set_update_config,
-        start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
-        stats_by_credential, stats_by_model, stats_overview, stats_timeseries,
-        update_admin_key, update_client_key, update_credential, update_group, update_refresh_token,
+        social_oauth_callback, start_idc_login, start_idc_relogin, start_social_login,
+        start_social_relogin, stats_by_credential, stats_by_model, stats_overview,
+        stats_timeseries, update_admin_key, update_client_key, update_credential, update_group,
+        update_refresh_token,
     },
     middleware::{AdminState, admin_auth_middleware},
 };
@@ -67,6 +69,7 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/clear-throttle", post(clear_throttle))
         .route("/credentials/{id}/reset-stats", post(reset_success_count))
         .route("/credentials/reset-stats", post(reset_all_success_count))
+        .route("/credentials/batch-import", post(batch_import_credentials))
         .route(
             "/credentials/disable-quota-exceeded",
             post(disable_quota_exceeded),
@@ -167,5 +170,12 @@ pub fn create_admin_router(state: AdminState) -> Router {
             admin_auth_middleware,
         ));
 
-    Router::new().merge(authenticated).with_state(state)
+    // 免鉴权路由：远程部署模式下 OAuth 公网回调（浏览器顶层导航到达，不带 admin API Key）。
+    // 由 OAuth state 定位会话，CSRF 保护与本地回调服务器同等。
+    let public = Router::new().route("/auth/callback/{*tail}", get(social_oauth_callback));
+
+    Router::new()
+        .merge(authenticated)
+        .merge(public)
+        .with_state(state)
 }

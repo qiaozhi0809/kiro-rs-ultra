@@ -8,7 +8,7 @@ interface SubscriptionBadgeProps {
   className?: string
 }
 
-type Tier = 'free' | 'pro' | 'pro_plus' | 'power' | 'unknown'
+export type Tier = 'free' | 'pro' | 'pro_plus' | 'power' | 'unknown'
 
 interface TierStyle {
   /** 容器背景与文字颜色 */
@@ -19,7 +19,8 @@ interface TierStyle {
   label: string
 }
 
-function detectTier(title?: string | null): Tier {
+/** 根据订阅标题推断分级（供列表筛选复用） */
+export function detectTier(title?: string | null): Tier {
   if (!title) return 'unknown'
   const upper = title.toUpperCase()
   if (upper.includes('POWER')) return 'power'

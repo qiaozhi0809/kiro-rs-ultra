@@ -235,6 +235,70 @@ pub struct AddCredentialResponse {
     pub email: Option<String>,
 }
 
+// ============ 批量导入（SSE） ============
+
+/// 批量导入请求。服务端按 `concurrency`（缺省 8，夹取到 [1,16]）有界并发地
+/// 逐条处理，结果通过 SSE 流逐条推送。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportRequest {
+    /// 待导入凭据（复用单条添加的富类型）
+    pub credentials: Vec<AddCredentialRequest>,
+    /// 并发度，缺省 8，服务端 clamp 到 [1, 16]
+    #[serde(default)]
+    pub concurrency: Option<u8>,
+    /// 是否验活。`true`（缺省）：add 后取余额校验，失败回滚；
+    /// `false`：仅 add 落库（"直接导入"），不取余额、不回滚。
+    #[serde(default = "default_batch_verify")]
+    pub verify: bool,
+}
+
+fn default_batch_verify() -> bool {
+    true
+}
+
+/// 批量导入 SSE 事件。每条凭据完成时发一条 `index` 事件；全部完成后发一条
+/// `status == "summary"` 的汇总事件（此时 `index` 为 None）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportEvent {
+    /// 对应请求数组下标；summary 事件为 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    /// "verified" | "duplicate" | "failed" | "summary"
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// "current/limit" 用量字符串，verified 时填
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscription: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// failed 且已回滚（删除）时为 true
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rolled_back: Option<bool>,
+    /// 仅 summary 事件填充
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<BatchImportSummary>,
+}
+
+/// 批量导入汇总（末尾事件）
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportSummary {
+    pub total: usize,
+    /// 直接导入（未验活）成功数
+    pub imported: usize,
+    pub verified: usize,
+    pub duplicate: usize,
+    pub failed: usize,
+    pub rolled_back: usize,
+}
+
 // ============ 余额查询 ============
 
 /// 余额查询响应
@@ -775,6 +839,10 @@ pub struct StartSocialLoginRequest {
     /// Kiro auth endpoint（留空用默认）
     #[serde(default)]
     pub auth_endpoint: Option<String>,
+    /// OAuth 回调公网地址（远程模式）。通常由前端按当前访问地址自动派生：
+    /// `${location.origin}/api/admin/auth/callback`。若 `config.callbackBaseUrl` 已配置则以其为准（覆盖）。
+    #[serde(default)]
+    pub callback_base_url: Option<String>,
 }
 
 /// 发起 Social 登录响应
@@ -787,6 +855,9 @@ pub struct StartSocialLoginResponse {
     pub portal_url: String,
     /// 会话过期时间（RFC3339）
     pub expires_at: String,
+    /// 是否处于远程回调模式（已配置 callbackBaseUrl）。
+    /// true 时 OAuth 回调指向公网路由，前端可自动轮询完成；false 时走本地端口。
+    pub remote: bool,
 }
 
 /// 手动完成 Social 登录请求（远程访问场景：从浏览器地址栏复制回调 URL）

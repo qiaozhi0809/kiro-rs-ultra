@@ -46,6 +46,17 @@ const api = axios.create({
   },
 })
 
+/**
+ * 按当前浏览器访问地址自动派生 OAuth 回调公网地址。
+ *
+ * 面板与 API 同源（API 用相对 /api/admin 前缀），故浏览器自身知道的 origin 就是最可信的公网地址。
+ * 浏览器授权后会落到 `${origin}/api/admin/auth/callback/oauth/callback`，由服务端公网回调路由接收。
+ * 远程部署（Render / VPS / Docker）零配置即可用；若需强制覆盖，在后端 config.json 配 callbackBaseUrl。
+ */
+function deriveCallbackBaseUrl(): string {
+  return `${window.location.origin}/api/admin/auth/callback`
+}
+
 // 请求拦截器添加 API Key
 api.interceptors.request.use((config) => {
   const apiKey = storage.getApiKey()
@@ -171,6 +182,115 @@ export async function addCredential(
 ): Promise<AddCredentialResponse> {
   const { data } = await api.post<AddCredentialResponse>('/credentials', req)
   return data
+}
+
+// ── 批量导入（SSE） ──────────────────────────────────────────────────────────
+
+/** 批量导入 SSE 单条事件（对应请求数组下标 index） */
+export interface BatchImportItemEvent {
+  index: number
+  status: 'verified' | 'imported' | 'duplicate' | 'failed'
+  credentialId?: number
+  email?: string
+  usage?: string
+  subscription?: string
+  error?: string
+  /** failed 且已回滚（删除）时为 true */
+  rolledBack?: boolean
+}
+
+/** 批量导入末尾汇总事件 */
+export interface BatchImportSummary {
+  total: number
+  /** 直接导入（未验活）成功数 */
+  imported: number
+  verified: number
+  duplicate: number
+  failed: number
+  rolledBack: number
+}
+
+export interface BatchImportCredentialsRequest {
+  credentials: AddCredentialRequest[]
+  /** 并发度，缺省 8，服务端 clamp 到 [1, 16] */
+  concurrency?: number
+  /** 是否验活。true（缺省）：add 后取余额校验 + 失败回滚；false：仅 add 落库（直接导入） */
+  verify?: boolean
+}
+
+/**
+ * 批量导入凭据并验活（SSE 流）。
+ *
+ * 服务端有界并发地逐条 add + 取余额验活 + 失败回滚，每条完成即通过 SSE 推送
+ * 一条 `BatchImportItemEvent`（乱序，带 index），全部完成后推送一条汇总。
+ *
+ * 用 fetch 读流而非 EventSource：EventSource 不支持 POST/自定义 header，
+ * 而本端点需带 x-api-key 鉴权并 POST 大 body。
+ *
+ * @param onEvent      每条凭据结果
+ * @param onSummary    末尾汇总
+ * @param signal       AbortSignal，取消时中断流读取
+ */
+export async function batchImportCredentials(
+  req: BatchImportCredentialsRequest,
+  onEvent: (e: BatchImportItemEvent) => void,
+  onSummary: (s: BatchImportSummary) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  const apiKey = storage.getApiKey()
+  const resp = await fetch('/api/admin/credentials/batch-import', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(apiKey ? { 'x-api-key': apiKey } : {}),
+    },
+    body: JSON.stringify(req),
+    signal,
+  })
+
+  if (!resp.ok) {
+    let msg = `HTTP ${resp.status}`
+    try {
+      const body = await resp.json()
+      msg = body?.message || body?.error || msg
+    } catch {
+      /* 忽略 JSON 解析失败，回退到状态码 */
+    }
+    throw new Error(msg)
+  }
+  if (!resp.body) throw new Error('响应缺少可读流')
+
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    // SSE 事件以空行（\n\n）分隔
+    let sep: number
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      const raw = buffer.slice(0, sep)
+      buffer = buffer.slice(sep + 2)
+      const dataLine = raw.split('\n').find((l) => l.startsWith('data:'))
+      if (!dataLine) continue
+      const jsonStr = dataLine.slice(5).trim()
+      if (!jsonStr) continue
+      let ev: Record<string, unknown>
+      try {
+        ev = JSON.parse(jsonStr)
+      } catch {
+        continue
+      }
+      if (ev.status === 'summary') {
+        onSummary(ev.summary as BatchImportSummary)
+      } else {
+        onEvent(ev as unknown as BatchImportItemEvent)
+      }
+    }
+  }
 }
 
 // 删除凭据
@@ -437,7 +557,10 @@ export async function updateAdminKey(req: UpdateAdminKeyRequest): Promise<Succes
 export async function startSocialLogin(
   req: StartSocialLoginRequest
 ): Promise<StartSocialLoginResponse> {
-  const { data } = await api.post<StartSocialLoginResponse>('/auth/social/start', req)
+  const { data } = await api.post<StartSocialLoginResponse>('/auth/social/start', {
+    callbackBaseUrl: deriveCallbackBaseUrl(),
+    ...req,
+  })
   return data
 }
 
@@ -465,7 +588,10 @@ export async function startSocialRelogin(
 ): Promise<StartSocialLoginResponse> {
   const { data } = await api.post<StartSocialLoginResponse>(
     `/credentials/${credentialId}/relogin/social/start`,
-    req
+    {
+      callbackBaseUrl: deriveCallbackBaseUrl(),
+      ...req,
+    }
   )
   return data
 }

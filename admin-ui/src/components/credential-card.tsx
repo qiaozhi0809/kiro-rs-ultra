@@ -14,6 +14,7 @@ import {
   Clock,
   ScrollText,
   Boxes,
+  Wallet,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -69,6 +70,8 @@ interface CredentialCardProps {
   onRefreshBalance: () => void;
   /** 该凭据的失败分类计数（来自 trace 聚合）；无数据时回退 totalFailureCount */
   failureStats?: { auth: number; throttle: number; other: number };
+  /** 展示形态：卡片（默认）或紧凑列表行 */
+  view?: "card" | "list";
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -193,6 +196,7 @@ export function CredentialCard({
   loadingBalance,
   onRefreshBalance,
   failureStats,
+  view = "card",
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false);
   const [priorityValue, setPriorityValue] = useState(
@@ -367,8 +371,450 @@ export function CredentialCard({
   const reasonStyle = getDisabledReasonStyle(credential.disabledReason);
   const isThrottled = !credential.disabled && throttleRemaining > 0;
 
+  // 卡片与列表行共用的状态描边 / 灰化（活跃 · 超额 · 冷却 · 禁用）
+  const stateClasses = [
+    credential.isCurrent ? "ring-2 ring-primary/60 shadow-apple-lg" : "",
+    !credential.disabled && isQuotaExceeded ? "ring-1 ring-amber-500/60" : "",
+    disabledByQuota
+      ? "ring-1 ring-amber-500/70 bg-amber-50/40 dark:bg-amber-500/[0.04]"
+      : "",
+    isThrottled
+      ? "ring-1 ring-orange-500/60 bg-orange-50/40 dark:bg-orange-500/[0.04]"
+      : "",
+    credential.disabled && !disabledByQuota ? "opacity-70" : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  // 订阅 / 状态 / 鉴权 / 分组等徽章 —— 卡片头部与列表行共用
+  const badges = (
+    <>
+      {balance?.subscriptionTitle && (
+        <SubscriptionBadge
+          title={balance.subscriptionTitle}
+          className="max-w-full"
+        />
+      )}
+      {credential.isCurrent && <Badge variant="success">活跃</Badge>}
+      {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
+      {credential.disabled && reasonStyle && (
+        <Badge variant={reasonStyle.variant}>已禁用 · {reasonStyle.label}</Badge>
+      )}
+      {credential.disabled && !reasonStyle && (
+        <Badge variant="destructive">已禁用</Badge>
+      )}
+      {/* 仍启用但已经达到上限：黄色"已超额"徽章 */}
+      {!credential.disabled && isQuotaExceeded && (
+        <Badge variant="warning">已超额</Badge>
+      )}
+      {isThrottled && (
+        <Badge
+          variant="warning"
+          className="bg-orange-500/15 text-orange-700 dark:text-orange-300 border-orange-500/30"
+          title="账号级风控冷却中（429 + suspicious activity），到期或手动解除后恢复调度"
+        >
+          <Clock className="mr-1 h-3 w-3" />
+          冷却 {formatThrottleCountdown(throttleRemaining)}
+        </Badge>
+      )}
+      {credential.authMethod && <Badge variant="secondary">{authLabel}</Badge>}
+      {/* 配置元信息合并为单个徽章，减少换行：endpoint · ARN */}
+      {(credential.endpoint || credential.hasProfileArn) && (
+        <Badge
+          variant="outline"
+          className="max-w-full truncate"
+          title={
+            credential.hasProfileArn ? "endpoint / 已配置 Profile ARN" : "endpoint"
+          }
+        >
+          {[credential.endpoint, credential.hasProfileArn ? "ARN" : null]
+            .filter(Boolean)
+            .join(" · ")}
+        </Badge>
+      )}
+      {/* 账号所属分组 */}
+      {(credential.groups ?? []).map((g) => (
+        <Badge key={g} variant="outline" title="账号分组">
+          {g}
+        </Badge>
+      ))}
+      {/* 账号来源渠道 */}
+      {credential.sourceChannel && (
+        <Badge variant="outline" title="账号来源渠道">
+          来源: {credential.sourceChannel}
+        </Badge>
+      )}
+    </>
+  );
+
+  // “更多操作”下拉 —— 卡片与列表行共用
+  const moreMenu = (
+    // modal={false}：菜单非模态，避免 Radix 在 <html> 上施加 overflow:hidden 滚动锁。
+    // 该锁在移动端（尤其 iOS Safari）会与背景层 backdrop-blur / 固定定位叠加，
+    // 导致整页渲染错乱或横向位移——这正是移动端点击"更多操作"后页面异常的根因。
+    <DropdownMenu modal={false}>
+      <DropdownMenuTrigger asChild>
+        <Button size="icon" variant="ghost" title="更多操作">
+          <MoreHorizontal className="h-4 w-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuItem
+          onSelect={(e) => {
+            e.preventDefault();
+            handleReset();
+          }}
+          disabled={
+            resetFailure.isPending ||
+            (credential.failureCount === 0 &&
+              credential.refreshFailureCount === 0)
+          }
+        >
+          <RotateCcw />
+          重置失败计数
+        </DropdownMenuItem>
+        <DropdownMenuItem
+          onSelect={() => setShowModelsDialog(true)}
+          disabled={credential.disabled}
+          title={credential.disabled ? "已禁用凭据无法查询" : undefined}
+        >
+          <Boxes />
+          查看可用模型
+        </DropdownMenuItem>
+        {throttleRemaining > 0 && (
+          <DropdownMenuItem
+            onSelect={(e) => {
+              e.preventDefault();
+              handleClearThrottle();
+            }}
+            disabled={clearThrottle.isPending}
+          >
+            <Clock />
+            解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
+          </DropdownMenuItem>
+        )}
+        {balance?.overageCapable === true &&
+          (balance.overageEnabled ? (
+            <DropdownMenuItem
+              onSelect={(e) => {
+                e.preventDefault();
+                handleSetOverage(false);
+              }}
+              disabled={overageBusy}
+            >
+              <ZapOff />
+              关闭超额
+            </DropdownMenuItem>
+          ) : (
+            <DropdownMenuItem
+              onSelect={(e) => {
+                e.preventDefault();
+                handleSetOverage(true);
+              }}
+              disabled={overageBusy}
+            >
+              <Zap className="text-emerald-500" />
+              开启超额
+            </DropdownMenuItem>
+          ))}
+        {credential.authMethod !== "api_key" && <DropdownMenuSeparator />}
+        {credential.authMethod !== "api_key" && (
+          <DropdownMenuItem onSelect={() => setShowReloginDialog(true)}>
+            <LogIn />
+            重新登录
+          </DropdownMenuItem>
+        )}
+        {credential.authMethod !== "api_key" && (
+          <DropdownMenuItem onSelect={() => setShowUpdateTokenDialog(true)}>
+            <RefreshCw />
+            重新导入 Token
+          </DropdownMenuItem>
+        )}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          destructive
+          onSelect={(e) => {
+            e.preventDefault();
+            setShowDeleteDialog(true);
+          }}
+        >
+          <Trash2 />
+          删除凭据
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+
+  // 紧凑列表行：继承卡片的全部操作（启用/禁用 · 优先级 · 失败/成功 · 刷新 · 编辑 · 更多 · 拖拽 · 选择）
+  const listView = (
+    <div
+      ref={setNodeRef}
+      style={dragStyle}
+      data-credential-id={credential.id}
+      className={`group flex min-w-0 items-center gap-2 rounded-2xl border bg-card px-2 py-2 transition-all sm:gap-3 sm:px-3 ${
+        isDragging
+          ? "shadow-apple-lg opacity-80"
+          : "hover:bg-accent/40 hover:shadow-apple-sm"
+      } ${stateClasses}`}
+    >
+      {/* 拖拽手柄 */}
+      <Button
+        ref={setActivatorNodeRef}
+        size="icon"
+        variant="ghost"
+        data-no-rect-select
+        className="h-8 w-8 shrink-0 cursor-grab touch-none active:cursor-grabbing"
+        title="拖拽调整优先级"
+        {...attributes}
+        {...listeners}
+      >
+        <GripVertical className="h-4 w-4 text-muted-foreground" />
+      </Button>
+
+      {/* 选择框 */}
+      <label
+        data-no-rect-select
+        className="flex h-8 w-8 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-accent"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <Checkbox
+          className="h-5 w-5 [&_svg]:h-4 [&_svg]:w-4"
+          checked={selected}
+          onCheckedChange={onToggleSelect}
+        />
+      </label>
+
+      {/* 身份 + 徽章 */}
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-sm font-medium leading-5">
+          {credential.email || `凭据 #${credential.id}`}
+        </div>
+        <div className="mt-1 flex min-w-0 items-center gap-1 overflow-hidden [&>*]:shrink-0">
+          {badges}
+        </div>
+      </div>
+
+      {/* 关键指标（中大屏） */}
+      <div className="hidden shrink-0 items-center gap-5 lg:flex">
+        <div className="relative w-14 shrink-0 text-center">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            优先级
+          </div>
+          {/* 固定高度占位，避免编辑态切换时整行高度抖动 */}
+          <div className="mt-0.5 flex h-[26px] items-center justify-center">
+            {editingPriority ? (
+              // 编辑栏（≈112px）比列宽（56px）更宽：绝对定位脱离流式布局浮起，
+              // 配合背景与 z-index，避免被相邻"失败"列在绘制顺序上覆盖
+              <div className="absolute left-1/2 top-1/2 z-30 inline-flex -translate-x-1/2 -translate-y-1/2 items-center gap-0.5 rounded-md border border-border/60 bg-card p-1 shadow-apple-sm">
+                <Input
+                  type="number"
+                  value={priorityValue}
+                  onChange={(e) => setPriorityValue(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") handlePriorityChange();
+                    if (e.key === "Escape") {
+                      setEditingPriority(false);
+                      setPriorityValue(String(credential.priority));
+                    }
+                  }}
+                  className="h-7 w-16 rounded-md text-sm"
+                  min="0"
+                  autoFocus
+                />
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-7 w-7"
+                  onClick={handlePriorityChange}
+                  disabled={setPriority.isPending}
+                  title="确认"
+                >
+                  ✓
+                </Button>
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-7 w-7"
+                  onClick={() => {
+                    setEditingPriority(false);
+                    setPriorityValue(String(credential.priority));
+                  }}
+                  title="取消"
+                >
+                  ✕
+                </Button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
+                onClick={() => setEditingPriority(true)}
+                title="点击编辑优先级"
+              >
+                {credential.priority}
+                <Pencil className="h-3 w-3 opacity-70" />
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="w-20 text-center">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            失败
+          </div>
+          <button
+            type="button"
+            onClick={() => setShowFailuresDialog(true)}
+            className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent"
+            title="鉴权失败 / 账号风控 / 其他（额度·瞬态·网络等）。点击查看失败日志详情"
+          >
+            {failureStats ? (
+              <span className="tabular-nums">
+                <span className="text-destructive">{failureStats.auth}</span>
+                <span className="text-muted-foreground/50">/</span>
+                <span className="text-amber-600 dark:text-amber-400">
+                  {failureStats.throttle}
+                </span>
+                <span className="text-muted-foreground/50">/</span>
+                <span className="text-muted-foreground">
+                  {failureStats.other}
+                </span>
+              </span>
+            ) : (
+              <span
+                className={
+                  credential.totalFailureCount > 0
+                    ? "text-destructive"
+                    : "text-muted-foreground"
+                }
+              >
+                {credential.totalFailureCount}
+              </span>
+            )}
+            <ScrollText className="h-3.5 w-3.5 opacity-70" />
+          </button>
+        </div>
+
+        <div className="w-16 text-center">
+          <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            成功
+          </div>
+          <button
+            type="button"
+            onClick={handleResetSuccess}
+            className="mt-0.5 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-sm font-medium tabular-nums transition-colors hover:bg-accent hover:text-primary"
+            title="点击重置成功次数"
+          >
+            {credential.successCount}
+            <RotateCcw className="h-3 w-3 opacity-70" />
+          </button>
+        </div>
+      </div>
+
+      {/* 余额（大屏） */}
+      <div className="hidden w-44 shrink-0 xl:block">
+        {loadingBalance ? (
+          <div className="flex items-center justify-center gap-1.5 text-xs text-muted-foreground">
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            查询中…
+          </div>
+        ) : balance ? (
+          <div>
+            <div className="flex items-baseline justify-between gap-2 text-xs tabular-nums">
+              <span
+                className={`font-semibold ${
+                  balance.remaining < 0
+                    ? "text-red-600 dark:text-red-400"
+                    : balance.remaining === 0
+                      ? "text-amber-600 dark:text-amber-400"
+                      : "text-emerald-600 dark:text-emerald-400"
+                }`}
+              >
+                {balance.remaining < 0
+                  ? `-$${formatNumber(Math.abs(balance.remaining))}`
+                  : `$${formatNumber(balance.remaining)}`}
+              </span>
+              <span className="text-muted-foreground">
+                {balance.usagePercentage.toFixed(0)}%
+              </span>
+            </div>
+            <Progress value={balance.usagePercentage} className="mt-1 h-1.5" />
+          </div>
+        ) : (
+          <div className="text-center text-[11px] text-muted-foreground">
+            余额未查询
+          </div>
+        )}
+      </div>
+
+      {/* 最后调用（中大屏） */}
+      <div className="hidden w-24 shrink-0 truncate text-right text-xs text-muted-foreground md:block">
+        {formatLastUsed(credential.lastUsedAt)}
+      </div>
+
+      {/* 操作区 */}
+      <div className="flex shrink-0 items-center gap-0.5 sm:gap-1">
+        <Button
+          size="icon"
+          variant="ghost"
+          className="hidden h-9 w-9 sm:inline-flex"
+          onClick={handleForceRefresh}
+          disabled={
+            forceRefresh.isPending ||
+            credential.disabled ||
+            credential.authMethod === "api_key"
+          }
+          title={
+            credential.authMethod === "api_key"
+              ? "API Key 无需刷新"
+              : credential.disabled
+                ? "已禁用"
+                : "强制刷新 Token"
+          }
+        >
+          <RefreshCw
+            className={`h-4 w-4 ${forceRefresh.isPending ? "animate-spin" : ""}`}
+          />
+        </Button>
+        <Button
+          size="icon"
+          variant="ghost"
+          className="hidden h-9 w-9 sm:inline-flex"
+          onClick={onRefreshBalance}
+          disabled={loadingBalance || credential.disabled}
+          title={credential.disabled ? "已禁用" : "刷新余额"}
+        >
+          {loadingBalance ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Wallet className="h-4 w-4" />
+          )}
+        </Button>
+        <Switch
+          checked={!credential.disabled}
+          onCheckedChange={handleToggleDisabled}
+          disabled={setDisabled.isPending}
+          title={credential.disabled ? "启用" : "禁用"}
+        />
+        <Button
+          size="icon"
+          variant="ghost"
+          className="h-9 w-9"
+          onClick={() => setShowEditDialog(true)}
+          title="编辑"
+        >
+          <Pencil className="h-4 w-4" />
+        </Button>
+        {moreMenu}
+      </div>
+    </div>
+  );
+
   return (
     <>
+      {view === "list" ? (
+        listView
+      ) : (
       <Card
         ref={setNodeRef}
         style={dragStyle}
@@ -377,27 +823,7 @@ export function CredentialCard({
           isDragging
             ? "shadow-apple-lg opacity-80"
             : "hover:-translate-y-0.5 hover:shadow-apple-lg"
-        } ${
-          credential.isCurrent ? "ring-2 ring-primary/60 shadow-apple-lg" : ""
-        } ${
-          // 未禁用但已超额：琥珀色提醒边
-          !credential.disabled && isQuotaExceeded
-            ? "ring-1 ring-amber-500/60"
-            : ""
-        } ${
-          // 已因超额被禁用：琥珀色实色边 + 不灰化（保留可读性，方便审视）
-          disabledByQuota
-            ? "ring-1 ring-amber-500/70 bg-amber-50/40 dark:bg-amber-500/[0.04]"
-            : ""
-        } ${
-          // 账号级风控冷却中：橙红色提示边
-          isThrottled
-            ? "ring-1 ring-orange-500/60 bg-orange-50/40 dark:bg-orange-500/[0.04]"
-            : ""
-        } ${
-          // 其他原因被禁用：常规灰化
-          credential.disabled && !disabledByQuota ? "opacity-70" : ""
-        }`}
+        } ${stateClasses}`}
       >
         <CardHeader className="p-4 pb-3 sm:p-5 sm:pb-3">
           <div className="flex min-w-0 items-start gap-2.5 sm:gap-3">
@@ -420,70 +846,7 @@ export function CredentialCard({
                 {credential.email || `凭据 #${credential.id}`}
               </CardTitle>
               <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1 overflow-hidden">
-                {balance?.subscriptionTitle && (
-                  <SubscriptionBadge
-                    title={balance.subscriptionTitle}
-                    className="max-w-full"
-                  />
-                )}
-                {credential.isCurrent && <Badge variant="success">活跃</Badge>}
-                {/* 禁用状态：合并 "已禁用" + 中文化的原因，单个 Badge 更醒目 */}
-                {credential.disabled && reasonStyle && (
-                  <Badge variant={reasonStyle.variant}>
-                    已禁用 · {reasonStyle.label}
-                  </Badge>
-                )}
-                {credential.disabled && !reasonStyle && (
-                  <Badge variant="destructive">已禁用</Badge>
-                )}
-                {/* 仍启用但已经达到上限：黄色"已超额"徽章 */}
-                {!credential.disabled && isQuotaExceeded && (
-                  <Badge variant="warning">已超额</Badge>
-                )}
-                {isThrottled && (
-                  <Badge
-                    variant="warning"
-                    className="bg-orange-500/15 text-orange-700 dark:text-orange-300 border-orange-500/30"
-                    title="账号级风控冷却中（429 + suspicious activity），到期或手动解除后恢复调度"
-                  >
-                    <Clock className="mr-1 h-3 w-3" />
-                    冷却 {formatThrottleCountdown(throttleRemaining)}
-                  </Badge>
-                )}
-                {credential.authMethod && (
-                  <Badge variant="secondary">{authLabel}</Badge>
-                )}
-                {/* 配置元信息合并为单个徽章，减少换行：endpoint · ARN */}
-                {(credential.endpoint || credential.hasProfileArn) && (
-                  <Badge
-                    variant="outline"
-                    className="max-w-full truncate"
-                    title={
-                      credential.hasProfileArn
-                        ? "endpoint / 已配置 Profile ARN"
-                        : "endpoint"
-                    }
-                  >
-                    {[
-                      credential.endpoint,
-                      credential.hasProfileArn ? "ARN" : null,
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </Badge>
-                )}
-                {/* 账号所属分组 */}
-                {(credential.groups ?? []).map((g) => (
-                  <Badge key={g} variant="outline" title="账号分组">
-                    {g}
-                  </Badge>
-                ))}
-                {/* 账号来源渠道 */}
-                {credential.sourceChannel && (
-                  <Badge variant="outline" title="账号来源渠道">
-                    来源: {credential.sourceChannel}
-                  </Badge>
-                )}
+                {badges}
               </div>
             </div>
             <Switch
@@ -508,7 +871,7 @@ export function CredentialCard({
                       type="number"
                       value={priorityValue}
                       onChange={(e) => setPriorityValue(e.target.value)}
-                      className="w-16 h-7 text-sm rounded-md"
+                      className="w-16 h-7 rounded-md text-base sm:text-sm"
                       min="0"
                     />
                     <Button
@@ -773,110 +1136,12 @@ export function CredentialCard({
                 <Pencil className="h-3.5 w-3.5" />
                 编辑
               </Button>
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button size="icon" variant="ghost" title="更多操作">
-                    <MoreHorizontal className="h-4 w-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  <DropdownMenuItem
-                    onSelect={(e) => {
-                      e.preventDefault();
-                      handleReset();
-                    }}
-                    disabled={
-                      resetFailure.isPending ||
-                      (credential.failureCount === 0 &&
-                        credential.refreshFailureCount === 0)
-                    }
-                  >
-                    <RotateCcw />
-                    重置失败计数
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => setShowModelsDialog(true)}
-                    disabled={credential.disabled}
-                    title={
-                      credential.disabled ? "已禁用凭据无法查询" : undefined
-                    }
-                  >
-                    <Boxes />
-                    查看可用模型
-                  </DropdownMenuItem>
-                  {throttleRemaining > 0 && (
-                    <DropdownMenuItem
-                      onSelect={(e) => {
-                        e.preventDefault();
-                        handleClearThrottle();
-                      }}
-                      disabled={clearThrottle.isPending}
-                    >
-                      <Clock />
-                      解除风控冷却（{formatThrottleCountdown(throttleRemaining)}
-                      ）
-                    </DropdownMenuItem>
-                  )}
-                  {balance?.overageCapable === true &&
-                    (balance.overageEnabled ? (
-                      <DropdownMenuItem
-                        onSelect={(e) => {
-                          e.preventDefault();
-                          handleSetOverage(false);
-                        }}
-                        disabled={overageBusy}
-                      >
-                        <ZapOff />
-                        关闭超额
-                      </DropdownMenuItem>
-                    ) : (
-                      <DropdownMenuItem
-                        onSelect={(e) => {
-                          e.preventDefault();
-                          handleSetOverage(true);
-                        }}
-                        disabled={overageBusy}
-                      >
-                        <Zap className="text-emerald-500" />
-                        开启超额
-                      </DropdownMenuItem>
-                    ))}
-                  {credential.authMethod !== "api_key" && (
-                    <DropdownMenuSeparator />
-                  )}
-                  {credential.authMethod !== "api_key" && (
-                    <DropdownMenuItem
-                      onSelect={() => setShowReloginDialog(true)}
-                    >
-                      <LogIn />
-                      重新登录
-                    </DropdownMenuItem>
-                  )}
-                  {credential.authMethod !== "api_key" && (
-                    <DropdownMenuItem
-                      onSelect={() => setShowUpdateTokenDialog(true)}
-                    >
-                      <RefreshCw />
-                      重新导入 Token
-                    </DropdownMenuItem>
-                  )}
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    destructive
-                    onSelect={(e) => {
-                      e.preventDefault();
-                      setShowDeleteDialog(true);
-                    }}
-                  >
-                    <Trash2 />
-                    删除凭据
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
+              {moreMenu}
             </div>
           </div>
         </CardContent>
       </Card>
+      )}
 
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
         <DialogContent className="sm:max-w-sm">
