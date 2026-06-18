@@ -262,9 +262,6 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
         <td className="py-2.5 pr-3 text-[13px]">
           <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>
         </td>
-        <td className="py-2.5 pr-3 text-[13px]">
-          <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>
-        </td>
         <td className="py-2.5 pr-3">
           <StatusBadge status={rec.finalStatus} />
         </td>
