@@ -13,10 +13,11 @@ import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
 import { Input } from '@/components/ui/input'
 import { GroupMultiSelect } from '@/components/group-select'
-import { updateCredential } from '@/api/credentials'
+import { updateCredential, setCredentialPriority } from '@/api/credentials'
 import type { CredentialStatusItem } from '@/types/api'
 
 type GroupMode = 'replace' | 'add' | 'remove'
+type PriorityMode = 'set' | 'inc' | 'dec'
 
 interface BatchEditCredentialDialogProps {
   open: boolean
@@ -35,6 +36,12 @@ const MODE_LABELS: { value: GroupMode; label: string; desc: string }[] = [
   { value: 'remove', label: '移除', desc: '从各账号分组里移除所选分组' },
 ]
 
+const PRIORITY_MODE_LABELS: { value: PriorityMode; label: string; desc: string }[] = [
+  { value: 'set', label: '设为', desc: '把所有选中账号的优先级设为固定值' },
+  { value: 'inc', label: '加', desc: '各账号在原优先级基础上 +N（数字越大优先级越低）' },
+  { value: 'dec', label: '减', desc: '各账号在原优先级基础上 −N（最低为 0，数字越小越优先）' },
+]
+
 export function BatchEditCredentialDialog({
   open,
   onOpenChange,
@@ -51,6 +58,13 @@ export function BatchEditCredentialDialog({
   const [editSource, setEditSource] = useState(false)
   const [sourceChannel, setSourceChannel] = useState('')
 
+  const [editPriority, setEditPriority] = useState(false)
+  const [priorityMode, setPriorityMode] = useState<PriorityMode>('set')
+  const [priorityValue, setPriorityValue] = useState('0')
+
+  const [editConcurrency, setEditConcurrency] = useState(false)
+  const [concurrencyValue, setConcurrencyValue] = useState('')
+
   const [running, setRunning] = useState(false)
   const [progress, setProgress] = useState({ current: 0, total: 0 })
 
@@ -61,6 +75,11 @@ export function BatchEditCredentialDialog({
       setGroups([])
       setEditSource(false)
       setSourceChannel('')
+      setEditPriority(false)
+      setPriorityMode('set')
+      setPriorityValue('0')
+      setEditConcurrency(false)
+      setConcurrencyValue('')
       setRunning(false)
       setProgress({ current: 0, total: 0 })
     }
@@ -73,9 +92,22 @@ export function BatchEditCredentialDialog({
     return current.filter((g) => !groups.includes(g))
   }
 
+  const computePriority = (current: number): number => {
+    const n = parseInt(priorityValue, 10)
+    if (!Number.isFinite(n)) return current
+    if (priorityMode === 'set') return Math.max(0, n)
+    if (priorityMode === 'inc') return Math.max(0, current + n)
+    // dec
+    return Math.max(0, current - n)
+  }
+
   const handleApply = async () => {
-    if (!editGroups && !editSource) {
+    if (!editGroups && !editSource && !editPriority && !editConcurrency) {
       toast.error('请至少开启一项要修改的字段')
+      return
+    }
+    if (editPriority && !Number.isFinite(parseInt(priorityValue, 10))) {
+      toast.error('优先级数值无效')
       return
     }
     setRunning(true)
@@ -87,8 +119,20 @@ export function BatchEditCredentialDialog({
       const req: Record<string, unknown> = {}
       if (editGroups) req.groups = computeGroups(c.groups ?? [])
       if (editSource) req.sourceChannel = sourceChannel.trim()
+      if (editConcurrency) {
+        // 空串 → 0（清除覆盖，回退全局默认）；否则解析为数字
+        req.concurrencyLimit =
+          concurrencyValue.trim() === ''
+            ? 0
+            : Math.max(0, parseInt(concurrencyValue, 10) || 0)
+      }
       try {
-        await updateCredential(c.id, req)
+        if (Object.keys(req).length > 0) {
+          await updateCredential(c.id, req)
+        }
+        if (editPriority) {
+          await setCredentialPriority(c.id, computePriority(c.priority))
+        }
         ok++
       } catch {
         fail++
@@ -164,6 +208,70 @@ export function BatchEditCredentialDialog({
                   disabled={running}
                 />
                 <p className="text-[11px] text-muted-foreground">纯备注，标记账号来源/渠道。</p>
+              </>
+            )}
+          </div>
+
+          {/* 优先级区 */}
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <label className="flex items-center justify-between">
+              <span className="text-sm font-medium">修改优先级</span>
+              <Switch checked={editPriority} onCheckedChange={setEditPriority} disabled={running} />
+            </label>
+            {editPriority && (
+              <>
+                <div className="flex gap-2">
+                  {PRIORITY_MODE_LABELS.map((m) => (
+                    <Button
+                      key={m.value}
+                      type="button"
+                      size="sm"
+                      variant={priorityMode === m.value ? 'default' : 'outline'}
+                      onClick={() => setPriorityMode(m.value)}
+                      disabled={running}
+                    >
+                      {m.label}
+                    </Button>
+                  ))}
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  {PRIORITY_MODE_LABELS.find((m) => m.value === priorityMode)?.desc}
+                </p>
+                <Input
+                  type="number"
+                  min={0}
+                  placeholder={priorityMode === 'set' ? '目标优先级（如 0）' : '增减量 N'}
+                  value={priorityValue}
+                  onChange={(e) => setPriorityValue(e.target.value)}
+                  disabled={running}
+                />
+              </>
+            )}
+          </div>
+
+          {/* 并发上限区 */}
+          <div className="space-y-3 rounded-xl border border-border/60 p-3">
+            <label className="flex items-center justify-between">
+              <span className="text-sm font-medium">修改并发上限</span>
+              <Switch
+                checked={editConcurrency}
+                onCheckedChange={setEditConcurrency}
+                disabled={running}
+              />
+            </label>
+            {editConcurrency && (
+              <>
+                <Input
+                  type="number"
+                  min={1}
+                  placeholder="应用到所有选中账号（留空 = 用全局默认）"
+                  value={concurrencyValue}
+                  onChange={(e) => setConcurrencyValue(e.target.value)}
+                  disabled={running}
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  各账号同时进行中的请求数上限。留空 = 清除覆盖回退全局默认。
+                </p>
               </>
             )}
           </div>
