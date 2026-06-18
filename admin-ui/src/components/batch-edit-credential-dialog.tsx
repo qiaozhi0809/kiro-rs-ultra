@@ -17,7 +17,6 @@ import { updateCredential, setCredentialPriority } from '@/api/credentials'
 import type { CredentialStatusItem } from '@/types/api'
 
 type GroupMode = 'replace' | 'add' | 'remove'
-type PriorityMode = 'set' | 'inc' | 'dec'
 
 interface BatchEditCredentialDialogProps {
   open: boolean
@@ -36,11 +35,7 @@ const MODE_LABELS: { value: GroupMode; label: string; desc: string }[] = [
   { value: 'remove', label: '移除', desc: '从各账号分组里移除所选分组' },
 ]
 
-const PRIORITY_MODE_LABELS: { value: PriorityMode; label: string; desc: string }[] = [
-  { value: 'set', label: '设为', desc: '把所有选中账号的优先级设为固定值' },
-  { value: 'inc', label: '加', desc: '各账号在原优先级基础上 +N（数字越大优先级越低）' },
-  { value: 'dec', label: '减', desc: '各账号在原优先级基础上 −N（最低为 0，数字越小越优先）' },
-]
+const PRIORITY_MAX = 9999
 
 export function BatchEditCredentialDialog({
   open,
@@ -59,7 +54,6 @@ export function BatchEditCredentialDialog({
   const [sourceChannel, setSourceChannel] = useState('')
 
   const [editPriority, setEditPriority] = useState(false)
-  const [priorityMode, setPriorityMode] = useState<PriorityMode>('set')
   const [priorityValue, setPriorityValue] = useState('0')
 
   const [editConcurrency, setEditConcurrency] = useState(false)
@@ -76,7 +70,6 @@ export function BatchEditCredentialDialog({
       setEditSource(false)
       setSourceChannel('')
       setEditPriority(false)
-      setPriorityMode('set')
       setPriorityValue('0')
       setEditConcurrency(false)
       setConcurrencyValue('')
@@ -92,13 +85,16 @@ export function BatchEditCredentialDialog({
     return current.filter((g) => !groups.includes(g))
   }
 
-  const computePriority = (current: number): number => {
+  // 步进器：把当前输入值夹到 [0, PRIORITY_MAX] 后增减
+  const stepPriority = (delta: number) => {
     const n = parseInt(priorityValue, 10)
-    if (!Number.isFinite(n)) return current
-    if (priorityMode === 'set') return Math.max(0, n)
-    if (priorityMode === 'inc') return Math.max(0, current + n)
-    // dec
-    return Math.max(0, current - n)
+    const base = Number.isFinite(n) ? n : 0
+    setPriorityValue(String(Math.min(PRIORITY_MAX, Math.max(0, base + delta))))
+  }
+  const targetPriority = (): number | null => {
+    const n = parseInt(priorityValue, 10)
+    if (!Number.isFinite(n)) return null
+    return Math.min(PRIORITY_MAX, Math.max(0, n))
   }
 
   const handleApply = async () => {
@@ -106,7 +102,8 @@ export function BatchEditCredentialDialog({
       toast.error('请至少开启一项要修改的字段')
       return
     }
-    if (editPriority && !Number.isFinite(parseInt(priorityValue, 10))) {
+    const prio = editPriority ? targetPriority() : null
+    if (editPriority && prio === null) {
       toast.error('优先级数值无效')
       return
     }
@@ -130,8 +127,8 @@ export function BatchEditCredentialDialog({
         if (Object.keys(req).length > 0) {
           await updateCredential(c.id, req)
         }
-        if (editPriority) {
-          await setCredentialPriority(c.id, computePriority(c.priority))
+        if (prio !== null) {
+          await setCredentialPriority(c.id, prio)
         }
         ok++
       } catch {
@@ -220,31 +217,40 @@ export function BatchEditCredentialDialog({
             </label>
             {editPriority && (
               <>
-                <div className="flex gap-2">
-                  {PRIORITY_MODE_LABELS.map((m) => (
-                    <Button
-                      key={m.value}
-                      type="button"
-                      size="sm"
-                      variant={priorityMode === m.value ? 'default' : 'outline'}
-                      onClick={() => setPriorityMode(m.value)}
-                      disabled={running}
-                    >
-                      {m.label}
-                    </Button>
-                  ))}
+                <div className="flex items-center gap-2">
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="outline"
+                    onClick={() => stepPriority(-1)}
+                    disabled={running}
+                    aria-label="减小优先级"
+                  >
+                    −
+                  </Button>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={PRIORITY_MAX}
+                    className="text-center"
+                    value={priorityValue}
+                    onChange={(e) => setPriorityValue(e.target.value)}
+                    disabled={running}
+                  />
+                  <Button
+                    type="button"
+                    size="icon"
+                    variant="outline"
+                    onClick={() => stepPriority(1)}
+                    disabled={running}
+                    aria-label="增大优先级"
+                  >
+                    +
+                  </Button>
                 </div>
                 <p className="text-[11px] text-muted-foreground">
-                  {PRIORITY_MODE_LABELS.find((m) => m.value === priorityMode)?.desc}
+                  把所有选中账号的优先级设为此值（数字越小越优先）。可用 −/+ 微调或直接输入。
                 </p>
-                <Input
-                  type="number"
-                  min={0}
-                  placeholder={priorityMode === 'set' ? '目标优先级（如 0）' : '增减量 N'}
-                  value={priorityValue}
-                  onChange={(e) => setPriorityValue(e.target.value)}
-                  disabled={running}
-                />
               </>
             )}
           </div>
