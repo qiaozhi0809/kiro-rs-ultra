@@ -571,6 +571,9 @@ impl AdminService {
                     endpoint: entry.endpoint.unwrap_or_else(|| default_endpoint.clone()),
                     groups: entry.groups,
                     source_channel: entry.source_channel,
+                    in_flight: entry.in_flight,
+                    concurrency_limit: entry.concurrency_limit,
+                    concurrency_limit_override: entry.concurrency_limit_override,
                     balance,
                     balance_updated_at,
                 }
@@ -706,6 +709,15 @@ impl AdminService {
         self.token_manager
             .clear_throttle(id)
             .map_err(|e| self.classify_error(e, id))
+    }
+
+    /// 强制清零某账号并发计数（处理卡死/泄漏的槽位）
+    pub fn clear_concurrency(&self, id: u64) -> Result<(), AdminServiceError> {
+        if self.token_manager.clear_concurrency(id) {
+            Ok(())
+        } else {
+            Err(AdminServiceError::NotFound { id })
+        }
     }
 
     pub fn reset_success_count(&self, id: Option<u64>) -> Result<u32, AdminServiceError> {
@@ -1139,6 +1151,7 @@ impl AdminService {
             endpoint: req.endpoint,
             groups: req.groups,
             source_channel: req.source_channel,
+            concurrency_limit: req.concurrency_limit,
         };
 
         // 调用 token_manager 添加凭据
@@ -1264,6 +1277,9 @@ impl AdminService {
                 req.groups,
                 req.source_channel
                     .map(|v| if v.is_empty() { None } else { Some(v) }),
+                // 0 = 清除覆盖（回退全局默认）；n>0 = 设为 n；字段缺省(None) = 不修改
+                req.concurrency_limit
+                    .map(|n| if n == 0 { None } else { Some(n) }),
             )
             .map_err(|e| self.classify_error(e, id))
     }
@@ -2363,6 +2379,7 @@ impl AdminService {
                 None,            // proxy_password 不修改
                 None,            // groups 不修改
                 None,            // source_channel 不修改
+                None,            // concurrency_limit 不修改
             )
             .map_err(|e| {
                 let msg = e.to_string();
@@ -2432,7 +2449,7 @@ impl AdminService {
             let url = urls[i % urls.len()].clone();
             if self
                 .token_manager
-                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None)
+                .update_credential(*cred_id, None, Some(Some(url)), None, None, None, None, None)
                 .is_ok()
             {
                 assigned += 1;

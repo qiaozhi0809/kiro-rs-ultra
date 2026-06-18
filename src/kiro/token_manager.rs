@@ -13,7 +13,8 @@ use tokio::sync::Mutex as TokioMutex;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
@@ -772,6 +773,10 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 当前进行中（in-flight）的请求数。由 `ConcurrencySlot` RAII 守卫增减：
+    /// 请求占用该凭据时 +1，请求结束（成功/失败/网络错误/流式结束）时自动 -1。
+    /// 运行时易失指标，不持久化。用 `Arc<AtomicU32>` 以便守卫脱离 entries 锁独立持有。
+    in_flight: Arc<AtomicU32>,
 }
 
 /// 禁用原因
@@ -860,6 +865,13 @@ pub struct CredentialEntrySnapshot {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 当前进行中（in-flight）的请求数（运行时易失指标）
+    pub in_flight: u32,
+    /// 有效并发上限（凭据级覆盖优先，否则全局默认）
+    pub concurrency_limit: u32,
+    /// 凭据级并发上限覆盖原始值（None = 未覆盖，用全局默认；用于编辑回填）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit_override: Option<u32>,
 }
 
 /// 凭据管理器状态快照
@@ -917,11 +929,39 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
+/// 并发槽位 RAII 守卫
+///
+/// 构造时对账号的 `in_flight` 计数 +1，`Drop` 时自动 -1。绑定到 `CallContext`，
+/// 随请求生命周期存活——流式请求时随 stream 移动，确保流结束（ctx 析构）才释放。
+///
+/// 用 Drop 而非显式 report_* 释放，是因为请求结束路径分散（成功/各类失败/
+/// **网络错误路径故意不调用 report**），只有 RAII 能保证所有路径都精确释放、不泄漏。
+pub struct ConcurrencySlot {
+    counter: Arc<AtomicU32>,
+}
+
+impl ConcurrencySlot {
+    /// 占用一个并发槽位：对计数 +1。
+    fn acquire(counter: Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        ConcurrencySlot { counter }
+    }
+}
+
+impl Drop for ConcurrencySlot {
+    fn drop(&mut self) {
+        // saturating：即便 clear-concurrency 把计数清零后槽位再析构，也不会回绕到 u32::MAX
+        let prev = self.counter.load(Ordering::SeqCst);
+        if prev > 0 {
+            self.counter.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
 /// API 调用上下文
 ///
 /// 绑定特定凭据的调用上下文，确保 token、credentials 和 id 的一致性
 /// 用于解决并发调用时 current_id 竞态问题
-#[derive(Clone)]
 pub struct CallContext {
     /// 凭据 ID（用于 report_success/report_failure）
     pub id: u64,
@@ -929,6 +969,9 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+    /// 并发槽位守卫。`None` 仅用于不计并发的内部场景（如测活/预热可自行决定）；
+    /// 正常请求路径由 `acquire_context` 注入 `Some(slot)`，请求结束时随 ctx 析构释放。
+    pub _slot: Option<ConcurrencySlot>,
 }
 
 /// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
@@ -1015,6 +1058,7 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    in_flight: Arc::new(AtomicU32::new(0)),
                 }
             })
             .collect();
@@ -1151,6 +1195,40 @@ impl MultiTokenManager {
             .count()
     }
 
+    /// 计算某账号的有效并发上限：凭据级 `concurrency_limit` 覆盖优先，
+    /// 否则回退到全局 `Config.default_concurrency_limit`。结果至少为 1。
+    fn effective_concurrency_limit(&self, entry: &CredentialEntry) -> u32 {
+        entry
+            .credentials
+            .concurrency_limit
+            .unwrap_or(self.config.default_concurrency_limit)
+            .max(1)
+    }
+
+    /// 取某账号的 `in_flight` 计数器 Arc（克隆），用于构造并发槽位守卫。
+    /// 账号不存在时返回 None。
+    fn in_flight_counter(&self, id: u64) -> Option<Arc<AtomicU32>> {
+        self.entries
+            .lock()
+            .iter()
+            .find(|e| e.id == id)
+            .map(|e| e.in_flight.clone())
+    }
+
+    /// 强制清零某账号的并发计数（处理卡死/泄漏的槽位）。返回是否命中该账号。
+    ///
+    /// 注意：这是运维兜底手段。若清零时仍有真实进行中的请求，其槽位 Drop 时
+    /// 会因 `prev > 0` 判断而不再下溢——计数最终仍归于一致。
+    pub fn clear_concurrency(&self, id: u64) -> bool {
+        let entries = self.entries.lock();
+        if let Some(entry) = entries.iter().find(|e| e.id == id) {
+            entry.in_flight.store(0, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
+    }
+
     /// 根据负载均衡模式选择下一个凭据
     ///
     /// - priority 模式：选择优先级最高（priority 最小）的可用凭据
@@ -1179,6 +1257,10 @@ impl MultiTokenManager {
                 }
                 // 账号分组隔离：Key 绑定分组时只用该分组内的账号
                 if !group_matches(&e.credentials.groups, group) {
+                    return false;
+                }
+                // 并发上限：进行中请求数已达上限则跳过（满则跳过，选下一个）
+                if e.in_flight.load(Ordering::SeqCst) >= self.effective_concurrency_limit(e) {
                     return false;
                 }
                 true
@@ -1252,6 +1334,8 @@ impl MultiTokenManager {
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                 && credential_matches_request(&e.credentials, model, group)
+                                && e.in_flight.load(Ordering::SeqCst)
+                                    < self.effective_concurrency_limit(e)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -1301,7 +1385,12 @@ impl MultiTokenManager {
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
-                Ok(ctx) => {
+                Ok(mut ctx) => {
+                    // 占用并发槽位：克隆该账号的 in_flight Arc 构造 RAII 守卫，
+                    // 随 ctx 存活到请求结束（含流式流结束）才释放。
+                    if let Some(counter) = self.in_flight_counter(id) {
+                        ctx._slot = Some(ConcurrencySlot::acquire(counter));
+                    }
                     return Ok(ctx);
                 }
                 Err(e) => {
@@ -1373,6 +1462,7 @@ impl MultiTokenManager {
                 id,
                 credentials: credentials.clone(),
                 token,
+                _slot: None,
             });
         }
 
@@ -1443,6 +1533,7 @@ impl MultiTokenManager {
             id,
             credentials: creds,
             token,
+            _slot: None,
         })
     }
 
@@ -2096,6 +2187,13 @@ impl MultiTokenManager {
                     endpoint: e.credentials.endpoint.clone(),
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
+                    in_flight: e.in_flight.load(Ordering::SeqCst),
+                    concurrency_limit: e
+                        .credentials
+                        .concurrency_limit
+                        .unwrap_or(self.config.default_concurrency_limit)
+                        .max(1),
+                    concurrency_limit_override: e.credentials.concurrency_limit,
                 })
                 .collect(),
             current_id,
@@ -2981,6 +3079,7 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                in_flight: Arc::new(AtomicU32::new(0)),
             });
         }
 
@@ -3005,6 +3104,7 @@ impl MultiTokenManager {
         proxy_password: Option<Option<String>>,
         groups: Option<Vec<String>>,
         source_channel: Option<Option<String>>,
+        concurrency_limit: Option<Option<u32>>,
     ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -3032,6 +3132,10 @@ impl MultiTokenManager {
             if let Some(v) = source_channel {
                 entry.credentials.source_channel =
                     v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            }
+            if let Some(v) = concurrency_limit {
+                // 内层 None = 清除覆盖（回退全局默认）；Some(0) 视为清除（避免锁死账号）
+                entry.credentials.concurrency_limit = v.filter(|n| *n > 0);
             }
         }
         self.persist_credentials()?;
@@ -4535,6 +4639,90 @@ mod tests {
             opus.id, 2,
             "priority current_id must not bypass Opus subscription filtering"
         );
+    }
+
+    /// 并发槽位：请求结束（ctx 析构）后 in_flight 必须归零，不泄漏。
+    #[tokio::test]
+    async fn test_concurrency_slot_releases_on_drop() {
+        let cred = grouped_cred("c1", &[]);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        {
+            let ctx = manager.acquire_context(None, None).await.unwrap();
+            let snap = manager.snapshot();
+            assert_eq!(snap.entries[0].in_flight, 1, "占用后 in_flight 应为 1");
+            drop(ctx);
+        }
+        let snap = manager.snapshot();
+        assert_eq!(snap.entries[0].in_flight, 0, "ctx 析构后 in_flight 应归零");
+    }
+
+    /// 并发上限：单账号达上限后无法再获取（满则跳过，无其他账号时全灭）。
+    #[tokio::test]
+    async fn test_concurrency_limit_blocks_when_full() {
+        let mut cred = grouped_cred("c1", &[]);
+        cred.concurrency_limit = Some(2);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        let c1 = manager.acquire_context(None, None).await.unwrap();
+        let c2 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(manager.snapshot().entries[0].in_flight, 2);
+
+        // 第三个请求：唯一账号已满 → 应失败
+        let c3 = manager.acquire_context(None, None).await;
+        assert!(c3.is_err(), "账号并发已满且无其他账号，应获取失败");
+
+        // 释放一个后可再获取
+        drop(c1);
+        let c4 = manager.acquire_context(None, None).await;
+        assert!(c4.is_ok(), "释放槽位后应能再次获取");
+        drop(c2);
+        drop(c4);
+    }
+
+    /// 并发上限：满账号被跳过，调度到另一个可用账号。
+    #[tokio::test]
+    async fn test_concurrency_limit_skips_to_next_credential() {
+        let mut a = grouped_cred("a", &[]);
+        a.priority = 0;
+        a.concurrency_limit = Some(1);
+        let mut b = grouped_cred("b", &[]);
+        b.priority = 1;
+        b.concurrency_limit = Some(5);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![a, b], None, None, false).unwrap();
+
+        // 第一个请求命中优先级最高的 a
+        let c1 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(c1.id, 1);
+
+        // a 已满（limit=1）→ 第二个请求应跳到 b
+        let c2 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(c2.id, 2, "a 并发已满，应跳到 b");
+        drop(c1);
+        drop(c2);
+    }
+
+    /// clear_concurrency 强制清零计数。
+    #[tokio::test]
+    async fn test_clear_concurrency_resets_count() {
+        let cred = grouped_cred("c1", &[]);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        let _c1 = manager.acquire_context(None, None).await.unwrap();
+        assert_eq!(manager.snapshot().entries[0].in_flight, 1);
+
+        assert!(manager.clear_concurrency(1), "应命中账号");
+        assert_eq!(
+            manager.snapshot().entries[0].in_flight,
+            0,
+            "clear 后应归零"
+        );
+        // 不存在的账号返回 false
+        assert!(!manager.clear_concurrency(999));
     }
 
     #[test]

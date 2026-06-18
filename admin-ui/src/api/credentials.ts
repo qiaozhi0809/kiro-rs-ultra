@@ -155,6 +155,12 @@ export async function clearThrottle(id: number): Promise<SuccessResponse> {
   return data
 }
 
+// 强制清零凭据的并发计数（处理卡死/泄漏的槽位）
+export async function clearConcurrency(id: number): Promise<SuccessResponse> {
+  const { data } = await api.post<SuccessResponse>(`/credentials/${id}/clear-concurrency`)
+  return data
+}
+
 // 获取凭据余额
 //
 // `force=true` 时附带 ?force=true 查询参数，让后端跳过 5 分钟内存缓存直接拉上游。

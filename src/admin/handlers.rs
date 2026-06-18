@@ -131,6 +131,18 @@ pub async fn clear_throttle(
     }
 }
 
+/// POST /api/admin/credentials/:id/clear-concurrency
+/// 强制清零凭据的并发计数（处理卡死/泄漏的槽位）
+pub async fn clear_concurrency(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.clear_concurrency(id) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 并发计数已清零", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/credentials/:id/balance
 /// 获取指定凭据的余额
 ///

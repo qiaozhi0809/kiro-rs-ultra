@@ -15,6 +15,7 @@ import {
   ScrollText,
   Boxes,
   Wallet,
+  Gauge,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -49,6 +50,7 @@ import {
   useForceRefreshToken,
   useResetSuccessCount,
   useClearThrottle,
+  useClearConcurrency,
   useTestCredential,
 } from "@/hooks/use-credentials";
 import { setCredentialOverage } from "@/api/credentials";
@@ -260,6 +262,13 @@ export function CredentialCard({
       onError: (err) => toast.error("解除失败: " + extractErrorMessage(err)),
     });
   }, [clearThrottle, credential.id]);
+  const clearConcurrency = useClearConcurrency();
+  const handleClearConcurrency = useCallback(() => {
+    clearConcurrency.mutate(credential.id, {
+      onSuccess: (res) => toast.success(res.message),
+      onError: (err) => toast.error("清理失败: " + extractErrorMessage(err)),
+    });
+  }, [clearConcurrency, credential.id]);
   const [overageBusy, setOverageBusy] = useState(false);
   const handleSetOverage = async (enabled: boolean) => {
     setOverageBusy(true);
@@ -491,6 +500,19 @@ export function CredentialCard({
           >
             <Clock />
             解除风控冷却（{formatThrottleCountdown(throttleRemaining)}）
+          </DropdownMenuItem>
+        )}
+        {(credential.inFlight ?? 0) > 0 && (
+          <DropdownMenuItem
+            onSelect={(e) => {
+              e.preventDefault();
+              handleClearConcurrency();
+            }}
+            disabled={clearConcurrency.isPending}
+            title="强制清零并发计数（处理卡死/泄漏的槽位）"
+          >
+            <Gauge />
+            清理并发（{credential.inFlight}）
           </DropdownMenuItem>
         )}
         {balance?.overageCapable === true &&
@@ -962,6 +984,28 @@ export function CredentialCard({
                   {credential.successCount}
                   <RotateCcw className="h-3 w-3 opacity-70" />
                 </button>
+              </dd>
+            </div>
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <dt className="shrink-0 text-muted-foreground">并发</dt>
+              <dd className="min-w-0 text-right">
+                {(() => {
+                  const inFlight = credential.inFlight ?? 0;
+                  const limit = credential.concurrencyLimit ?? 0;
+                  const full = limit > 0 && inFlight >= limit;
+                  return (
+                    <span
+                      className={`font-medium tabular-nums ${full ? "text-amber-600 dark:text-amber-400" : ""}`}
+                      title={
+                        credential.concurrencyLimitOverride != null
+                          ? "并发上限（账号级覆盖）"
+                          : "并发上限（全局默认）"
+                      }
+                    >
+                      {inFlight}/{limit}
+                    </span>
+                  );
+                })()}
               </dd>
             </div>
             <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">

@@ -140,6 +140,14 @@ pub struct KiroCredentials {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+
+    /// 并发上限覆盖（每账号同时进行中的请求数上限）
+    ///
+    /// `None` 表示使用全局默认上限（`Config.default_concurrency_limit`）。
+    /// 调度时若该账号进行中请求数已达上限，则跳过它选择下一个可用账号。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit: Option<u32>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -491,6 +499,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            concurrency_limit: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -682,6 +691,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            concurrency_limit: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -717,6 +727,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            concurrency_limit: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -835,6 +846,7 @@ mod tests {
             endpoint: None,
             groups: vec![],
             source_channel: None,
+            concurrency_limit: None,
         };
 
         let json = original.to_pretty_json().unwrap();

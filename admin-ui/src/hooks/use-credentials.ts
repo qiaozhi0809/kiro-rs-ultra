@@ -6,6 +6,7 @@ import {
   resetCredentialFailure,
   forceRefreshToken,
   clearThrottle,
+  clearConcurrency,
   getCredentialBalance,
   getCredentialModels,
   addCredential,
@@ -104,6 +105,17 @@ export function useClearThrottle() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => clearThrottle(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 清零并发计数（处理卡死/泄漏的槽位）
+export function useClearConcurrency() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => clearConcurrency(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },

@@ -74,6 +74,13 @@ pub struct CredentialStatusItem {
     /// 账号来源渠道（纯备注）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_channel: Option<String>,
+    /// 当前进行中（in-flight）的请求数（运行时易失指标）
+    pub in_flight: u32,
+    /// 有效并发上限（凭据级覆盖优先，否则全局默认）
+    pub concurrency_limit: u32,
+    /// 凭据级并发上限覆盖原始值（None = 未覆盖，用全局默认；用于编辑回填）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub concurrency_limit_override: Option<u32>,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,
@@ -182,6 +189,9 @@ pub struct AddCredentialRequest {
     /// 账号来源渠道（纯备注，可选）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 并发上限覆盖（可选，None = 用全局默认）
+    #[serde(default)]
+    pub concurrency_limit: Option<u32>,
 }
 
 fn default_auth_method() -> String {
@@ -220,6 +230,10 @@ pub struct UpdateCredentialRequest {
     /// 账号来源渠道（None 表示不修改，空串表示清除）
     #[serde(default)]
     pub source_channel: Option<String>,
+    /// 并发上限覆盖。`None` = 不修改；`Some(0)` = 清除覆盖（回退全局默认）；
+    /// `Some(n>0)` = 设为 n。
+    #[serde(default)]
+    pub concurrency_limit: Option<u32>,
 }
 
 /// 添加凭据成功响应

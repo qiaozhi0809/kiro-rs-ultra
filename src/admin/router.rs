@@ -10,7 +10,7 @@ use super::{
         add_credential, add_proxy, apply_image_update, assign_proxies_round_robin,
         assign_proxy_to_credential, batch_add_proxies, batch_import_credentials,
         check_all_proxies, check_proxy,
-        check_rate_limit, check_update, clear_throttle, complete_social_login,
+        check_rate_limit, check_update, clear_concurrency, clear_throttle, complete_social_login,
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
         export_credentials, force_refresh_token, get_account_throttle_config,
@@ -67,6 +67,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/credentials/{id}/priority", post(set_credential_priority))
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/clear-throttle", post(clear_throttle))
+        .route(
+            "/credentials/{id}/clear-concurrency",
+            post(clear_concurrency),
+        )
         .route("/credentials/{id}/reset-stats", post(reset_success_count))
         .route("/credentials/reset-stats", post(reset_all_success_count))
         .route("/credentials/batch-import", post(batch_import_credentials))

@@ -165,6 +165,13 @@ pub struct Config {
     #[serde(default = "default_usage_log_retention_days")]
     pub usage_log_retention_days: u32,
 
+    /// 每账号默认并发上限（同时进行中的请求数）。默认 10。
+    ///
+    /// 凭据未显式设置 `concurrency_limit` 时回退到此值。调度时若账号进行中
+    /// 请求数已达上限，则跳过它选择下一个可用账号（满则跳过，不排队）。
+    #[serde(default = "default_concurrency_limit")]
+    pub default_concurrency_limit: u32,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -245,6 +252,10 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+fn default_concurrency_limit() -> u32 {
+    10
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -280,6 +291,7 @@ impl Default for Config {
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
+            default_concurrency_limit: default_concurrency_limit(),
             endpoints: HashMap::new(),
             config_path: None,
         }

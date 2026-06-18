@@ -43,6 +43,12 @@ export function EditCredentialDialog({
   const [proxyPassword, setProxyPassword] = useState('')
   const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
   const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
+  // 空串 = 用全局默认；数字 = 账号级覆盖
+  const [concurrencyLimit, setConcurrencyLimit] = useState(
+    credential.concurrencyLimitOverride != null
+      ? String(credential.concurrencyLimitOverride)
+      : '',
+  )
   const [manualMode, setManualMode] = useState(false)
 
   const groupOptions = useGroupOptions()
@@ -62,6 +68,11 @@ export function EditCredentialDialog({
       setProxyPassword('')
       setGroups(credential.groups ?? [])
       setSourceChannel(credential.sourceChannel ?? '')
+      setConcurrencyLimit(
+        credential.concurrencyLimitOverride != null
+          ? String(credential.concurrencyLimitOverride)
+          : '',
+      )
       setManualMode(false)
     }
   }, [open, credential])
@@ -81,6 +92,11 @@ export function EditCredentialDialog({
           proxyPassword: proxyPassword || undefined,
           groups: groups,
           sourceChannel: sourceChannel,
+          // 空串 → 0（后端解释为清除覆盖，回退全局默认）；否则解析为数字
+          concurrencyLimit:
+            concurrencyLimit.trim() === ''
+              ? 0
+              : Math.max(0, parseInt(concurrencyLimit, 10) || 0),
         },
       },
       {
@@ -163,6 +179,25 @@ export function EditCredentialDialog({
               />
               <p className="text-xs text-muted-foreground">
                 纯备注，标记此账号的购买来源/渠道，便于追踪。留空表示清除。
+              </p>
+            </div>
+
+            {/* 并发上限覆盖 */}
+            <div className="space-y-2">
+              <label htmlFor="concurrencyLimit" className="text-sm font-medium">
+                并发上限（覆盖全局默认）
+              </label>
+              <Input
+                id="concurrencyLimit"
+                type="number"
+                min={1}
+                placeholder="留空 = 用全局默认"
+                value={concurrencyLimit}
+                onChange={(e) => setConcurrencyLimit(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                该账号同时进行中的请求数上限。达上限的账号在调度时被跳过。留空使用全局默认。
               </p>
             </div>
 

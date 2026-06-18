@@ -36,6 +36,12 @@ export interface CredentialStatusItem {
   groups?: string[]
   /** 账号来源渠道（纯备注） */
   sourceChannel?: string
+  /** 当前进行中（in-flight）的请求数（运行时易失指标） */
+  inFlight?: number
+  /** 有效并发上限（凭据级覆盖优先，否则全局默认） */
+  concurrencyLimit?: number
+  /** 凭据级并发上限覆盖原始值（undefined = 未覆盖，用全局默认；用于编辑回填） */
+  concurrencyLimitOverride?: number
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
@@ -119,6 +125,8 @@ export interface AddCredentialRequest {
   email?: string
   groups?: string[]
   sourceChannel?: string
+  /** 并发上限覆盖（可选，省略 = 用全局默认） */
+  concurrencyLimit?: number
 }
 
 // 添加凭据响应
@@ -139,6 +147,8 @@ export interface UpdateCredentialRequest {
   groups?: string[]
   /** 账号来源渠道（undefined 表示不修改，空串表示清除） */
   sourceChannel?: string
+  /** 并发上限覆盖：undefined 表示不修改；0 表示清除覆盖（回退全局默认）；n>0 表示设为 n */
+  concurrencyLimit?: number
 }
 
 // 更新 refreshToken 请求
