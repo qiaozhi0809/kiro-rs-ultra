@@ -777,6 +777,12 @@ struct CredentialEntry {
     /// 请求占用该凭据时 +1，请求结束（成功/失败/网络错误/流式结束）时自动 -1。
     /// 运行时易失指标，不持久化。用 `Arc<AtomicU32>` 以便守卫脱离 entries 锁独立持有。
     in_flight: Arc<AtomicU32>,
+    /// 请求耗时滑动平均（毫秒，EWMA α=0.2）。仅成功请求更新。运行时易失指标。
+    ewma_latency_ms: Option<f64>,
+    /// 计价请求数（credits > 0 的请求累计）。运行时易失指标。
+    billed_requests: u64,
+    /// 累计 credits 成本（本地估算）。运行时易失指标。
+    accrued_cost: f64,
 }
 
 /// 禁用原因
@@ -872,6 +878,13 @@ pub struct CredentialEntrySnapshot {
     /// 凭据级并发上限覆盖原始值（None = 未覆盖，用全局默认；用于编辑回填）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency_limit_override: Option<u32>,
+    /// 请求耗时滑动平均（毫秒，EWMA）；无样本时 None
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ewma_latency_ms: Option<f64>,
+    /// 计价请求数（credits>0 的请求累计）
+    pub billed_requests: u64,
+    /// 累计 credits 成本（本地估算）
+    pub accrued_cost: f64,
 }
 
 /// 凭据管理器状态快照
@@ -1059,6 +1072,9 @@ impl MultiTokenManager {
                     last_used_at: None,
                     throttled_until: None,
                     in_flight: Arc::new(AtomicU32::new(0)),
+                    ewma_latency_ms: None,
+                    billed_requests: 0,
+                    accrued_cost: 0.0,
                 }
             })
             .collect();
@@ -1226,6 +1242,26 @@ impl MultiTokenManager {
             true
         } else {
             false
+        }
+    }
+
+    /// 记录一次请求结束时的性能指标（由 `UsageRecordHook` 在请求收尾时调用）。
+    ///
+    /// - `latency_ms`：本次请求耗时。**仅成功请求**更新 EWMA（失败耗时无参考价值，
+    ///   且会被超时/重试污染）。EWMA α=0.2：`new = 0.2*x + 0.8*old`。
+    /// - `credits`：本次计费量。`> 0` 才累加 `accrued_cost` 且 `billed_requests += 1`。
+    pub fn record_request_metrics(&self, id: u64, latency_ms: u64, credits: f64, success: bool) {
+        let mut entries = self.entries.lock();
+        if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+            if success {
+                let x = latency_ms as f64;
+                entry.ewma_latency_ms =
+                    Some(entry.ewma_latency_ms.map(|o| 0.2 * x + 0.8 * o).unwrap_or(x));
+            }
+            if credits.is_finite() && credits > 0.0 {
+                entry.accrued_cost += credits;
+                entry.billed_requests += 1;
+            }
         }
     }
 
@@ -2194,6 +2230,9 @@ impl MultiTokenManager {
                         .unwrap_or(self.config.default_concurrency_limit)
                         .max(1),
                     concurrency_limit_override: e.credentials.concurrency_limit,
+                    ewma_latency_ms: e.ewma_latency_ms,
+                    billed_requests: e.billed_requests,
+                    accrued_cost: e.accrued_cost,
                 })
                 .collect(),
             current_id,
@@ -3080,6 +3119,9 @@ impl MultiTokenManager {
                 last_used_at: None,
                 throttled_until: None,
                 in_flight: Arc::new(AtomicU32::new(0)),
+                ewma_latency_ms: None,
+                billed_requests: 0,
+                accrued_cost: 0.0,
             });
         }
 
@@ -4723,6 +4765,41 @@ mod tests {
         );
         // 不存在的账号返回 false
         assert!(!manager.clear_concurrency(999));
+    }
+
+    /// record_request_metrics：EWMA 计算 / credits 累加 / 失败不更新 EWMA。
+    #[test]
+    fn test_record_request_metrics() {
+        let cred = grouped_cred("c1", &[]);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        // 首个成功样本：EWMA = 该样本
+        manager.record_request_metrics(1, 1000, 0.5, true);
+        let s = manager.snapshot();
+        let e = &s.entries[0];
+        assert_eq!(e.ewma_latency_ms, Some(1000.0));
+        assert_eq!(e.billed_requests, 1);
+        assert!((e.accrued_cost - 0.5).abs() < 1e-9);
+
+        // 第二个成功样本 2000ms：EWMA = 0.2*2000 + 0.8*1000 = 1200
+        manager.record_request_metrics(1, 2000, 0.5, true);
+        let s = manager.snapshot();
+        let e = &s.entries[0];
+        assert!((e.ewma_latency_ms.unwrap() - 1200.0).abs() < 1e-9);
+        assert_eq!(e.billed_requests, 2);
+        assert!((e.accrued_cost - 1.0).abs() < 1e-9);
+
+        // 失败请求：不更新 EWMA；credits=0 不计价
+        manager.record_request_metrics(1, 9999, 0.0, false);
+        let s = manager.snapshot();
+        let e = &s.entries[0];
+        assert!(
+            (e.ewma_latency_ms.unwrap() - 1200.0).abs() < 1e-9,
+            "失败请求不应污染 EWMA"
+        );
+        assert_eq!(e.billed_requests, 2, "credits=0 不计价");
+        assert!((e.accrued_cost - 1.0).abs() < 1e-9);
     }
 
     #[test]

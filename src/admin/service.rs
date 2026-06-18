@@ -574,6 +574,9 @@ impl AdminService {
                     in_flight: entry.in_flight,
                     concurrency_limit: entry.concurrency_limit,
                     concurrency_limit_override: entry.concurrency_limit_override,
+                    ewma_latency_ms: entry.ewma_latency_ms,
+                    billed_requests: entry.billed_requests,
+                    accrued_cost: entry.accrued_cost,
                     balance,
                     balance_updated_at,
                 }

@@ -1008,6 +1008,30 @@ export function CredentialCard({
                 })()}
               </dd>
             </div>
+            {credential.ewmaLatencyMs != null && (
+              <div className="flex min-w-0 items-center justify-between gap-2">
+                <dt className="shrink-0 text-muted-foreground">耗时 EWMA</dt>
+                <dd className="min-w-0 text-right font-medium tabular-nums">
+                  {Math.round(credential.ewmaLatencyMs)}ms
+                </dd>
+              </div>
+            )}
+            {(credential.billedRequests ?? 0) > 0 && (
+              <div className="flex min-w-0 items-center justify-between gap-2">
+                <dt className="shrink-0 text-muted-foreground">计价请求</dt>
+                <dd className="min-w-0 text-right font-medium tabular-nums">
+                  {credential.billedRequests}
+                </dd>
+              </div>
+            )}
+            {(credential.accruedCost ?? 0) > 0 && (
+              <div className="flex min-w-0 items-center justify-between gap-2 min-[420px]:col-span-2">
+                <dt className="shrink-0 text-muted-foreground">估算成本</dt>
+                <dd className="min-w-0 text-right font-medium tabular-nums">
+                  ${formatNumber(credential.accruedCost ?? 0)}
+                </dd>
+              </div>
+            )}
             <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
               <dt className="shrink-0 text-muted-foreground">最后调用</dt>
               <dd className="min-w-0 truncate text-right font-medium">

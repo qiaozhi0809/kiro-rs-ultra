@@ -178,6 +178,11 @@ impl KiroProvider {
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
 
+    /// 暴露内部的 token_manager（供请求收尾时记录每账号性能指标）。
+    pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
+        &self.token_manager
+    }
+
     /// 在发起请求前，确保 Enterprise / IdC 账号的真实 profileArn 已解析并写入 `ctx`。
     ///
     /// 流式端点强制要求 profileArn；Enterprise / IdC 账号必须先把 BuilderID

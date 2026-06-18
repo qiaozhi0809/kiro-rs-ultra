@@ -81,6 +81,13 @@ pub struct CredentialStatusItem {
     /// 凭据级并发上限覆盖原始值（None = 未覆盖，用全局默认；用于编辑回填）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency_limit_override: Option<u32>,
+    /// 请求耗时滑动平均（毫秒，EWMA）；无样本时省略
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ewma_latency_ms: Option<f64>,
+    /// 计价请求数（credits>0 的请求累计）
+    pub billed_requests: u64,
+    /// 累计 credits 成本（本地估算）
+    pub accrued_cost: f64,
     /// 凭据余额（从缓存中读取的最近一次结果，可能为 None）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balance: Option<BalanceResponse>,

@@ -52,6 +52,8 @@ pub(crate) struct UsageRecordHook {
     pub key_id: u64,
     pub model: String,
     pub started_at: Instant,
+    /// token_manager（用于记录每账号性能指标：EWMA 耗时 / 计价 / 成本）
+    pub token_manager: Option<std::sync::Arc<crate::kiro::token_manager::MultiTokenManager>>,
 }
 
 impl UsageRecordHook {
@@ -63,6 +65,7 @@ impl UsageRecordHook {
             key_id,
             model,
             started_at: Instant::now(),
+            token_manager: state.kiro_provider.as_ref().map(|p| p.token_manager().clone()),
         }
     }
 
@@ -108,6 +111,18 @@ impl UsageRecordHook {
                     rec.cache_creation_tokens,
                     rec.cache_read_tokens,
                     rec.credits,
+                );
+            }
+        }
+        // 记录每账号性能指标（EWMA 耗时 / 计价 / 成本）。
+        // credential_id==0 表示无凭据上下文（如 websearch），跳过。
+        if credential_id != 0 {
+            if let Some(tm) = &self.token_manager {
+                tm.record_request_metrics(
+                    credential_id,
+                    rec.duration_ms,
+                    rec.credits,
+                    status == "success",
                 );
             }
         }

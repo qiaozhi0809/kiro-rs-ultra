@@ -42,6 +42,12 @@ export interface CredentialStatusItem {
   concurrencyLimit?: number
   /** 凭据级并发上限覆盖原始值（undefined = 未覆盖，用全局默认；用于编辑回填） */
   concurrencyLimitOverride?: number
+  /** 请求耗时滑动平均（毫秒，EWMA）；无样本时省略 */
+  ewmaLatencyMs?: number
+  /** 计价请求数（credits>0 的请求累计） */
+  billedRequests?: number
+  /** 累计 credits 成本（本地估算） */
+  accruedCost?: number
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
   /** 余额缓存的更新时间（Unix 秒） */
