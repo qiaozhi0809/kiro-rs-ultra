@@ -26,6 +26,7 @@ use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::events::Event as KiroStreamEvent;
 use crate::kiro::model::token_refresh::{
+    ExternalIdpErrorResponse, ExternalIdpRefreshForm, ExternalIdpRefreshResponse,
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
@@ -141,6 +142,12 @@ pub(crate) async fn refresh_token(
     }
 
     validate_refresh_token(credentials)?;
+
+    // External IdP (Microsoft Entra / Azure AD 等) 优先匹配：
+    // 这条分支不走 AWS SSO OIDC，而是直接 POST 到凭据上的 token_endpoint。
+    if credentials.is_external_idp() {
+        return refresh_external_idp_token(credentials, config, proxy).await;
+    }
 
     // 根据 auth_method 选择刷新方式
     // 如果未指定 auth_method，根据是否有 clientId/clientSecret 自动判断
@@ -258,10 +265,9 @@ async fn refresh_idc_token(
         .client_id
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("IdC 刷新需要 clientId"))?;
-    let client_secret = credentials
-        .client_secret
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("IdC 刷新需要 clientSecret"))?;
+    // clientSecret 在公共客户端（PKCE / builder-id）场景可缺失：
+    // 留 None 时序列化会自动省略 clientSecret 字段，避免 invalid_client。
+    let client_secret = credentials.client_secret.as_ref().cloned();
 
     // 优先级：凭据.auth_region > 凭据.region > config.auth_region > config.region
     let region = credentials.effective_auth_region(config);
@@ -278,7 +284,7 @@ async fn refresh_idc_token(
     let client = build_client(proxy, 60, config.tls_backend)?;
     let body = IdcRefreshRequest {
         client_id: client_id.to_string(),
-        client_secret: client_secret.to_string(),
+        client_secret,
         refresh_token: refresh_token.to_string(),
         grant_type: "refresh_token".to_string(),
     };
@@ -338,6 +344,104 @@ async fn refresh_idc_token(
     // 同步更新 profile_arn（如果 IdC 响应中包含）
     if let Some(profile_arn) = data.profile_arn {
         new_credentials.profile_arn = Some(profile_arn);
+    }
+
+    Ok(new_credentials)
+}
+
+/// 刷新 External IdP Token（Microsoft Entra / Azure AD 等）
+///
+/// 与 AWS SSO OIDC 不同，External IdP 凭据走 IdP 自己的 OAuth2 token endpoint，
+/// 请求体是 `application/x-www-form-urlencoded`，而非 JSON。
+///
+/// 字段约束（参见 RFC 6749 §6 + Microsoft identity platform 文档）：
+/// - `grant_type=refresh_token` 必填
+/// - `client_id` 必填
+/// - `refresh_token` 必填
+/// - `client_secret` 仅 confidential client 必填，公共客户端（PKCE/native）必须省略
+/// - `scope` 可选；省略时 IdP 沿用上次授权的 scope
+///
+/// 上游 CodeWhisperer 调用侧另需配合 `TokenType: EXTERNAL_IDP` 请求头，详见
+/// [`KiroCredentials::is_external_idp`] 调用点（endpoint/ide.rs / endpoint/cli.rs /
+/// token_manager 内 REST 调用）。
+async fn refresh_external_idp_token(
+    credentials: &KiroCredentials,
+    config: &Config,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<KiroCredentials> {
+    tracing::info!("正在刷新 External IdP Token...");
+
+    let refresh_token = credentials.refresh_token.as_ref().unwrap();
+    let client_id = credentials
+        .client_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 clientId"))?;
+    let token_endpoint = credentials
+        .token_endpoint
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("External IdP 刷新需要 tokenEndpoint"))?;
+    let client_secret = credentials.client_secret.as_deref();
+    let scope = credentials.scopes.as_deref();
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+    let form = ExternalIdpRefreshForm {
+        grant_type: "refresh_token",
+        client_id,
+        refresh_token,
+        client_secret,
+        scope,
+    };
+
+    // 与 Kiro IDE 行为对齐：use 默认 reqwest UA + 无需 AWS SDK headers。
+    let response = client
+        .post(token_endpoint)
+        .header("accept", "application/json")
+        .form(&form)
+        .send()
+        .await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+
+        // 解析 RFC 6749 标准错误码：`invalid_grant` → refreshToken 永久失效
+        if status.as_u16() == 400 || status.as_u16() == 401 {
+            if let Ok(err) = serde_json::from_str::<ExternalIdpErrorResponse>(&body_text) {
+                if err.error.eq_ignore_ascii_case("invalid_grant") {
+                    return Err(RefreshTokenInvalidError {
+                        message: format!(
+                            "External IdP refreshToken 已失效 (invalid_grant): {}",
+                            body_text
+                        ),
+                    }
+                    .into());
+                }
+            }
+        }
+
+        let error_msg = match status.as_u16() {
+            400 => "External IdP 刷新参数无效",
+            401 => "External IdP 凭证已过期或无效，需要重新认证",
+            403 => "权限不足，无法刷新 Token",
+            429 => "请求过于频繁，已被 IdP 限流",
+            500..=599 => "服务器错误，External IdP 服务暂时不可用",
+            _ => "External IdP Token 刷新失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ExternalIdpRefreshResponse = response.json().await?;
+
+    let mut new_credentials = credentials.clone();
+    new_credentials.access_token = Some(data.access_token);
+
+    if let Some(new_refresh_token) = data.refresh_token {
+        new_credentials.refresh_token = Some(new_refresh_token);
+    }
+
+    if let Some(expires_in) = data.expires_in {
+        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        new_credentials.expires_at = Some(expires_at.to_rfc3339());
     }
 
     Ok(new_credentials)
@@ -416,6 +520,8 @@ pub(crate) async fn get_usage_limits(
 
         if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp() {
+            request = request.header("TokenType", "EXTERNAL_IDP");
         }
 
         let response = request.send().await?;
@@ -513,6 +619,8 @@ pub(crate) async fn get_available_models(
 
         if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp() {
+            request = request.header("TokenType", "EXTERNAL_IDP");
         }
 
         let response = request.send().await?;
@@ -612,6 +720,8 @@ pub(crate) async fn list_available_profiles(
 
         if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp() {
+            request = request.header("TokenType", "EXTERNAL_IDP");
         }
 
         let response = request.send().await?;
@@ -705,6 +815,8 @@ pub(crate) async fn set_user_preference(
 
         if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp() {
+            request = request.header("TokenType", "EXTERNAL_IDP");
         }
 
         let response = request.send().await?;
@@ -2897,6 +3009,8 @@ impl MultiTokenManager {
         }
         if credentials.is_api_key_credential() {
             request = request.header("tokentype", "API_KEY");
+        } else if credentials.is_external_idp() {
+            request = request.header("TokenType", "EXTERNAL_IDP");
         }
 
         let request_started_at = Instant::now();

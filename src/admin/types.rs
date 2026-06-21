@@ -165,6 +165,20 @@ pub struct AddCredentialRequest {
     #[serde(default)]
     pub start_url: Option<String>,
 
+    /// External IdP token 端点 URL（仅 `external_idp` 账号使用）
+    /// 例如 Microsoft Entra v2.0：
+    /// `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+
+    /// External IdP OAuth 作用域（空格分隔，可选）
+    #[serde(default)]
+    pub scopes: Option<String>,
+
+    /// External IdP Issuer URL（可选元数据）
+    #[serde(default)]
+    pub issuer_url: Option<String>,
+
     /// 优先级（可选，默认 0）
     #[serde(default)]
     pub priority: u32,
