@@ -25,6 +25,10 @@
 /traces.db
 /traces.db-shm
 /traces.db-wal
+# mitm 流量调试库（仅排错用，绝不入库）
+/mitm_*.db
+/mitm_*.db-shm
+/mitm_*.db-wal
 # 在线更新产生的暂存二进制和备份
 *.staged-*
 *.backup
