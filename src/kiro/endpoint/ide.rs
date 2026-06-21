@@ -85,6 +85,11 @@ impl KiroEndpoint for IdeEndpoint {
 
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if ctx.credentials.is_external_idp() {
+            // External IdP（Microsoft Entra 等）必须带该 header，否则上游
+            // CodeWhisperer 会以 "The bearer token included in the request is invalid"
+            // 拒绝。对齐官方 Kiro IDE 的 addExternalIdpTokenTypeMiddleware。
+            req = req.header("TokenType", "EXTERNAL_IDP");
         }
         req
     }
@@ -103,6 +108,8 @@ impl KiroEndpoint for IdeEndpoint {
         }
         if ctx.credentials.is_api_key_credential() {
             req = req.header("tokentype", "API_KEY");
+        } else if ctx.credentials.is_external_idp() {
+            req = req.header("TokenType", "EXTERNAL_IDP");
         }
         req
     }
