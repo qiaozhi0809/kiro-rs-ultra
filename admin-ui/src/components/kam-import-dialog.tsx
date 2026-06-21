@@ -43,6 +43,12 @@ interface KamAccount {
     authMethod?: string
     provider?: string
     startUrl?: string
+    /** External IdP token 端点（Microsoft Entra 等） */
+    tokenEndpoint?: string
+    /** External IdP OAuth 作用域 */
+    scopes?: string
+    /** External IdP Issuer URL（可选元数据） */
+    issuerUrl?: string
   }
   machineId?: string
   status?: string
@@ -107,6 +113,9 @@ function normalizeKamAccount(item: unknown): unknown {
     const authMethod = typeof obj.authMethod === 'string' ? obj.authMethod : undefined
     const provider = typeof obj.provider === 'string' ? obj.provider : undefined
     const startUrl = typeof obj.startUrl === 'string' ? obj.startUrl : undefined
+    const tokenEndpoint = typeof obj.tokenEndpoint === 'string' ? obj.tokenEndpoint : undefined
+    const scopes = typeof obj.scopes === 'string' ? obj.scopes : undefined
+    const issuerUrl = typeof obj.issuerUrl === 'string' ? obj.issuerUrl : undefined
 
     return {
       email,
@@ -126,6 +135,9 @@ function normalizeKamAccount(item: unknown): unknown {
         authMethod,
         provider,
         startUrl,
+        tokenEndpoint,
+        scopes,
+        issuerUrl,
       },
     }
   }
@@ -352,9 +364,38 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
         const clientId = cred.clientId?.trim() || undefined
         const clientSecret = cred.clientSecret?.trim() || undefined
-        const authMethod = clientId && clientSecret ? 'idc' : 'social'
-        const provider = cred.provider?.trim() || account.idp?.trim() || undefined
+        const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+        const scopes = cred.scopes?.trim() || undefined
+        const issuerUrl = cred.issuerUrl?.trim() || undefined
+        const rawAuthMethod = cred.authMethod?.trim().toLowerCase()
+        const rawProvider = cred.provider?.trim()
 
+        // 三路识别认证方式：
+        // 1) 显式 authMethod=external_idp / provider=ExternalIdp / 携带 tokenEndpoint
+        //    → external_idp（Microsoft Entra 等，公共客户端可没有 clientSecret）
+        // 2) 同时有 clientId + clientSecret → idc（AWS SSO OIDC）
+        // 3) 其余 → social
+        const isExternalIdp =
+          rawAuthMethod === 'external_idp' ||
+          rawAuthMethod === 'external-idp' ||
+          rawAuthMethod === 'externalidp' ||
+          rawProvider?.toLowerCase() === 'externalidp' ||
+          !!tokenEndpoint
+        const authMethod: 'external_idp' | 'idc' | 'social' = isExternalIdp
+          ? 'external_idp'
+          : clientId && clientSecret
+            ? 'idc'
+            : 'social'
+        const provider = rawProvider || account.idp?.trim() || undefined
+
+        // External IdP 必须有 clientId + tokenEndpoint，否则刷新无门路
+        if (isExternalIdp && (!clientId || !tokenEndpoint)) {
+          updateResult(i, {
+            status: 'failed',
+            error: 'External IdP 凭据需要 clientId 与 tokenEndpoint',
+          })
+          continue
+        }
         // idc 模式下必须同时提供 clientId 和 clientSecret
         if (authMethod === 'social' && (clientId || clientSecret)) {
           updateResult(i, { status: 'failed', error: 'idc 模式需要同时提供 clientId 和 clientSecret' })
@@ -382,6 +423,9 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             startUrl: cred.startUrl?.trim() || undefined,
             clientId,
             clientSecret,
+            tokenEndpoint,
+            scopes,
+            issuerUrl,
             machineId: account.machineId?.trim() || undefined,
             email: account.email?.trim() || undefined,
             proxyUrl,
