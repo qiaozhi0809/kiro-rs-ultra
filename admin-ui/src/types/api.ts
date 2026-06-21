@@ -128,11 +128,17 @@ export interface AddCredentialRequest {
   accessToken?: string
   profileArn?: string
   expiresAt?: string
-  authMethod?: 'social' | 'idc' | 'api_key'
+  authMethod?: 'social' | 'idc' | 'api_key' | 'external_idp'
   provider?: string
   clientId?: string
   clientSecret?: string
   startUrl?: string
+  /** External IdP token 端点（Microsoft Entra v2.0 等），仅 external_idp 使用 */
+  tokenEndpoint?: string
+  /** External IdP OAuth 作用域（空格分隔），仅 external_idp 使用 */
+  scopes?: string
+  /** External IdP Issuer URL（可选元数据） */
+  issuerUrl?: string
   priority?: number
   authRegion?: string
   apiRegion?: string

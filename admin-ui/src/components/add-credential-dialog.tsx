@@ -26,7 +26,7 @@ interface AddCredentialDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
-type AuthMethod = 'social' | 'idc' | 'api_key'
+type AuthMethod = 'social' | 'idc' | 'api_key' | 'external_idp'
 
 export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogProps) {
   const [refreshToken, setRefreshToken] = useState('')
@@ -36,6 +36,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
+  const [tokenEndpoint, setTokenEndpoint] = useState('')
+  const [scopes, setScopes] = useState('')
+  const [issuerUrl, setIssuerUrl] = useState('')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
@@ -56,6 +59,9 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setApiRegion('')
     setClientId('')
     setClientSecret('')
+    setTokenEndpoint('')
+    setScopes('')
+    setIssuerUrl('')
     setMachineId('')
     setProxyUrl('')
     setProxyUsername('')
@@ -66,6 +72,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   }
 
   const isApiKey = authMethod === 'api_key'
+  const isExternalIdp = authMethod === 'external_idp'
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
@@ -86,6 +93,18 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         toast.error('IdC/Builder-ID/IAM 认证需要填写 Client ID 和 Client Secret')
         return
       }
+      // External IdP（Microsoft Entra 等）需要 clientId 与 tokenEndpoint，
+      // clientSecret 公共客户端（PKCE）可省略
+      if (isExternalIdp) {
+        if (!clientId.trim()) {
+          toast.error('External IdP 认证需要填写 Client ID')
+          return
+        }
+        if (!tokenEndpoint.trim()) {
+          toast.error('External IdP 认证需要填写 Token Endpoint')
+          return
+        }
+      }
     }
 
     mutate(
@@ -97,6 +116,10 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
+        tokenEndpoint: isExternalIdp ? tokenEndpoint.trim() || undefined : undefined,
+        scopes: isExternalIdp ? scopes.trim() || undefined : undefined,
+        issuerUrl: isExternalIdp ? issuerUrl.trim() || undefined : undefined,
+        provider: isExternalIdp ? 'ExternalIdp' : undefined,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
@@ -143,6 +166,7 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 <SelectContent>
                   <SelectItem value="social">Social</SelectItem>
                   <SelectItem value="idc">IdC/Builder-ID/IAM</SelectItem>
+                  <SelectItem value="external_idp">External IdP（Microsoft Entra）</SelectItem>
                   <SelectItem value="api_key">API Key</SelectItem>
                 </SelectContent>
               </Select>
@@ -237,6 +261,88 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                     onChange={(e) => setClientSecret(e.target.value)}
                     disabled={isPending}
                   />
+                </div>
+              </>
+            )}
+
+            {/* External IdP（Microsoft Entra / Azure AD）额外字段 */}
+            {isExternalIdp && (
+              <>
+                <div className="space-y-2">
+                  <label htmlFor="extClientId" className="text-sm font-medium">
+                    Client ID <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="extClientId"
+                    placeholder="例: 3a00dc43-2c75-48ef-a31c-2284f0590105"
+                    value={clientId}
+                    onChange={(e) => setClientId(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Microsoft Entra 应用注册的应用程序（客户端）ID
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="tokenEndpoint" className="text-sm font-medium">
+                    Token Endpoint <span className="text-red-500">*</span>
+                  </label>
+                  <Input
+                    id="tokenEndpoint"
+                    placeholder="https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+                    value={tokenEndpoint}
+                    onChange={(e) => setTokenEndpoint(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    IdP 的 OAuth2 token 端点。Microsoft Entra v2.0 形如上方占位符
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="extClientSecret" className="text-sm font-medium">
+                    Client Secret
+                  </label>
+                  <Input
+                    id="extClientSecret"
+                    type="password"
+                    placeholder="公共客户端 (PKCE / native) 留空"
+                    value={clientSecret}
+                    onChange={(e) => setClientSecret(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    可选。仅 confidential client / web app 才填；公共客户端必须留空，否则 IdP 会以 invalid_client 拒绝
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="scopes" className="text-sm font-medium">
+                    Scopes
+                  </label>
+                  <Input
+                    id="scopes"
+                    placeholder="openid profile offline_access ..."
+                    value={scopes}
+                    onChange={(e) => setScopes(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    可选，空格分隔。refresh 时通常可省略，IdP 沿用上次授权的 scope
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <label htmlFor="issuerUrl" className="text-sm font-medium">
+                    Issuer URL
+                  </label>
+                  <Input
+                    id="issuerUrl"
+                    placeholder="https://login.microsoftonline.com/{tenant}/v2.0"
+                    value={issuerUrl}
+                    onChange={(e) => setIssuerUrl(e.target.value)}
+                    disabled={isPending}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    可选元数据，便于排错
+                  </p>
                 </div>
               </>
             )}
