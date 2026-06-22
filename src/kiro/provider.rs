@@ -352,6 +352,7 @@ impl KiroProvider {
             // ─── MCP 端点降级（runtime → ide）───────────────────────
             let endpoint_name_mcp = endpoint.name();
             if matches!(status.as_u16(), 400 | 403 | 429)
+                && !endpoint.is_account_throttled(&body)
                 && !endpoint.is_client_validation_error(&body)
             {
                 if let Some(fallback) = self.fallback_endpoint(endpoint_name_mcp) {
