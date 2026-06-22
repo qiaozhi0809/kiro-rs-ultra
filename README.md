@@ -44,7 +44,7 @@
 - **多凭据调度**：`priority` 固定优先级和 `balanced` 均衡分配。
 - **故障转移**：凭据失败、额度用尽、账号级 429 风控冷却、token 失效强制刷新。
 - **profileArn 策略**：流式端点按账号类型注入真实 ARN 或 Builder ID 占位 ARN；用量类 / 头部类调用跳过占位 ARN。
-- **端点抽象**：按凭据选择 `ide` 或 `cli` endpoint。
+- **端点抽象**：按凭据选择 `ide` / `cli` / `runtime` endpoint。`runtime` 走 `runtime.{region}.kiro.dev`，与 `q.{region}.amazonaws.com` 是两条独立限流桶——把账号分到两条上可以等效拿到上游配额翻倍。
 - **工具调用**：支持 `tool_use` / `tool_result` 配对、工具名缩短与反向映射。
 - **Thinking / Reasoning 兼容**：支持 `thinking.type=enabled` / `adaptive`、Claude Code 默认 thinking 请求、Kiro 原生 `reasoningContentEvent` 到 Anthropic thinking / signature / redacted thinking 事件的转换。
 - **WebSearch**：支持纯 `web_search` 请求和混合工具场景下的本地 agentic web_search loop。

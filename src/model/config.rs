@@ -197,7 +197,11 @@ fn default_region() -> String {
 }
 
 fn default_kiro_version() -> String {
-    "2.3.0".to_string()
+    // Kiro 上游会按 UA 里的版本号做风控：低版本号触发 429 的阈值明显更低
+    // （比如 0.7.x 三次内必中），因此 fallback 必须跟当前发布的最新 IDE 版本对齐。
+    // 实际运行时通常被 `kiro_version::effective()` 用最新版本覆盖，这里只在
+    // 元数据拉取失败时兜底。
+    "0.12.333".to_string()
 }
 
 fn default_system_version() -> String {
