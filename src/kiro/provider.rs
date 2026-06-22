@@ -178,6 +178,19 @@ impl KiroProvider {
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
 
+    /// 端点降级：runtime → ide。
+    ///
+    /// runtime 与 q (ide) 的上游限流桶独立——runtime 返回 400/403/429 时
+    /// 立即用 ide 端点重发同一请求，大概率能通。
+    /// 仅 runtime 端点有 fallback；ide / cli 返回 None（无降级目标）。
+    fn fallback_endpoint(&self, current: &str) -> Option<Arc<dyn KiroEndpoint>> {
+        if current == "runtime" {
+            self.endpoints.get("ide").cloned()
+        } else {
+            None
+        }
+    }
+
     /// 暴露内部的 token_manager（供请求收尾时记录每账号性能指标）。
     pub fn token_manager(&self) -> &Arc<MultiTokenManager> {
         &self.token_manager
@@ -335,6 +348,53 @@ impl KiroProvider {
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
+
+            // ─── MCP 端点降级（runtime → ide）───────────────────────
+            let endpoint_name_mcp = endpoint.name();
+            if matches!(status.as_u16(), 400 | 403 | 429)
+                && !endpoint.is_client_validation_error(&body)
+            {
+                if let Some(fallback) = self.fallback_endpoint(endpoint_name_mcp) {
+                    tracing::info!(
+                        "MCP 端点降级 [{}] → [{}]（凭据 #{}，HTTP {}）",
+                        endpoint_name_mcp,
+                        fallback.name(),
+                        ctx.id,
+                        status.as_u16()
+                    );
+                    let fb_rctx = RequestContext {
+                        credentials: &ctx.credentials,
+                        token: &ctx.token,
+                        machine_id: &machine_id,
+                        config,
+                    };
+                    let fb_url = fallback.mcp_url(&fb_rctx);
+                    let fb_body = fallback.transform_mcp_body(request_body, &fb_rctx);
+                    let fb_base = self
+                        .client_for(&ctx.credentials)?
+                        .post(&fb_url)
+                        .body(fb_body)
+                        .header("content-type", fallback.content_type())
+                        .header("Connection", "close");
+                    let fb_request = fallback.decorate_mcp(fb_base, &fb_rctx);
+                    match fb_request.send().await {
+                        Ok(fb_resp) if fb_resp.status().is_success() => {
+                            self.token_manager.report_success(ctx.id);
+                            return Ok(fb_resp);
+                        }
+                        Ok(fb_resp) => {
+                            tracing::warn!(
+                                "MCP 降级端点也失败（HTTP {}），回退常规重试",
+                                fb_resp.status().as_u16()
+                            );
+                        }
+                        Err(fb_err) => {
+                            tracing::warn!("MCP 降级端点网络错误: {}", fb_err);
+                        }
+                    }
+                }
+            }
+            // ─── MCP 端点降级结束 ────────────────────────────────────
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -537,6 +597,81 @@ impl KiroProvider {
 
             // 失败响应：读取 body 用于日志/错误信息
             let body = response.text().await.unwrap_or_default();
+
+            // ─── 端点降级（runtime → ide）─────────────────────────────
+            // runtime.{region}.kiro.dev 与 q.{region}.amazonaws.com 限流桶独立。
+            // 当 runtime 返回 400/403/429 时，立即用 ide 端点重发同一请求——
+            // 大概率能通（独立桶未被限流）。不消耗重试预算，不切换账号。
+            if matches!(status.as_u16(), 400 | 403 | 429)
+                && !endpoint.is_account_throttled(&body)
+                && !endpoint.is_client_validation_error(&body)
+            {
+                if let Some(fallback) = self.fallback_endpoint(endpoint_name) {
+                    let fb_name = fallback.name();
+                    tracing::info!(
+                        "端点降级 [{}] → [{}]（凭据 #{}，HTTP {}）",
+                        endpoint_name,
+                        fb_name,
+                        ctx.id,
+                        status.as_u16()
+                    );
+
+                    let fb_rctx = RequestContext {
+                        credentials: &ctx.credentials,
+                        token: &ctx.token,
+                        machine_id: &machine_id,
+                        config,
+                    };
+                    let fb_url = fallback.api_url(&fb_rctx);
+                    let fb_body = fallback.transform_api_body(request_body, &fb_rctx);
+                    let fb_base = self
+                        .client_for(&ctx.credentials)?
+                        .post(&fb_url)
+                        .body(fb_body)
+                        .header("content-type", fallback.content_type())
+                        .header("Connection", "close");
+                    let fb_request = fallback.decorate_api(fb_base, &fb_rctx);
+                    let fb_request = fb_request
+                        .build()
+                        .map_err(|e| anyhow::anyhow!("构建降级请求失败: {}", e))?;
+
+                    match self.client_for(&ctx.credentials)?.execute(fb_request).await {
+                        Ok(fb_resp) if fb_resp.status().is_success() => {
+                            Self::emit_attempt(
+                                sink, attempt, ctx.id, fb_name, Some(fb_resp.status().as_u16()),
+                                outcome::SUCCESS, None, attempt_start,
+                            );
+                            self.token_manager.report_success(ctx.id);
+                            return Ok(KiroCallResult {
+                                response: fb_resp,
+                                credential_id: ctx.id,
+                            });
+                        }
+                        Ok(fb_resp) => {
+                            let fb_status = fb_resp.status();
+                            let fb_body = fb_resp.text().await.unwrap_or_default();
+                            tracing::warn!(
+                                "降级端点 [{}] 也失败（HTTP {}），回退常规重试",
+                                fb_name,
+                                fb_status.as_u16()
+                            );
+                            Self::emit_attempt(
+                                sink, attempt, ctx.id, fb_name, Some(fb_status.as_u16()),
+                                outcome::TRANSIENT, Some(&fb_body), attempt_start,
+                            );
+                        }
+                        Err(fb_err) => {
+                            tracing::warn!(
+                                "降级端点 [{}] 网络错误: {}",
+                                fb_name,
+                                fb_err
+                            );
+                        }
+                    }
+                    // fallback 也失败了，继续常规流程（用原始 status/body 走下面的分支）
+                }
+            }
+            // ─── 端点降级结束 ────────────────────────────────────────
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
