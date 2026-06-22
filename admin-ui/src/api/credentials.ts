@@ -457,6 +457,31 @@ export async function setAccountThrottleConfig(
   return data
 }
 
+// ============ 端点策略（起点 + runtime 降级 + 当前分布）============
+
+export interface EndpointDistributionItem {
+  endpoint: string
+  count: number
+}
+
+export interface EndpointPolicy {
+  defaultEndpoint: string
+  runtimeFallbackEnabled: boolean
+  distribution: EndpointDistributionItem[]
+}
+
+export async function getEndpointPolicy(): Promise<EndpointPolicy> {
+  const { data } = await api.get<EndpointPolicy>('/config/endpoint-policy')
+  return data
+}
+
+export async function setEndpointPolicy(
+  patch: Partial<Pick<EndpointPolicy, 'defaultEndpoint' | 'runtimeFallbackEnabled'>>,
+): Promise<EndpointPolicy> {
+  const { data } = await api.put<EndpointPolicy>('/config/endpoint-policy', patch)
+  return data
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number

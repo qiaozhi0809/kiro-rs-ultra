@@ -581,15 +581,31 @@ pub async fn set_load_balancing_mode(
 /// 获取账号级风控故障转移配置
 pub async fn get_account_throttle_config(State(state): State<AdminState>) -> impl IntoResponse {
     Json(state.service.get_account_throttle_config())
-}
-
-/// PUT /api/admin/config/account-throttle
+}/// PUT /api/admin/config/account-throttle
 /// 更新账号级风控故障转移配置
 pub async fn set_account_throttle_config(
     State(state): State<AdminState>,
     Json(payload): Json<SetAccountThrottleConfigRequest>,
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/config/endpoint-policy
+/// 获取端点策略：默认起点 / runtime 降级开关 / 当前凭据在端点上的分布
+pub async fn get_endpoint_policy(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_endpoint_policy())
+}
+
+/// PUT /api/admin/config/endpoint-policy
+/// 修改端点策略（两个字段都可选，仅改传的那个）
+pub async fn set_endpoint_policy(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SetEndpointPolicyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_endpoint_policy(payload) {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }

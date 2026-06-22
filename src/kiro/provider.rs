@@ -105,8 +105,6 @@ pub struct KiroProvider {
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
     endpoints: HashMap<String, Arc<dyn KiroEndpoint>>,
-    /// 默认端点名称（凭据未指定 endpoint 时使用）
-    default_endpoint: String,
     /// 已尝试过 profileArn 解析的凭据 ID（进程内）。
     ///
     /// 避免对「无 Enterprise profile」的账号（如纯 BuilderID）在每次请求都重复调用
@@ -146,7 +144,6 @@ impl KiroProvider {
             client_cache: Mutex::new(client_cache),
             tls_backend,
             endpoints,
-            default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
@@ -168,10 +165,12 @@ impl KiroProvider {
         &self,
         credentials: &KiroCredentials,
     ) -> anyhow::Result<Arc<dyn KiroEndpoint>> {
+        // 凭据级 endpoint 优先；否则用 token_manager 的运行时默认值（可被 Admin 动态修改）
+        let runtime_default = self.token_manager.get_default_endpoint();
         let name = credentials
             .endpoint
             .as_deref()
-            .unwrap_or(&self.default_endpoint);
+            .unwrap_or(&runtime_default);
         self.endpoints
             .get(name)
             .cloned()
@@ -183,7 +182,11 @@ impl KiroProvider {
     /// runtime 与 q (ide) 的上游限流桶独立——runtime 返回 400/403/429 时
     /// 立即用 ide 端点重发同一请求，大概率能通。
     /// 仅 runtime 端点有 fallback；ide / cli 返回 None（无降级目标）。
+    /// 也尊重运行时开关：token_manager.runtime_fallback_enabled = false 时直接 None。
     fn fallback_endpoint(&self, current: &str) -> Option<Arc<dyn KiroEndpoint>> {
+        if !self.token_manager.get_runtime_fallback_enabled() {
+            return None;
+        }
         if current == "runtime" {
             self.endpoints.get("ide").cloned()
         } else {

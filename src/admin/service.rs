@@ -24,11 +24,13 @@ use super::types::{
     AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
     BalanceResponse, BatchAddProxyRequest, BatchImportEvent,
     CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
+    EndpointDistributionItem, EndpointPolicyResponse,
     GitHubRateLimitInfo, ImageUpdateResponse, ExportedAccount, ExportedCredentials,
     CredentialsExportResponse,
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
-    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    QuotaExceededResult, SetAccountThrottleConfigRequest, SetEndpointPolicyRequest,
+    SetLoadBalancingModeRequest,
     SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
     StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
     UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -1966,6 +1968,46 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取端点策略（起点 + 降级 + 当前分布）
+    pub fn get_endpoint_policy(&self) -> EndpointPolicyResponse {
+        let distribution = self
+            .token_manager
+            .endpoint_distribution()
+            .into_iter()
+            .map(|(endpoint, count)| EndpointDistributionItem { endpoint, count })
+            .collect();
+        EndpointPolicyResponse {
+            default_endpoint: self.token_manager.get_default_endpoint(),
+            runtime_fallback_enabled: self.token_manager.get_runtime_fallback_enabled(),
+            distribution,
+        }
+    }
+
+    /// 修改端点策略（两个字段都可选）
+    pub fn set_endpoint_policy(
+        &self,
+        req: SetEndpointPolicyRequest,
+    ) -> Result<EndpointPolicyResponse, AdminServiceError> {
+        if let Some(ref ep) = req.default_endpoint {
+            // 白名单：仅允许聊天用的两个端点
+            if ep != "ide" && ep != "runtime" {
+                return Err(AdminServiceError::InvalidCredential(format!(
+                    "defaultEndpoint 必须是 'ide' 或 'runtime'，收到: {}",
+                    ep
+                )));
+            }
+            self.token_manager
+                .set_default_endpoint(ep.clone())
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        if let Some(enabled) = req.runtime_fallback_enabled {
+            self.token_manager
+                .set_runtime_fallback_enabled(enabled)
+                .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
+        }
+        Ok(self.get_endpoint_policy())
     }
 
     /// 获取账号级风控故障转移配置

@@ -199,6 +199,13 @@ pub struct Config {
     #[serde(default = "default_cache_mode")]
     pub cache_mode_default: CacheMode,
 
+    /// runtime → ide 自动降级开关（默认 true，= 升级前行为）。
+    ///
+    /// 关闭后 runtime 起点请求遇错不再降级到 ide，由账号正常重试逻辑接管。
+    /// 起点 = ide 的请求不受此开关影响（ide 没有下家端点）。
+    #[serde(default = "default_runtime_fallback_enabled")]
+    pub runtime_fallback_enabled: bool,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -291,6 +298,10 @@ fn default_cache_mode() -> CacheMode {
     CacheMode::Low
 }
 
+fn default_runtime_fallback_enabled() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -328,6 +339,7 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             default_concurrency_limit: default_concurrency_limit(),
             cache_mode_default: default_cache_mode(),
+            runtime_fallback_enabled: default_runtime_fallback_enabled(),
             endpoints: HashMap::new(),
             config_path: None,
         }

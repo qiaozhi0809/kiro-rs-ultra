@@ -17,6 +17,8 @@ import {
   setLoadBalancingMode,
   getAccountThrottleConfig,
   setAccountThrottleConfig,
+  getEndpointPolicy,
+  setEndpointPolicy,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
@@ -249,6 +251,27 @@ export function useSetAccountThrottleConfig() {
     mutationFn: setAccountThrottleConfig,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取端点策略（起点 + runtime 降级 + 当前分布）
+export function useEndpointPolicy() {
+  return useQuery({
+    queryKey: ['endpointPolicy'],
+    queryFn: getEndpointPolicy,
+    // 分布会随凭据增删/disabled 变化，刷凭据列表时一起重新拉
+    refetchOnWindowFocus: true,
+  })
+}
+
+// 修改端点策略
+export function useSetEndpointPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setEndpointPolicy,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['endpointPolicy'] })
     },
   })
 }

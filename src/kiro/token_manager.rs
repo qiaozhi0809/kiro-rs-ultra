@@ -1064,6 +1064,10 @@ pub struct MultiTokenManager {
     is_multiple_format: AtomicBool,
     /// 负载均衡模式（运行时可修改）
     load_balancing_mode: Mutex<String>,
+    /// 默认起点端点名（运行时可修改）。未在凭据级单独配 endpoint 的请求用此值。
+    default_endpoint: Mutex<String>,
+    /// runtime → ide 自动降级开关（运行时可修改）。false 时 fallback_endpoint 直接返回 None。
+    runtime_fallback_enabled: AtomicBool,
     /// 账号级 429 风控故障转移开关（运行时可修改）
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
@@ -1308,6 +1312,8 @@ impl MultiTokenManager {
             .unwrap_or(0);
 
         let load_balancing_mode = config.load_balancing_mode.clone();
+        let default_endpoint = config.default_endpoint.clone();
+        let runtime_fallback_enabled = config.runtime_fallback_enabled;
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         let manager = Self {
@@ -1321,6 +1327,8 @@ impl MultiTokenManager {
             persist_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
             load_balancing_mode: Mutex::new(load_balancing_mode),
+            default_endpoint: Mutex::new(default_endpoint),
+            runtime_fallback_enabled: AtomicBool::new(runtime_fallback_enabled),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
@@ -3795,6 +3803,108 @@ impl MultiTokenManager {
 
         tracing::info!("负载均衡模式已设置为: {}", mode);
         Ok(())
+    }
+
+    /// 获取当前默认起点端点（Admin API）
+    pub fn get_default_endpoint(&self) -> String {
+        self.default_endpoint.lock().clone()
+    }
+
+    /// 设置默认起点端点（Admin API）。运行时立即生效 + 持久化。
+    /// 调用方负责校验端点名在 provider 注册表里存在。
+    pub fn set_default_endpoint(&self, endpoint: String) -> anyhow::Result<()> {
+        let trimmed = endpoint.trim().to_string();
+        if trimmed.is_empty() {
+            anyhow::bail!("端点名不能为空");
+        }
+        let previous = self.get_default_endpoint();
+        if previous == trimmed {
+            return Ok(());
+        }
+
+        *self.default_endpoint.lock() = trimmed.clone();
+
+        if let Err(err) = self.persist_default_endpoint(&trimmed) {
+            *self.default_endpoint.lock() = previous;
+            return Err(err);
+        }
+
+        tracing::info!("默认起点端点已设置为: {}", trimmed);
+        Ok(())
+    }
+
+    fn persist_default_endpoint(&self, endpoint: &str) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = match self.config.config_path() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，默认起点端点仅在当前进程生效: {}", endpoint);
+                return Ok(());
+            }
+        };
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.default_endpoint = endpoint.to_string();
+        config
+            .save()
+            .with_context(|| format!("持久化默认起点端点失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
+    /// 获取 runtime → ide 自动降级开关（Admin API）
+    pub fn get_runtime_fallback_enabled(&self) -> bool {
+        self.runtime_fallback_enabled.load(Ordering::Relaxed)
+    }
+
+    /// 设置 runtime → ide 自动降级开关（Admin API）。运行时立即生效 + 持久化。
+    pub fn set_runtime_fallback_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        let previous = self.get_runtime_fallback_enabled();
+        if previous == enabled {
+            return Ok(());
+        }
+        self.runtime_fallback_enabled.store(enabled, Ordering::Relaxed);
+
+        if let Err(err) = self.persist_runtime_fallback_enabled(enabled) {
+            self.runtime_fallback_enabled.store(previous, Ordering::Relaxed);
+            return Err(err);
+        }
+        tracing::info!("runtime→ide 自动降级已{}", if enabled { "启用" } else { "禁用" });
+        Ok(())
+    }
+
+    fn persist_runtime_fallback_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = match self.config.config_path() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，runtime 降级开关仅在当前进程生效: {}", enabled);
+                return Ok(());
+            }
+        };
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.runtime_fallback_enabled = enabled;
+        config
+            .save()
+            .with_context(|| format!("持久化 runtime 降级开关失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
+    /// 统计当前每个端点上"挂着"的可用凭据数（按 endpoint 字段或默认端点归属）。
+    /// 返回 (endpoint_name, count) 列表，仅统计未禁用的凭据。
+    pub fn endpoint_distribution(&self) -> Vec<(String, usize)> {
+        let default_ep = self.get_default_endpoint();
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for e in self.entries.lock().iter().filter(|e| !e.disabled) {
+            let ep = e
+                .credentials
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| default_ep.clone());
+            *counts.entry(ep).or_insert(0) += 1;
+        }
+        counts.into_iter().collect()
     }
 
     /// 获取账号级风控故障转移配置（Admin API）

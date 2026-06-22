@@ -475,6 +475,39 @@ pub struct SetLoadBalancingModeRequest {
     pub mode: String,
 }
 
+/// 端点策略响应（凭据列表标题旁的三件套 UI 用）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointPolicyResponse {
+    /// 当前默认起点端点（凭据未单独配 endpoint 时用此值）
+    pub default_endpoint: String,
+    /// runtime → ide 自动降级开关
+    pub runtime_fallback_enabled: bool,
+    /// 当前每个端点上"挂着"几个未禁用的凭据（含凭据级覆盖）。
+    /// 单端点时只有一项；并行时两项并列。
+    pub distribution: Vec<EndpointDistributionItem>,
+}
+
+/// 端点凭据分布项
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EndpointDistributionItem {
+    pub endpoint: String,
+    pub count: usize,
+}
+
+/// 端点策略修改请求（两个字段都可选 = 仅改传的那个）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetEndpointPolicyRequest {
+    /// 新的默认起点端点；缺省 = 不改
+    #[serde(default)]
+    pub default_endpoint: Option<String>,
+    /// 新的 runtime → ide 降级开关；缺省 = 不改
+    #[serde(default)]
+    pub runtime_fallback_enabled: Option<bool>,
+}
+
 /// 账号级风控故障转移配置响应
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

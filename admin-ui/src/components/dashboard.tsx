@@ -142,6 +142,7 @@ import {
   overageFailureMessage,
 } from "@/lib/utils";
 import type { BalanceResponse } from "@/types/api";
+import { EndpointPolicyControls } from "@/components/endpoint-policy-controls";
 
 interface DashboardProps {
   onLogout: () => void;
@@ -1322,7 +1323,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
       >
         {/* 大标题 */}
-        <div className="mb-5 flex items-end justify-between gap-4 sm:mb-6">
+        <div className="mb-5 flex flex-wrap items-end justify-between gap-4 sm:mb-6">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight leading-tight sm:text-[28px]">
               凭据管理
@@ -1331,6 +1332,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               管理 Kiro 的所有访问凭据、负载均衡与登录信息
             </p>
           </div>
+          <EndpointPolicyControls />
         </div>
 
         {/* 统计卡片 */}
