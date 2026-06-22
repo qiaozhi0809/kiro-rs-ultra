@@ -214,6 +214,10 @@ async fn main() {
         }
     }
 
+    // 把分组注册表交给 token_manager，使其在 acquire_context / sticky_record 时能查
+    // 每组的 cacheMode 覆盖（用 OnceLock 是因为 token_manager 比 group_manager 先构造）。
+    token_manager.register_group_manager(group_manager.clone());
+
     // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
     let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
         cache_dir.join("traces.db"),

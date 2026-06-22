@@ -11,11 +11,14 @@ import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
 import {
+  Select, SelectTrigger, SelectValue, SelectContent, SelectItem,
+} from '@/components/ui/select'
+import {
   useGroups, useCreateGroup, useUpdateGroup, useDeleteGroup,
 } from '@/hooks/use-groups'
 import { useConfirm } from '@/components/ui/confirm-dialog'
 import { extractErrorMessage } from '@/lib/utils'
-import type { GroupItem } from '@/types/api'
+import type { CacheMode, GroupItem } from '@/types/api'
 
 /**
  * 分组管理页：CRUD 已注册分组。
@@ -25,7 +28,18 @@ import type { GroupItem } from '@/types/api'
  * - 改名走级联（后端自动同步所有引用）
  * - 删除默认拒绝有引用的，二次确认才允许 force 级联清理
  * - 列表展示每个分组当前被多少个凭据 / Key 引用，删除前清楚知道影响
+ * - 缓存档（cacheMode）三档可选：off / low / high；不选 = 继承全局默认
  */
+
+/** 编辑表单内 cacheMode 控件状态（'__inherit__' 仅用于 UI，提交时映射为 'inherit'） */
+type CacheModeFormValue = CacheMode | '__inherit__'
+
+const CACHE_MODE_LABEL: Record<CacheMode, string> = {
+  off: '无缓存',
+  low: '低命中',
+  high: '高命中',
+}
+
 export function GroupsPage() {
   const { data, isLoading, isFetching, refetch } = useGroups()
   const createGroup = useCreateGroup()
@@ -36,17 +50,20 @@ export function GroupsPage() {
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
+  const [createCache, setCreateCache] = useState<CacheModeFormValue>('__inherit__')
 
   const [editOpen, setEditOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<GroupItem | null>(null)
   const [editNewName, setEditNewName] = useState('')
   const [editDesc, setEditDesc] = useState('')
+  const [editCache, setEditCache] = useState<CacheModeFormValue>('__inherit__')
 
   const groups = data?.groups ?? []
 
   const openCreate = () => {
     setCreateName('')
     setCreateDesc('')
+    setCreateCache('__inherit__')
     setCreateOpen(true)
   }
 
@@ -60,6 +77,7 @@ export function GroupsPage() {
       await createGroup.mutateAsync({
         name,
         description: createDesc.trim() || undefined,
+        cacheMode: createCache === '__inherit__' ? undefined : createCache,
       })
       toast.success(`已创建分组：${name}`)
       setCreateOpen(false)
@@ -72,6 +90,7 @@ export function GroupsPage() {
     setEditTarget(g)
     setEditNewName(g.name)
     setEditDesc(g.description ?? '')
+    setEditCache(g.cacheMode ?? '__inherit__')
     setEditOpen(true)
   }
 
@@ -82,16 +101,25 @@ export function GroupsPage() {
       toast.error('分组名不能为空')
       return
     }
+    // 只有当 UI 值与原值不同才下发 cacheMode 字段，避免误清空
+    const originalCache: CacheModeFormValue = editTarget.cacheMode ?? '__inherit__'
+    const cacheChanged = editCache !== originalCache
+    const cacheModePatch = !cacheChanged
+      ? undefined
+      : editCache === '__inherit__'
+        ? 'inherit'
+        : editCache
     try {
       await updateGroup.mutateAsync({
         name: editTarget.name,
         req: {
           newName: newName !== editTarget.name ? newName : undefined,
           description: editDesc, // 空字符串 → 后端清空
+          cacheMode: cacheModePatch,
         },
       })
       const renamed = newName !== editTarget.name
-      toast.success(renamed ? `已改名：${editTarget.name} → ${newName}` : '备注已更新')
+      toast.success(renamed ? `已改名：${editTarget.name} → ${newName}` : '已更新')
       setEditOpen(false)
     } catch (e) {
       toast.error(extractErrorMessage(e))
@@ -202,6 +230,15 @@ export function GroupsPage() {
                     <KeyRound className="h-3 w-3" />
                     {g.clientKeyCount} Key
                   </Badge>
+                  {g.cacheMode ? (
+                    <Badge variant="outline" title="本组覆盖的缓存档">
+                      缓存：{CACHE_MODE_LABEL[g.cacheMode]}
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="text-muted-foreground" title="未覆盖；使用全局默认 cacheModeDefault">
+                      缓存：默认
+                    </Badge>
+                  )}
                 </div>
 
                 <p className="text-[11px] text-muted-foreground">
@@ -242,6 +279,27 @@ export function GroupsPage() {
                 disabled={createGroup.isPending}
               />
             </div>
+            <div className="space-y-1">
+              <label className="text-sm font-medium">缓存档</label>
+              <Select
+                value={createCache}
+                onValueChange={(v) => setCreateCache(v as CacheModeFormValue)}
+                disabled={createGroup.isPending}
+              >
+                <SelectTrigger className="h-10">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__inherit__">跟随全局默认</SelectItem>
+                  <SelectItem value="off">无缓存（off）</SelectItem>
+                  <SelectItem value="low">低命中（low）</SelectItem>
+                  <SelectItem value="high">高命中（high）</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                同会话粘同账号的强度。高命中突破并发上限 ×2 强粘（适合高活跃组）；低命中满则让步换号；无缓存不粘。
+              </p>
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCreateOpen(false)} disabled={createGroup.isPending}>
@@ -280,6 +338,24 @@ export function GroupsPage() {
                 onChange={(e) => setEditDesc(e.target.value)}
                 disabled={updateGroup.isPending}
               />
+            </div>
+            <div className="space-y-1">
+              <label className="text-sm font-medium">缓存档</label>
+              <Select
+                value={editCache}
+                onValueChange={(v) => setEditCache(v as CacheModeFormValue)}
+                disabled={updateGroup.isPending}
+              >
+                <SelectTrigger className="h-10">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="__inherit__">跟随全局默认</SelectItem>
+                  <SelectItem value="off">无缓存（off）</SelectItem>
+                  <SelectItem value="low">低命中（low）</SelectItem>
+                  <SelectItem value="high">高命中（high）</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
             {editTarget && (editTarget.credentialCount > 0 || editTarget.clientKeyCount > 0) && (
               <p className="text-xs text-amber-600">

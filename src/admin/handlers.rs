@@ -1548,12 +1548,38 @@ fn group_to_item(
     super::types::GroupItem {
         name: g.name.clone(),
         description: g.description.clone(),
+        cache_mode: g.cache_mode,
         created_at: g.created_at.clone(),
         credential_count: state
             .service
             .token_manager()
             .count_credentials_with_group(&g.name),
         client_key_count: state.client_keys.count_with_group(&g.name),
+    }
+}
+
+/// 把 PATCH 请求里的 cacheMode 字符串解析为 `Option<Option<CacheMode>>`：
+/// - `Ok(None)` = 字段未传或显式 `null` → 不改
+/// - `Ok(Some(None))` = `"inherit"` / `""` → 清除覆盖
+/// - `Ok(Some(Some(mode)))` = 设置为 mode
+/// - `Err(msg)` = 非法字符串
+fn parse_cache_mode_patch(
+    raw: Option<&str>,
+) -> Result<Option<Option<crate::model::config::CacheMode>>, String> {
+    use crate::model::config::CacheMode;
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let trimmed = s.trim().to_ascii_lowercase();
+    match trimmed.as_str() {
+        "" | "inherit" => Ok(Some(None)),
+        "off" => Ok(Some(Some(CacheMode::Off))),
+        "low" => Ok(Some(Some(CacheMode::Low))),
+        "high" => Ok(Some(Some(CacheMode::High))),
+        other => Err(format!(
+            "非法 cacheMode 值: {} （期望 off / low / high / inherit）",
+            other
+        )),
     }
 }
 
@@ -1573,11 +1599,30 @@ pub async fn create_group(
     State(state): State<AdminState>,
     Json(payload): Json<super::types::CreateGroupRequest>,
 ) -> impl IntoResponse {
+    let cache_mode = payload.cache_mode;
     match state
         .groups
         .create(payload.name, payload.description)
     {
-        Ok(g) => Json(group_to_item(&g, &state)).into_response(),
+        Ok(mut g) => {
+            // 若 payload 带 cache_mode，创建后立即写入覆盖
+            if let Some(mode) = cache_mode {
+                match state.groups.update_cache_mode(&g.name, Some(mode)) {
+                    Ok(updated) => g = updated,
+                    Err(e) => {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            Json(super::types::AdminErrorResponse::internal_error(format!(
+                                "创建分组成功但写入 cacheMode 失败: {}",
+                                e
+                            ))),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            Json(group_to_item(&g, &state)).into_response()
+        }
         Err(e) => {
             let msg = e.to_string();
             // "已存在" → 409；其他校验失败 → 400
@@ -1670,6 +1715,27 @@ pub async fn update_group(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(super::types::AdminErrorResponse::invalid_request(e.to_string())),
+            )
+                .into_response();
+        }
+    }
+
+    // 3. 改 cacheMode（off / low / high / inherit / 空字符串）
+    match parse_cache_mode_patch(payload.cache_mode.as_deref()) {
+        Ok(None) => {} // 字段未传 → 不改
+        Ok(Some(new_mode)) => {
+            if let Err(e) = state.groups.update_cache_mode(&current_name, new_mode) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(super::types::AdminErrorResponse::invalid_request(e.to_string())),
+                )
+                    .into_response();
+            }
+        }
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(msg)),
             )
                 .into_response();
         }

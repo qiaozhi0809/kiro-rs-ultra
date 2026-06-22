@@ -1087,6 +1087,9 @@ pub struct GroupItem {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// 缓存命中档位覆盖；`None` 表示继承全局 `cacheModeDefault`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_mode: Option<crate::model::config::CacheMode>,
     pub created_at: String,
     /// 引用计数：有多少个凭据带这个分组（前端展示 / 删除前提醒）
     pub credential_count: usize,
@@ -1109,9 +1112,12 @@ pub struct CreateGroupRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// 缓存命中档位覆盖；缺省 = 继承全局默认
+    #[serde(default)]
+    pub cache_mode: Option<crate::model::config::CacheMode>,
 }
 
-/// 更新分组请求（改名 / 改备注；两者都可选）
+/// 更新分组请求（改名 / 改备注 / 改 cacheMode；全部可选）
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateGroupRequest {
@@ -1121,6 +1127,13 @@ pub struct UpdateGroupRequest {
     /// 新备注；传空字符串清除备注；不传字段则保留
     #[serde(default)]
     pub description: Option<String>,
+    /// 新缓存档位字符串：
+    /// - 不传 / `null` = 不改
+    /// - `"inherit"` / `""` = 清除覆盖（回到继承全局）
+    /// - `"off"` / `"low"` / `"high"` = 设置
+    /// 其他值由 handler 返回 400。
+    #[serde(default)]
+    pub cache_mode: Option<String>,
 }
 
 /// 删除分组的可选查询参数

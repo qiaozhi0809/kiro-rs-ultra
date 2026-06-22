@@ -15,6 +15,7 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
@@ -31,7 +32,8 @@ use crate::kiro::model::token_refresh::{
 };
 use crate::kiro::model::usage_limits::UsageLimitsResponse;
 use crate::kiro::parser::decoder::EventStreamDecoder;
-use crate::model::config::Config;
+use crate::model::config::{CacheMode, Config};
+use crate::admin::groups::SharedGroupManager;
 
 /// 测活产出 — 写入 traces.db 时复用真实对话路径的 token / credit 字段
 #[derive(Debug, Clone, Default)]
@@ -1073,6 +1075,9 @@ pub struct MultiTokenManager {
     /// Session-Sticky 映射：conversationId → 上次使用的凭据 ID。
     /// 同一会话粘同一凭据 → 上游 prompt cache 前缀复用率从 ~60% 拉到 ~90%。
     sticky_map: Mutex<HashMap<String, StickyEntry>>,
+    /// 分组注册表（构造后通过 [`register_group_manager`] 注入）。
+    /// 用于按分组查 `cacheMode` 覆盖；未注入或不命中时回退到 [`Config::cache_mode_default`]。
+    group_manager: OnceLock<SharedGroupManager>,
 }
 
 /// Session-Sticky 条目
@@ -1321,6 +1326,7 @@ impl MultiTokenManager {
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             sticky_map: Mutex::new(HashMap::new()),
+            group_manager: OnceLock::new(),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1357,6 +1363,33 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 注入分组注册表（运行时只能调一次；重复调用静默忽略）。
+    ///
+    /// 用 `OnceLock` 是因为 `MultiTokenManager` 在 `main.rs` 中比 `GroupManager` 先构造，
+    /// 无法走构造参数注入。等到两者都就绪后，main 调一次此方法把分组管理器交给我们。
+    pub fn register_group_manager(&self, mgr: SharedGroupManager) {
+        if self.group_manager.set(mgr).is_err() {
+            tracing::warn!("register_group_manager 被重复调用，已忽略");
+        }
+    }
+
+    /// 解析某分组实际生效的缓存命中档：
+    /// 1. 若分组存在且有 `cacheMode` 覆盖 → 用覆盖值
+    /// 2. 否则回退到 `Config::cache_mode_default`
+    ///
+    /// `group = None`（请求未指定分组）也走全局默认。
+    /// 若 `group_manager` 尚未注入（异常路径），同样走全局默认（不影响功能，只是分组覆盖不生效）。
+    fn resolve_cache_mode(&self, group: Option<&str>) -> CacheMode {
+        group
+            .and_then(|g| {
+                self.group_manager
+                    .get()
+                    .and_then(|gm| gm.get(g))
+                    .and_then(|grp| grp.cache_mode)
+            })
+            .unwrap_or(self.config.cache_mode_default)
     }
 
     /// 获取全局代理配置的克隆（可安全跨锁使用）
@@ -1551,6 +1584,14 @@ impl MultiTokenManager {
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
 
+        // 缓存命中档：决定是否传 sticky_id + sticky 命中时是否放宽并发上限
+        let cache_mode = self.resolve_cache_mode(group);
+        let effective_sticky_id = if cache_mode == CacheMode::Off {
+            None
+        } else {
+            sticky_id
+        };
+
         loop {
             if attempt_count >= max_attempts {
                 anyhow::bail!(
@@ -1564,18 +1605,25 @@ impl MultiTokenManager {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
                 // Session-Sticky：如果传了 sticky_id，先检查该凭据是否可用
-                let sticky_hit = sticky_id.and_then(|sid| {
+                let sticky_hit = effective_sticky_id.and_then(|sid| {
                     let entries = self.entries.lock();
                     let now = Instant::now();
                     entries
                         .iter()
                         .find(|e| {
+                            // High 档：sticky 命中放宽到常规上限 ×2 强粘同号（软顶防爆）
+                            // Low/Off：使用常规并发上限
+                            let cap = match cache_mode {
+                                CacheMode::High => {
+                                    self.effective_concurrency_limit(e).saturating_mul(2)
+                                }
+                                _ => self.effective_concurrency_limit(e),
+                            };
                             e.id == sid
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
                                 && credential_matches_request(&e.credentials, model, group)
-                                && e.in_flight.load(Ordering::SeqCst)
-                                    < self.effective_concurrency_limit(e)
+                                && e.in_flight.load(Ordering::SeqCst) < cap
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 });
@@ -3837,8 +3885,14 @@ impl MultiTokenManager {
             .map(|e| e.credential_id)
     }
 
-    /// 记录 conversationId → credential_id 的粘性映射
-    pub fn sticky_record(&self, conversation_id: &str, credential_id: u64) {
+    /// 记录 conversationId → credential_id 的粘性映射。
+    ///
+    /// 若该 conversation 所属分组（或全局）档为 `Off`，直接 no-op（不写也不读 sticky）。
+    /// 这样下次同 conversation 来时 `sticky_lookup` 拿不到结果，自然走纯负载均衡。
+    pub fn sticky_record(&self, conversation_id: &str, credential_id: u64, group: Option<&str>) {
+        if self.resolve_cache_mode(group) == CacheMode::Off {
+            return;
+        }
         const MAX_ENTRIES: usize = 10_000;
         const EVICT_TTL: StdDuration = StdDuration::from_secs(300);
         let mut map = self.sticky_map.lock();

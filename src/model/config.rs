@@ -17,6 +17,27 @@ impl Default for TlsBackend {
     }
 }
 
+/// 缓存命中（session-sticky 调度）强度档位。
+///
+/// "缓存"本质是 session-sticky：同一 conversation 粘到同一账号 → 上游 prompt cache 复用率高。
+/// 三档区分粘的"积极程度"：
+/// - `Off` 无缓存：完全不传 sticky_id，纯负载均衡（cache 命中低，但调度最均匀）。
+/// - `Low` 低命中：传 sticky_id，命中且账号未满并发才用；满了让步换号（= 升级前现状）。
+/// - `High` 高命中：sticky 命中可突破到常规上限 ×2 强粘同号（cache 命中最高；软顶防爆）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CacheMode {
+    Off,
+    Low,
+    High,
+}
+
+impl Default for CacheMode {
+    fn default() -> Self {
+        Self::Low
+    }
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -172,6 +193,12 @@ pub struct Config {
     #[serde(default = "default_concurrency_limit")]
     pub default_concurrency_limit: u32,
 
+    /// 全局默认缓存命中档（无分组覆盖时生效）。默认 `Low`（= 升级前现状行为）。
+    ///
+    /// 详细语义见 [`CacheMode`]。每个 `Group` 可通过 `cacheMode` 字段单独覆盖。
+    #[serde(default = "default_cache_mode")]
+    pub cache_mode_default: CacheMode,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -260,6 +287,10 @@ fn default_concurrency_limit() -> u32 {
     10
 }
 
+fn default_cache_mode() -> CacheMode {
+    CacheMode::Low
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -296,6 +327,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             default_concurrency_limit: default_concurrency_limit(),
+            cache_mode_default: default_cache_mode(),
             endpoints: HashMap::new(),
             config_path: None,
         }

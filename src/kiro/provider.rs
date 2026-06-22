@@ -595,9 +595,10 @@ impl KiroProvider {
                     outcome::SUCCESS, None, attempt_start,
                 );
                 self.token_manager.report_success(ctx.id);
-                // Session-Sticky：记录本次成功使用的凭据，下次同 conversationId 优先复用
+                // Session-Sticky：记录本次成功使用的凭据，下次同 conversationId 优先复用。
+                // token_manager 内部按 group 解析 cache_mode，Off 档自动 no-op。
                 if let Some(cid) = conversation_id.as_deref() {
-                    self.token_manager.sticky_record(cid, ctx.id);
+                    self.token_manager.sticky_record(cid, ctx.id, group);
                 }
                 return Ok(KiroCallResult {
                     response,
@@ -653,7 +654,7 @@ impl KiroProvider {
                             );
                             self.token_manager.report_success(ctx.id);
                             if let Some(cid) = conversation_id.as_deref() {
-                                self.token_manager.sticky_record(cid, ctx.id);
+                                self.token_manager.sticky_record(cid, ctx.id, group);
                             }
                             return Ok(KiroCallResult {
                                 response: fb_resp,

@@ -585,9 +585,19 @@ export type FailureStatsMap = Record<string, FailureStats>
 
 // ============ 账号分组（独立实体）============
 
+/**
+ * 缓存命中（session-sticky 调度）档位：
+ * - `off` 无缓存：完全不传 sticky_id，纯负载均衡
+ * - `low` 低命中：sticky 命中且未满并发才用，满则让步换号（= 升级前默认）
+ * - `high` 高命中：sticky 命中可突破到常规上限 ×2 强粘同号
+ */
+export type CacheMode = 'off' | 'low' | 'high'
+
 export interface GroupItem {
   name: string
   description?: string
+  /** 缓存命中档位覆盖；缺省表示继承全局 cacheModeDefault */
+  cacheMode?: CacheMode
   createdAt: string
   /** 引用计数：有多少个凭据带这个分组 */
   credentialCount: number
@@ -603,6 +613,7 @@ export interface GroupsResponse {
 export interface CreateGroupRequest {
   name: string
   description?: string
+  cacheMode?: CacheMode
 }
 
 export interface UpdateGroupRequest {
@@ -610,4 +621,11 @@ export interface UpdateGroupRequest {
   newName?: string
   /** 新备注；空字符串清除；undefined 保留原值 */
   description?: string
+  /**
+   * 新缓存档位：
+   * - undefined / null = 不改
+   * - 'inherit' / '' = 清除覆盖（回到继承全局默认）
+   * - 'off' / 'low' / 'high' = 设置
+   */
+  cacheMode?: CacheMode | 'inherit' | ''
 }

@@ -15,6 +15,8 @@ use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+use crate::model::config::CacheMode;
+
 /// 单个分组（持久化实体）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -24,6 +26,9 @@ pub struct Group {
     /// 备注（可选）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// 缓存命中（session-sticky）档位覆盖；`None` 表示继承全局 `cacheModeDefault`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_mode: Option<CacheMode>,
     /// 创建时间（ISO8601）
     pub created_at: String,
 }
@@ -136,6 +141,7 @@ impl GroupManager {
         let group = Group {
             name: trimmed.to_string(),
             description: description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()),
+            cache_mode: None,
             created_at: Utc::now().to_rfc3339(),
         };
         inner.entries.insert(group.name.clone(), group.clone());
@@ -155,6 +161,23 @@ impl GroupManager {
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("分组不存在: {}", name))?;
         entry.description = description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty());
+        let cloned = entry.clone();
+        self.save_locked(&inner);
+        Ok(cloned)
+    }
+
+    /// 更新缓存命中档位覆盖。`mode = None` 表示清除覆盖（回到继承全局默认）。
+    pub fn update_cache_mode(
+        &self,
+        name: &str,
+        mode: Option<CacheMode>,
+    ) -> anyhow::Result<Group> {
+        let mut inner = self.inner.write();
+        let entry = inner
+            .entries
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("分组不存在: {}", name))?;
+        entry.cache_mode = mode;
         let cloned = entry.clone();
         self.save_locked(&inner);
         Ok(cloned)
@@ -216,6 +239,7 @@ impl GroupManager {
                     Group {
                         name: trimmed.to_string(),
                         description: None,
+                        cache_mode: None,
                         created_at: now.clone(),
                     },
                 );
@@ -313,6 +337,26 @@ mod tests {
         mgr.create("x".into(), None).unwrap();
         assert!(mgr.rename("x", "x").is_ok());
         assert!(mgr.rename("x", "  x  ").is_ok());
+    }
+
+    #[test]
+    fn update_cache_mode_set_and_clear() {
+        let mgr = GroupManager::new();
+        mgr.create("g".into(), None).unwrap();
+        // 默认 None（继承全局）
+        assert_eq!(mgr.get("g").unwrap().cache_mode, None);
+        // 设置为 High
+        mgr.update_cache_mode("g", Some(CacheMode::High)).unwrap();
+        assert_eq!(mgr.get("g").unwrap().cache_mode, Some(CacheMode::High));
+        // 清除（回到继承全局）
+        mgr.update_cache_mode("g", None).unwrap();
+        assert_eq!(mgr.get("g").unwrap().cache_mode, None);
+    }
+
+    #[test]
+    fn update_cache_mode_missing_group_errors() {
+        let mgr = GroupManager::new();
+        assert!(mgr.update_cache_mode("ghost", Some(CacheMode::Off)).is_err());
     }
 
     #[test]
