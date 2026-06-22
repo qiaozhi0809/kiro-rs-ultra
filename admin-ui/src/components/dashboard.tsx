@@ -258,7 +258,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { data: failureStatsMap } = useFailureStats();
   const groupOptions = useGroupOptions();
 
-  // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
+  // 分组筛选：'' = 全部；'__none__' = 未分组；'__available__' = 仅可用；'__disabled__' = 仅已停用；其他 = 按分组名筛选
   const [groupFilter, setGroupFilter] = useState<string>("");
   // 订阅分级筛选（多选）：空集合 = 全部分级；否则只显示集合内的分级
   const [tierFilter, setTierFilter] = useState<Set<Tier>>(new Set());
@@ -278,10 +278,15 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     const all = data?.credentials ?? [];
     let out = all;
     if (groupFilter) {
-      out =
-        groupFilter === "__none__"
-          ? out.filter((c) => !c.groups || c.groups.length === 0)
-          : out.filter((c) => c.groups?.includes(groupFilter));
+      if (groupFilter === "__none__") {
+        out = out.filter((c) => !c.groups || c.groups.length === 0);
+      } else if (groupFilter === "__available__") {
+        out = out.filter((c) => !c.disabled);
+      } else if (groupFilter === "__disabled__") {
+        out = out.filter((c) => c.disabled);
+      } else {
+        out = out.filter((c) => c.groups?.includes(groupFilter));
+      }
     }
     if (tierFilter.size > 0) {
       out = out.filter((c) =>
@@ -1378,7 +1383,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             )}
             {groupFilter && (
               <Badge variant="outline" className="gap-1">
-                筛选：{groupFilter === "__none__" ? "未分组" : groupFilter}
+                筛选：
+                {groupFilter === "__none__"
+                  ? "未分组"
+                  : groupFilter === "__available__"
+                    ? "仅可用"
+                    : groupFilter === "__disabled__"
+                      ? "仅已停用"
+                      : groupFilter}
                 <button
                   type="button"
                   className="ml-1 text-muted-foreground hover:text-foreground"
@@ -1490,12 +1502,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               >
                 <SelectTrigger
                   className="h-8 w-full rounded-full border-border bg-card/60 px-3 backdrop-blur sm:w-[140px]"
-                  title="按分组筛选凭据"
+                  title="按分组 / 状态筛选凭据"
                 >
                   <SelectValue placeholder="全部分组" />
                 </SelectTrigger>
                 <SelectContent align="end">
                   <SelectItem value="all">全部分组</SelectItem>
+                  <SelectItem value="__available__">仅可用</SelectItem>
+                  <SelectItem value="__disabled__">仅已停用</SelectItem>
                   <SelectItem value="__none__">未分组</SelectItem>
                   {groupOptions.map((g) => (
                     <SelectItem key={g} value={g}>
