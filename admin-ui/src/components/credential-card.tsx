@@ -83,6 +83,8 @@ interface CredentialCardProps {
   failureStats?: { auth: number; throttle: number; other: number };
   /** 展示形态：卡片（默认）或紧凑列表行 */
   view?: "card" | "list";
+  /** 卡片密度：compact 隐藏调度评分/压力/EWMA/计价/总调度/近期调度 6 项；detailed 全部展示 */
+  density?: "compact" | "detailed";
 }
 
 function formatLastUsed(lastUsedAt: string | null): string {
@@ -239,6 +241,7 @@ export function CredentialCard({
   onRefreshBalance,
   failureStats,
   view = "card",
+  density = "compact",
 }: CredentialCardProps) {
   const [editingPriority, setEditingPriority] = useState(false);
   const [priorityValue, setPriorityValue] = useState(
@@ -1094,75 +1097,79 @@ export function CredentialCard({
                 })()}
               </dd>
             </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <MetricLabel
-                label="耗时 EWMA"
-                tip="请求耗时的指数滑动平均（α=0.2），只统计成功请求。反映该账号近期的响应速度，越低越快。"
-              />
-              <dd className="min-w-0 text-right font-medium tabular-nums">
-                {credential.ewmaLatencyMs != null
-                  ? `${Math.round(credential.ewmaLatencyMs)}ms`
-                  : "—"}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <MetricLabel
-                label="计价请求"
-                tip="本进程启动以来产生计费（credits>0）的请求数。进程重启后归零。"
-              />
-              <dd className="min-w-0 text-right font-medium tabular-nums">
-                {credential.billedRequests ?? 0}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <MetricLabel
-                label="估算成本"
-                tip="本进程启动以来累计的 credits 成本（来自上游 meteringEvent 真实计费量）。进程重启后归零。"
-              />
-              <dd className="min-w-0 text-right font-medium tabular-nums">
-                ${formatNumber(credential.accruedCost ?? 0)}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <MetricLabel
-                label="总调度"
-                tip="本进程启动以来该账号被选中调度的总次数（含后续可能失败的尝试）。进程重启后归零。"
-              />
-              <dd className="min-w-0 text-right font-medium tabular-nums">
-                {credential.totalDispatch ?? 0}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <MetricLabel
-                label="调度评分"
-                tip="账号健康度评分，越高越优先：成功率×100 + 空闲并发奖励(剩余/上限×20) − 耗时惩罚(EWMA/100，封顶50)。"
-              />
-              <dd className="min-w-0 text-right font-medium tabular-nums">
-                {(credential.dispatchScore ?? 0).toFixed(2)}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <MetricLabel
-                label="近期调度"
-                tip="最近 10秒 / 60秒 / 5分钟 内该账号被调度的次数，反映近期负载分布。"
-              />
-              <dd className="min-w-0 text-right font-medium tabular-nums">
-                {credential.recentDispatch10s ?? 0}
-                <span className="text-muted-foreground"> / </span>
-                {credential.recentDispatch60s ?? 0}
-                <span className="text-muted-foreground"> / </span>
-                {credential.recentDispatch5m ?? 0}
-              </dd>
-            </div>
-            <div className="flex min-w-0 items-center justify-between gap-2">
-              <MetricLabel
-                label="调度压力"
-                tip="最近 60 秒调度数 / 并发上限。反映每个并发槽位的近期请求密度，越高越忙。"
-              />
-              <dd className="min-w-0 text-right font-medium tabular-nums">
-                {(credential.dispatchPressure ?? 0).toFixed(2)}
-              </dd>
-            </div>
+            {density === "detailed" && (
+              <>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <MetricLabel
+                    label="耗时 EWMA"
+                    tip="请求耗时的指数滑动平均（α=0.2），只统计成功请求。反映该账号近期的响应速度，越低越快。"
+                  />
+                  <dd className="min-w-0 text-right font-medium tabular-nums">
+                    {credential.ewmaLatencyMs != null
+                      ? `${Math.round(credential.ewmaLatencyMs)}ms`
+                      : "—"}
+                  </dd>
+                </div>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <MetricLabel
+                    label="计价请求"
+                    tip="本进程启动以来产生计费（credits>0）的请求数。进程重启后归零。"
+                  />
+                  <dd className="min-w-0 text-right font-medium tabular-nums">
+                    {credential.billedRequests ?? 0}
+                  </dd>
+                </div>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <MetricLabel
+                    label="估算成本"
+                    tip="本进程启动以来累计的 credits 成本（来自上游 meteringEvent 真实计费量）。进程重启后归零。"
+                  />
+                  <dd className="min-w-0 text-right font-medium tabular-nums">
+                    ${formatNumber(credential.accruedCost ?? 0)}
+                  </dd>
+                </div>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <MetricLabel
+                    label="总调度"
+                    tip="本进程启动以来该账号被选中调度的总次数（含后续可能失败的尝试）。进程重启后归零。"
+                  />
+                  <dd className="min-w-0 text-right font-medium tabular-nums">
+                    {credential.totalDispatch ?? 0}
+                  </dd>
+                </div>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <MetricLabel
+                    label="调度评分"
+                    tip="账号健康度评分，越高越优先：成功率×100 + 空闲并发奖励(剩余/上限×20) − 耗时惩罚(EWMA/100，封顶50)。"
+                  />
+                  <dd className="min-w-0 text-right font-medium tabular-nums">
+                    {(credential.dispatchScore ?? 0).toFixed(2)}
+                  </dd>
+                </div>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <MetricLabel
+                    label="近期调度"
+                    tip="最近 10秒 / 60秒 / 5分钟 内该账号被调度的次数，反映近期负载分布。"
+                  />
+                  <dd className="min-w-0 text-right font-medium tabular-nums">
+                    {credential.recentDispatch10s ?? 0}
+                    <span className="text-muted-foreground"> / </span>
+                    {credential.recentDispatch60s ?? 0}
+                    <span className="text-muted-foreground"> / </span>
+                    {credential.recentDispatch5m ?? 0}
+                  </dd>
+                </div>
+                <div className="flex min-w-0 items-center justify-between gap-2">
+                  <MetricLabel
+                    label="调度压力"
+                    tip="最近 60 秒调度数 / 并发上限。反映每个并发槽位的近期请求密度，越高越忙。"
+                  />
+                  <dd className="min-w-0 text-right font-medium tabular-nums">
+                    {(credential.dispatchPressure ?? 0).toFixed(2)}
+                  </dd>
+                </div>
+              </>
+            )}
             <div className="flex min-w-0 items-center justify-between gap-2 border-t border-border/50 pt-2 min-[420px]:col-span-2">
               <dt className="shrink-0 text-muted-foreground">最后调用</dt>
               <dd className="min-w-0 truncate text-right font-medium">

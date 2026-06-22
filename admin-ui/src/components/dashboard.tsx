@@ -52,7 +52,7 @@ function GithubIcon({ className }: { className?: string }) {
 }
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { storage, type CredentialView } from "@/lib/storage";
+import { storage, type CredentialView, type CredentialDensity } from "@/lib/storage";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -223,6 +223,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const changeViewMode = (v: CredentialView) => {
     setViewMode(v);
     storage.setCredentialView(v);
+  };
+  // 卡片密度：compact 隐藏调度评分/压力/EWMA 等高级指标；detailed 全部展示
+  const [density, setDensity] = useState<CredentialDensity>(() =>
+    storage.getCredentialDensity(),
+  );
+  const changeDensity = (d: CredentialDensity) => {
+    setDensity(d);
+    storage.setCredentialDensity(d);
   };
   const changePageSize = (n: number) => {
     setPageSize(n);
@@ -1576,6 +1584,40 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <span className="hidden sm:inline">列表</span>
                 </button>
               </div>
+
+              {/* 卡片密度切换：简约 / 详细（仅卡片视图生效；列表视图本来就紧凑） */}
+              {viewMode === "card" && (
+                <div className="col-span-2 inline-flex h-8 shrink-0 items-center justify-self-start rounded-full border border-border bg-card/60 p-0.5 backdrop-blur sm:col-span-1">
+                  <button
+                    type="button"
+                    onClick={() => changeDensity("compact")}
+                    aria-pressed={density === "compact"}
+                    title="简约模式：仅显示优先级/失败/刷新失败/成功/并发"
+                    className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[13px] transition-colors ${
+                      density === "compact"
+                        ? "bg-background text-foreground shadow-apple-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <span className="hidden sm:inline">简约</span>
+                    <span className="sm:hidden">简</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => changeDensity("detailed")}
+                    aria-pressed={density === "detailed"}
+                    title="详细模式：含调度评分 / 压力 / EWMA / 计价 / 总调度 / 近期调度"
+                    className={`inline-flex h-7 items-center gap-1 rounded-full px-2.5 text-[13px] transition-colors ${
+                      density === "detailed"
+                        ? "bg-background text-foreground shadow-apple-sm"
+                        : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <span className="hidden sm:inline">详细</span>
+                    <span className="sm:hidden">详</span>
+                  </button>
+                </div>
+              )}
             </div>
 
             {/* 操作 — 右（移动端整宽两列网格，桌面端右对齐内联） */}
@@ -1897,6 +1939,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                       key={credential.id}
                       credential={credential}
                       view={viewMode}
+                      density={density}
                       selected={selectedIds.has(credential.id)}
                       onToggleSelect={() => toggleSelect(credential.id)}
                       balance={
