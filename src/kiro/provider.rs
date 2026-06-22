@@ -282,7 +282,7 @@ impl KiroProvider {
 
         for attempt in 0..max_retries {
             // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离
-            let ctx = match self.token_manager.acquire_context(None, None).await {
+            let ctx = match self.token_manager.acquire_context(None, None, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -493,11 +493,16 @@ impl KiroProvider {
 
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
+        // Session-Sticky：提取 conversationId，查 sticky map 得到上次使用的凭据
+        let conversation_id = Self::extract_conversation_id(request_body);
+        let sticky_id = conversation_id
+            .as_deref()
+            .and_then(|cid| self.token_manager.sticky_lookup(cid));
 
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group, sticky_id).await {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(
@@ -589,6 +594,10 @@ impl KiroProvider {
                     outcome::SUCCESS, None, attempt_start,
                 );
                 self.token_manager.report_success(ctx.id);
+                // Session-Sticky：记录本次成功使用的凭据，下次同 conversationId 优先复用
+                if let Some(cid) = conversation_id.as_deref() {
+                    self.token_manager.sticky_record(cid, ctx.id);
+                }
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
@@ -642,6 +651,9 @@ impl KiroProvider {
                                 outcome::SUCCESS, None, attempt_start,
                             );
                             self.token_manager.report_success(ctx.id);
+                            if let Some(cid) = conversation_id.as_deref() {
+                                self.token_manager.sticky_record(cid, ctx.id);
+                            }
                             return Ok(KiroCallResult {
                                 response: fb_resp,
                                 credential_id: ctx.id,
@@ -958,6 +970,15 @@ impl KiroProvider {
             .get("currentMessage")?
             .get("userInputMessage")?
             .get("modelId")?
+            .as_str()
+            .map(|s| s.to_string())
+    }
+
+    /// 从请求体中提取 conversationId（用于 session-sticky 调度）
+    fn extract_conversation_id(request_body: &str) -> Option<String> {
+        let json: serde_json::Value = serde_json::from_str(request_body).ok()?;
+        json.get("conversationState")?
+            .get("conversationId")?
             .as_str()
             .map(|s| s.to_string())
     }

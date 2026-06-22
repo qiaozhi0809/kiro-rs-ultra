@@ -1070,6 +1070,15 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// Session-Sticky 映射：conversationId → 上次使用的凭据 ID。
+    /// 同一会话粘同一凭据 → 上游 prompt cache 前缀复用率从 ~60% 拉到 ~90%。
+    sticky_map: Mutex<HashMap<String, StickyEntry>>,
+}
+
+/// Session-Sticky 条目
+struct StickyEntry {
+    credential_id: u64,
+    last_used: Instant,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1311,6 +1320,7 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            sticky_map: Mutex::new(HashMap::new()),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1534,7 +1544,9 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+    /// - `group`: 可选的分组名称
+    /// - `sticky_id`: Session-Sticky 提示——如果有值且该凭据当前可用，优先命中它
+    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>, sticky_id: Option<u64>) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1551,6 +1563,26 @@ impl MultiTokenManager {
             let (id, credentials) = {
                 let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
 
+                // Session-Sticky：如果传了 sticky_id，先检查该凭据是否可用
+                let sticky_hit = sticky_id.and_then(|sid| {
+                    let entries = self.entries.lock();
+                    let now = Instant::now();
+                    entries
+                        .iter()
+                        .find(|e| {
+                            e.id == sid
+                                && !e.disabled
+                                && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                                && credential_matches_request(&e.credentials, model, group)
+                                && e.in_flight.load(Ordering::SeqCst)
+                                    < self.effective_concurrency_limit(e)
+                        })
+                        .map(|e| (e.id, e.credentials.clone()))
+                });
+
+                if let Some(hit) = sticky_hit {
+                    hit
+                } else {
                 // balanced 模式：每次请求都重新均衡选择，不固定 current_id
                 // priority 模式：优先使用 current_id 指向的凭据
                 let current_hit = if is_balanced {
@@ -1613,6 +1645,7 @@ impl MultiTokenManager {
                         anyhow::bail!("所有凭据均已禁用（{}/{}）", available, total);
                     }
                 }
+                } // sticky_hit else end
             };
 
             // 尝试获取/刷新 Token
@@ -3793,6 +3826,59 @@ impl MultiTokenManager {
 
         Ok(())
     }
+
+    // ============ Session-Sticky 调度 ============
+
+    /// 查询 conversationId 上次粘到的凭据 ID
+    pub fn sticky_lookup(&self, conversation_id: &str) -> Option<u64> {
+        self.sticky_map
+            .lock()
+            .get(conversation_id)
+            .map(|e| e.credential_id)
+    }
+
+    /// 记录 conversationId → credential_id 的粘性映射
+    pub fn sticky_record(&self, conversation_id: &str, credential_id: u64) {
+        const MAX_ENTRIES: usize = 10_000;
+        const EVICT_TTL: StdDuration = StdDuration::from_secs(300);
+        let mut map = self.sticky_map.lock();
+        map.insert(
+            conversation_id.to_string(),
+            StickyEntry {
+                credential_id,
+                last_used: Instant::now(),
+            },
+        );
+        // lazy evict：超容量或每 256 次写入清一次过期
+        if map.len() > MAX_ENTRIES || map.len() % 256 == 0 {
+            let now = Instant::now();
+            map.retain(|_, e| now.duration_since(e.last_used) < EVICT_TTL);
+            if map.len() > MAX_ENTRIES {
+                Self::sticky_evict_oldest(&mut map, MAX_ENTRIES);
+            }
+        }
+    }
+
+    /// 清理超过 TTL 的 sticky 条目
+    pub fn sticky_evict_expired(&self, ttl: StdDuration) {
+        let mut map = self.sticky_map.lock();
+        let now = Instant::now();
+        map.retain(|_, e| now.duration_since(e.last_used) < ttl);
+    }
+
+    fn sticky_evict_oldest(map: &mut HashMap<String, StickyEntry>, target: usize) {
+        while map.len() > target {
+            let oldest_key = map
+                .iter()
+                .min_by_key(|(_, e)| e.last_used)
+                .map(|(k, _)| k.clone());
+            if let Some(key) = oldest_key {
+                map.remove(&key);
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 impl Drop for MultiTokenManager {
@@ -4200,7 +4286,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let ctx = manager.acquire_context(None, None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -4223,7 +4309,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let ctx = manager.acquire_context(None, None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -4269,7 +4355,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, None)
+            .acquire_context(None, None, None)
             .await
             .err()
             .unwrap()
@@ -4314,7 +4400,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, None)
+            .acquire_context(None, None, None)
             .await
             .err()
             .unwrap()
@@ -4899,11 +4985,11 @@ mod tests {
                 .unwrap();
 
         // Warm current_id with the highest-priority Free account.
-        let current = manager.acquire_context(None, None).await.unwrap();
+        let current = manager.acquire_context(None, None, None).await.unwrap();
         assert_eq!(current.id, 1);
 
         let opus = manager
-            .acquire_context(Some("claude-opus-4.6"), None)
+            .acquire_context(Some("claude-opus-4.6"), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -4920,7 +5006,7 @@ mod tests {
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
 
         {
-            let ctx = manager.acquire_context(None, None).await.unwrap();
+            let ctx = manager.acquire_context(None, None, None).await.unwrap();
             let snap = manager.snapshot();
             assert_eq!(snap.entries[0].in_flight, 1, "占用后 in_flight 应为 1");
             drop(ctx);
@@ -4937,17 +5023,17 @@ mod tests {
         let manager =
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
 
-        let c1 = manager.acquire_context(None, None).await.unwrap();
-        let c2 = manager.acquire_context(None, None).await.unwrap();
+        let c1 = manager.acquire_context(None, None, None).await.unwrap();
+        let c2 = manager.acquire_context(None, None, None).await.unwrap();
         assert_eq!(manager.snapshot().entries[0].in_flight, 2);
 
         // 第三个请求：唯一账号已满 → 应失败
-        let c3 = manager.acquire_context(None, None).await;
+        let c3 = manager.acquire_context(None, None, None).await;
         assert!(c3.is_err(), "账号并发已满且无其他账号，应获取失败");
 
         // 释放一个后可再获取
         drop(c1);
-        let c4 = manager.acquire_context(None, None).await;
+        let c4 = manager.acquire_context(None, None, None).await;
         assert!(c4.is_ok(), "释放槽位后应能再次获取");
         drop(c2);
         drop(c4);
@@ -4966,11 +5052,11 @@ mod tests {
             MultiTokenManager::new(Config::default(), vec![a, b], None, None, false).unwrap();
 
         // 第一个请求命中优先级最高的 a
-        let c1 = manager.acquire_context(None, None).await.unwrap();
+        let c1 = manager.acquire_context(None, None, None).await.unwrap();
         assert_eq!(c1.id, 1);
 
         // a 已满（limit=1）→ 第二个请求应跳到 b
-        let c2 = manager.acquire_context(None, None).await.unwrap();
+        let c2 = manager.acquire_context(None, None, None).await.unwrap();
         assert_eq!(c2.id, 2, "a 并发已满，应跳到 b");
         drop(c1);
         drop(c2);
@@ -4983,7 +5069,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
 
-        let _c1 = manager.acquire_context(None, None).await.unwrap();
+        let _c1 = manager.acquire_context(None, None, None).await.unwrap();
         assert_eq!(manager.snapshot().entries[0].in_flight, 1);
 
         assert!(manager.clear_concurrency(1), "应命中账号");
@@ -5146,16 +5232,16 @@ mod tests {
         .unwrap();
 
         // 正常情况下 g1 能拿到 context
-        assert!(manager.acquire_context(None, Some("g1")).await.is_ok());
+        assert!(manager.acquire_context(None, Some("g1"), None).await.is_ok());
 
         // 手动禁用 g1 内唯一账号 A(id1)
         manager.set_disabled(1, true).unwrap();
 
         // 严格隔离：g1 无可用账号 → Err，且不会选到 B/C
-        let res = manager.acquire_context(None, Some("g1")).await;
+        let res = manager.acquire_context(None, Some("g1"), None).await;
         assert!(res.is_err(), "g1 内全部账号禁用后应失败，不回退到其他分组");
 
         // 但 g2 仍可用
-        assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+        assert!(manager.acquire_context(None, Some("g2"), None).await.is_ok());
     }
 }
