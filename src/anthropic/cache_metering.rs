@@ -435,8 +435,12 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
     let ttl = detect_max_ttl(req);
 
     // 1. tools（全部喂入，作为前缀基础的一部分；工具定义跨轮稳定）。
+    // 按 name 排序保证不同插入顺序不影响 hash（客户端可能因插件加载顺序不同
+    // 每轮给出不同的 tools 数组顺序——不排序会导致整条前缀链全部 miss）。
     if let Some(tools) = req.tools.as_ref() {
-        for t in tools {
+        let mut sorted_tools: Vec<&Tool> = tools.iter().collect();
+        sorted_tools.sort_by_key(|t| &t.name);
+        for t in sorted_tools {
             feed(&mut hasher, &tool_signature(t), &tool_token_text(t), &mut cum_tokens);
         }
     }
@@ -604,11 +608,44 @@ fn block_signature_value(v: &serde_json::Value) -> String {
     format!("block:{}|{}|{}", s("type"), s("text"), s("thinking"))
 }
 
-/// content block 的 token 估算原文：仅 text + thinking 的纯文本，不含签名结构标记。
+/// content block 的 token 估算原文：text + thinking + tool_use input + tool_result content。
+///
+/// tool_use 的 `input`（JSON 对象，可能几十~几千 token）和 tool_result 的 `content`
+/// 在之前被忽略，导致比例分摊时分子分母都偏小且非等比例——含大量工具调用的对话
+/// 报告的 cache_read 失真（表现为"本该 0 的 cache_write 有残留值"）。
 fn block_token_text(v: &serde_json::Value) -> String {
     let s = |key: &str| v.get(key).and_then(|x| x.as_str()).unwrap_or("");
     let text = s("text");
     let thinking = s("thinking");
+
+    let block_type = s("type");
+
+    // tool_use: input 是 JSON 对象，序列化为字符串估算 token
+    if block_type == "tool_use" {
+        if let Some(input) = v.get("input") {
+            let input_str = input.to_string();
+            if text.is_empty() && thinking.is_empty() {
+                return input_str;
+            }
+            return format!("{text} {thinking} {input_str}");
+        }
+    }
+
+    // tool_result: content 可能是字符串或数组
+    if block_type == "tool_result" {
+        if let Some(content) = v.get("content") {
+            let content_str = if let Some(s) = content.as_str() {
+                s.to_string()
+            } else {
+                content.to_string()
+            };
+            if text.is_empty() && thinking.is_empty() {
+                return content_str;
+            }
+            return format!("{text} {thinking} {content_str}");
+        }
+    }
+
     if thinking.is_empty() {
         text.to_string()
     } else if text.is_empty() {
