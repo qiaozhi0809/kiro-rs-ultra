@@ -611,6 +611,46 @@ pub async fn set_endpoint_policy(
     }
 }
 
+/// GET /api/admin/config/compact-threshold
+/// 获取全局上下文压缩阈值默认值
+pub async fn get_compact_threshold(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "threshold": state.service.token_manager().get_compact_threshold_default()
+    }))
+}
+
+/// PUT /api/admin/config/compact-threshold
+/// 设置全局上下文压缩阈值（重启后生效，分组覆盖立即生效）
+pub async fn set_compact_threshold(
+    State(state): State<AdminState>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let threshold = match payload.get("threshold").and_then(|v| v.as_f64()) {
+        Some(t) => t as f32,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(
+                    "缺少 threshold 字段（数字 0.5 ~ 1.0）",
+                )),
+            )
+                .into_response();
+        }
+    };
+    match state
+        .service
+        .token_manager()
+        .set_compact_threshold_default(threshold)
+    {
+        Ok(()) => Json(serde_json::json!({ "threshold": threshold })).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(super::types::AdminErrorResponse::invalid_request(e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
 /// GET /api/admin/config/log-governance
 /// 获取日志治理配置（trace 开关 / trace 保留 / usage 保留）
 pub async fn get_log_governance_config(State(state): State<AdminState>) -> impl IntoResponse {
@@ -1565,6 +1605,7 @@ fn group_to_item(
         name: g.name.clone(),
         description: g.description.clone(),
         cache_mode: g.cache_mode,
+        compact_threshold: g.compact_threshold,
         created_at: g.created_at.clone(),
         credential_count: state
             .service
@@ -1616,6 +1657,7 @@ pub async fn create_group(
     Json(payload): Json<super::types::CreateGroupRequest>,
 ) -> impl IntoResponse {
     let cache_mode = payload.cache_mode;
+    let compact_threshold = payload.compact_threshold;
     match state
         .groups
         .create(payload.name, payload.description)
@@ -1630,6 +1672,21 @@ pub async fn create_group(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(super::types::AdminErrorResponse::internal_error(format!(
                                 "创建分组成功但写入 cacheMode 失败: {}",
+                                e
+                            ))),
+                        )
+                            .into_response();
+                    }
+                }
+            }
+            if let Some(t) = compact_threshold {
+                match state.groups.update_compact_threshold(&g.name, Some(t)) {
+                    Ok(updated) => g = updated,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(super::types::AdminErrorResponse::invalid_request(format!(
+                                "创建分组成功但写入 compactThreshold 失败: {}",
                                 e
                             ))),
                         )
@@ -1752,6 +1809,28 @@ pub async fn update_group(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(super::types::AdminErrorResponse::invalid_request(msg)),
+            )
+                .into_response();
+        }
+    }
+
+    // 4. 改 compactThreshold
+    //    - compact_threshold_inherit = Some(true) → 清除覆盖
+    //    - compact_threshold = Some(t) 且 t > 0 → 设置（合法范围 0.5 ~ 1.0 由 GroupManager 校验）
+    //    - 否则不改
+    if payload.compact_threshold_inherit == Some(true) {
+        if let Err(e) = state.groups.update_compact_threshold(&current_name, None) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(e.to_string())),
+            )
+                .into_response();
+        }
+    } else if let Some(t) = payload.compact_threshold {
+        if let Err(e) = state.groups.update_compact_threshold(&current_name, Some(t)) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(super::types::AdminErrorResponse::invalid_request(e.to_string())),
             )
                 .into_response();
         }

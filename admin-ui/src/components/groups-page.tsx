@@ -51,12 +51,15 @@ export function GroupsPage() {
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
   const [createCache, setCreateCache] = useState<CacheModeFormValue>('__inherit__')
+  /** 创建表单的 compact 阈值：'__inherit__' = 继承全局；否则是 0.5-1.0 的字符串（百分比形式输入） */
+  const [createCompact, setCreateCompact] = useState<string>('__inherit__')
 
   const [editOpen, setEditOpen] = useState(false)
   const [editTarget, setEditTarget] = useState<GroupItem | null>(null)
   const [editNewName, setEditNewName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editCache, setEditCache] = useState<CacheModeFormValue>('__inherit__')
+  const [editCompact, setEditCompact] = useState<string>('__inherit__')
 
   const groups = data?.groups ?? []
 
@@ -64,7 +67,17 @@ export function GroupsPage() {
     setCreateName('')
     setCreateDesc('')
     setCreateCache('__inherit__')
+    setCreateCompact('__inherit__')
     setCreateOpen(true)
+  }
+
+  const parseCompactInput = (raw: string): { value?: number; error?: string } => {
+    if (raw === '__inherit__' || raw.trim() === '') return {}
+    const n = Number(raw)
+    if (!Number.isFinite(n)) return { error: '请输入有效数字（百分比，50-100）' }
+    const ratio = n > 1 ? n / 100 : n
+    if (ratio < 0.5 || ratio > 1.0) return { error: '阈值必须在 50% ~ 100% 之间' }
+    return { value: ratio }
   }
 
   const handleCreate = async () => {
@@ -73,11 +86,17 @@ export function GroupsPage() {
       toast.error('分组名不能为空')
       return
     }
+    const compact = parseCompactInput(createCompact)
+    if (compact.error) {
+      toast.error(compact.error)
+      return
+    }
     try {
       await createGroup.mutateAsync({
         name,
         description: createDesc.trim() || undefined,
         cacheMode: createCache === '__inherit__' ? undefined : createCache,
+        compactThreshold: compact.value,
       })
       toast.success(`已创建分组：${name}`)
       setCreateOpen(false)
@@ -91,6 +110,9 @@ export function GroupsPage() {
     setEditNewName(g.name)
     setEditDesc(g.description ?? '')
     setEditCache(g.cacheMode ?? '__inherit__')
+    setEditCompact(
+      g.compactThreshold == null ? '__inherit__' : String(Math.round(g.compactThreshold * 100)),
+    )
     setEditOpen(true)
   }
 
@@ -109,6 +131,25 @@ export function GroupsPage() {
       : editCache === '__inherit__'
         ? 'inherit'
         : editCache
+    // compactThreshold 同理：只在变化时下发
+    const originalCompact =
+      editTarget.compactThreshold == null
+        ? '__inherit__'
+        : String(Math.round(editTarget.compactThreshold * 100))
+    const compactChanged = editCompact !== originalCompact
+    let compactPatch: { compactThreshold?: number; compactThresholdInherit?: boolean } = {}
+    if (compactChanged) {
+      if (editCompact === '__inherit__') {
+        compactPatch = { compactThresholdInherit: true }
+      } else {
+        const parsed = parseCompactInput(editCompact)
+        if (parsed.error) {
+          toast.error(parsed.error)
+          return
+        }
+        if (parsed.value != null) compactPatch = { compactThreshold: parsed.value }
+      }
+    }
     try {
       await updateGroup.mutateAsync({
         name: editTarget.name,
@@ -116,6 +157,7 @@ export function GroupsPage() {
           newName: newName !== editTarget.name ? newName : undefined,
           description: editDesc, // 空字符串 → 后端清空
           cacheMode: cacheModePatch,
+          ...compactPatch,
         },
       })
       const renamed = newName !== editTarget.name
@@ -239,6 +281,15 @@ export function GroupsPage() {
                       缓存：默认
                     </Badge>
                   )}
+                  {g.compactThreshold != null ? (
+                    <Badge variant="outline" title="本组覆盖的压缩阈值">
+                      压缩：{Math.round(g.compactThreshold * 100)}%
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="text-muted-foreground" title="未覆盖；使用全局默认 contextCompactThresholdDefault">
+                      压缩：默认
+                    </Badge>
+                  )}
                 </div>
 
                 <p className="text-[11px] text-muted-foreground">
@@ -300,6 +351,37 @@ export function GroupsPage() {
                 同会话粘同账号的强度。高命中突破并发上限 ×2 强粘（适合高活跃组）；低命中满则让步换号；无缓存不粘。
               </p>
             </div>
+            <div className="space-y-1">
+              <label className="text-sm font-medium">上下文压缩阈值</label>
+              <div className="flex items-center gap-2">
+                <Input
+                  type="text"
+                  inputMode="numeric"
+                  className="h-9 max-w-[140px]"
+                  placeholder="跟随全局（默认 95）"
+                  value={createCompact === '__inherit__' ? '' : createCompact}
+                  onChange={(e) => {
+                    const v = e.target.value.trim()
+                    setCreateCompact(v === '' ? '__inherit__' : v)
+                  }}
+                  disabled={createGroup.isPending}
+                />
+                <span className="text-sm text-muted-foreground">%</span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setCreateCompact('__inherit__')}
+                  disabled={createGroup.isPending || createCompact === '__inherit__'}
+                  className="text-xs"
+                >
+                  跟随全局
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                上下文使用率达到此百分比时主动让客户端 auto-compact（50–100，默认 95）。设低一点能更早做摘要、避开 400。
+              </p>
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setCreateOpen(false)} disabled={createGroup.isPending}>
@@ -356,6 +438,37 @@ export function GroupsPage() {
                   <SelectItem value="high">高命中（high）</SelectItem>
                 </SelectContent>
               </Select>
+            </div>
+            <div className="space-y-1">
+              <label className="text-sm font-medium">上下文压缩阈值</label>
+              <div className="flex items-center gap-2">
+                <Input
+                  type="text"
+                  inputMode="numeric"
+                  className="h-9 max-w-[140px]"
+                  placeholder="跟随全局（默认 95）"
+                  value={editCompact === '__inherit__' ? '' : editCompact}
+                  onChange={(e) => {
+                    const v = e.target.value.trim()
+                    setEditCompact(v === '' ? '__inherit__' : v)
+                  }}
+                  disabled={updateGroup.isPending}
+                />
+                <span className="text-sm text-muted-foreground">%</span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setEditCompact('__inherit__')}
+                  disabled={updateGroup.isPending || editCompact === '__inherit__'}
+                  className="text-xs"
+                >
+                  跟随全局
+                </Button>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                上下文使用率达到此百分比时主动让客户端 auto-compact（50–100，默认 95）。
+              </p>
             </div>
             {editTarget && (editTarget.credentialCount > 0 || editTarget.clientKeyCount > 0) && (
               <p className="text-xs text-amber-600">

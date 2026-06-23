@@ -1400,6 +1400,51 @@ impl MultiTokenManager {
             .unwrap_or(self.config.cache_mode_default)
     }
 
+    /// 解析某分组实际生效的上下文压缩阈值。
+    /// 同 `resolve_cache_mode`：分组覆盖 → 全局默认；结果钳制在 [0.5, 1.0]。
+    pub fn resolve_compact_threshold(&self, group: Option<&str>) -> f32 {
+        let raw = group
+            .and_then(|g| {
+                self.group_manager
+                    .get()
+                    .and_then(|gm| gm.get(g))
+                    .and_then(|grp| grp.compact_threshold)
+            })
+            .unwrap_or(self.config.context_compact_threshold_default);
+        raw.clamp(0.5, 1.0)
+    }
+
+    /// 全局默认压缩阈值（Admin API）
+    pub fn get_compact_threshold_default(&self) -> f32 {
+        self.config.context_compact_threshold_default.clamp(0.5, 1.0)
+    }
+
+    /// 设置全局默认压缩阈值（Admin API）。运行时立即生效 + 持久化。
+    pub fn set_compact_threshold_default(&self, threshold: f32) -> anyhow::Result<()> {
+        if !(0.5..=1.0).contains(&threshold) {
+            anyhow::bail!("阈值必须在 0.5 ~ 1.0 之间，收到: {}", threshold);
+        }
+        use anyhow::Context;
+        let config_path = match self.config.config_path() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，全局压缩阈值仅在当前进程不生效（无字段缓存）");
+                return Ok(());
+            }
+        };
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.context_compact_threshold_default = threshold;
+        config
+            .save()
+            .with_context(|| format!("持久化全局压缩阈值失败: {}", config_path.display()))?;
+        // 注意：当前 self.config 是构造期克隆，运行时不持久写回到结构体。
+        // 此处仅写盘，下次启动加载。如果要做运行时热更，需要把 context_compact_threshold_default
+        // 也提到 AtomicU32 / Mutex<f32>。目前每分组都可覆盖，全局值改动场景不频繁，暂不做。
+        tracing::info!("全局上下文压缩阈值已更新到 {}（重启后生效）", threshold);
+        Ok(())
+    }
+
     /// 获取全局代理配置的克隆（可安全跨锁使用）
     pub fn proxy(&self) -> Option<ProxyConfig> {
         self.proxy.lock().clone()

@@ -206,6 +206,18 @@ pub struct Config {
     #[serde(default = "default_runtime_fallback_enabled")]
     pub runtime_fallback_enabled: bool,
 
+    /// 全局上下文压缩阈值（0.5 ~ 1.0）。
+    ///
+    /// 当上游 `ContextUsage` 事件报 percentage ≥ 该阈值时，代理把响应的
+    /// `stop_reason` 改写为 `model_context_window_exceeded`，让客户端
+    /// （如 Claude Code）触发 auto-compact / 摘要历史，在真正撞 1M / 200K
+    /// 砸 400 之前给客户端留缓冲。
+    ///
+    /// 每个 `Group` 可通过 `compactThreshold` 字段单独覆盖（适合不同分组
+    /// 用不同模型 / 上下文窗口的场景）。
+    #[serde(default = "default_context_compact_threshold")]
+    pub context_compact_threshold_default: f32,
+
     /// 端点特定的配置
     ///
     /// 键为端点名（如 "ide" / "cli"），值为该端点自由定义的参数对象。
@@ -302,6 +314,12 @@ fn default_runtime_fallback_enabled() -> bool {
     true
 }
 
+/// 默认上下文压缩阈值：context_usage ≥ 95% 时主动触发 compact。
+/// 设 < 1.0 是为了在上游真砸 400 之前给客户端留缓冲做摘要。
+fn default_context_compact_threshold() -> f32 {
+    0.95
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -340,6 +358,7 @@ impl Default for Config {
             default_concurrency_limit: default_concurrency_limit(),
             cache_mode_default: default_cache_mode(),
             runtime_fallback_enabled: default_runtime_fallback_enabled(),
+            context_compact_threshold_default: default_context_compact_threshold(),
             endpoints: HashMap::new(),
             config_path: None,
         }

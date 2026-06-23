@@ -598,6 +598,8 @@ export interface GroupItem {
   description?: string
   /** 缓存命中档位覆盖；缺省表示继承全局 cacheModeDefault */
   cacheMode?: CacheMode
+  /** 上下文压缩阈值覆盖（0.5 ~ 1.0）；缺省表示继承全局默认 */
+  compactThreshold?: number
   createdAt: string
   /** 引用计数：有多少个凭据带这个分组 */
   credentialCount: number
@@ -614,6 +616,7 @@ export interface CreateGroupRequest {
   name: string
   description?: string
   cacheMode?: CacheMode
+  compactThreshold?: number
 }
 
 export interface UpdateGroupRequest {
@@ -628,4 +631,8 @@ export interface UpdateGroupRequest {
    * - 'off' / 'low' / 'high' = 设置
    */
   cacheMode?: CacheMode | 'inherit' | ''
+  /** 新 compact 阈值（0.5 ~ 1.0）；undefined = 不改 */
+  compactThreshold?: number
+  /** true = 清除覆盖（回到继承全局默认）；与上面互斥 */
+  compactThresholdInherit?: boolean
 }

@@ -14,8 +14,8 @@ use super::{
         complete_social_relogin, create_client_key, create_group, delete_client_key,
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
         export_credentials, force_refresh_token, get_account_throttle_config,
-        get_all_credentials, get_credential_balance, get_credential_models, get_endpoint_policy,
-        get_global_proxy,
+        get_all_credentials, get_compact_threshold, get_credential_balance,
+        get_credential_models, get_endpoint_policy, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_update_config,
         list_client_keys, list_groups, list_traces, trace_failure_stats, poll_idc_login,
         poll_idc_relogin, poll_social_login,
@@ -23,7 +23,8 @@ use super::{
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
         test_credential,
         warmup_credential,
-        set_account_throttle_config, set_client_key_disabled, set_credential_disabled,
+        set_account_throttle_config, set_client_key_disabled, set_compact_threshold,
+        set_credential_disabled,
         set_credential_overage, set_credential_priority, set_endpoint_policy, set_global_proxy,
         set_load_balancing_mode, set_log_governance_config, set_proxy_enabled, set_update_config,
         social_oauth_callback, start_idc_login, start_idc_relogin, start_social_login,
@@ -110,6 +111,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/endpoint-policy",
             get(get_endpoint_policy).put(set_endpoint_policy),
+        )
+        .route(
+            "/config/compact-threshold",
+            get(get_compact_threshold).put(set_compact_threshold),
         )
         .route(
             "/config/log-governance",

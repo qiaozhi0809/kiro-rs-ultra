@@ -1123,6 +1123,9 @@ pub struct GroupItem {
     /// 缓存命中档位覆盖；`None` 表示继承全局 `cacheModeDefault`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_mode: Option<crate::model::config::CacheMode>,
+    /// 上下文压缩阈值覆盖（0.5 ~ 1.0）；`None` 表示继承全局
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_threshold: Option<f32>,
     pub created_at: String,
     /// 引用计数：有多少个凭据带这个分组（前端展示 / 删除前提醒）
     pub credential_count: usize,
@@ -1148,9 +1151,12 @@ pub struct CreateGroupRequest {
     /// 缓存命中档位覆盖；缺省 = 继承全局默认
     #[serde(default)]
     pub cache_mode: Option<crate::model::config::CacheMode>,
+    /// 上下文压缩阈值（0.5 ~ 1.0）；缺省 = 继承全局默认
+    #[serde(default)]
+    pub compact_threshold: Option<f32>,
 }
 
-/// 更新分组请求（改名 / 改备注 / 改 cacheMode；全部可选）
+/// 更新分组请求（改名 / 改备注 / 改 cacheMode / 改 compactThreshold；全部可选）
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateGroupRequest {
@@ -1167,6 +1173,14 @@ pub struct UpdateGroupRequest {
     /// 其他值由 handler 返回 400。
     #[serde(default)]
     pub cache_mode: Option<String>,
+    /// 新上下文压缩阈值（0.5 ~ 1.0），或 `null` / 缺省 = 不改；
+    /// 显式传 `0` 视为清除覆盖（回到继承全局）。负值 / 超 1.0 由 handler 返回 400。
+    #[serde(default)]
+    pub compact_threshold: Option<f32>,
+    /// 显式清除 compact_threshold 覆盖（与上面的 `compact_threshold` 二选一）。
+    /// 前端选"跟随全局默认"时传 `true`。
+    #[serde(default)]
+    pub compact_threshold_inherit: Option<bool>,
 }
 
 /// 删除分组的可选查询参数

@@ -1049,6 +1049,10 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 上下文压缩阈值（百分比形式，0.0 ~ 100.0）。contextUsage ≥ 此值时
+    /// 主动改写 stop_reason 为 model_context_window_exceeded，让客户端 auto-compact。
+    /// 默认 100.0（仅在真满时触发，= 旧行为）。
+    pub compact_threshold_pct: f64,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -1122,6 +1126,7 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            compact_threshold_pct: 100.0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             known_tool_names,
@@ -1217,14 +1222,16 @@ impl StreamContext {
                 let actual_input_tokens =
                     (context_usage.context_usage_percentage * (window_size as f64) / 100.0) as i32;
                 self.context_input_tokens = Some(actual_input_tokens);
-                // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                if context_usage.context_usage_percentage >= 100.0 {
+                // ≥ 阈值（默认 100%，可被分组覆盖到更低）时主动改写 stop_reason，
+                // 让客户端 auto-compact 在真满之前提前介入。
+                if context_usage.context_usage_percentage >= self.compact_threshold_pct {
                     self.state_manager
                         .set_stop_reason("model_context_window_exceeded");
                 }
                 tracing::debug!(
-                    "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                    "收到 contextUsageEvent: {}% (阈值 {:.1}%), 计算 input_tokens: {}",
                     context_usage.context_usage_percentage,
+                    self.compact_threshold_pct,
                     actual_input_tokens
                 );
                 Vec::new()
@@ -2199,6 +2206,11 @@ impl BufferedStreamContext {
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
         self.inner.cache_usage = cache_usage;
+    }
+
+    /// 设置 compact 阈值（百分比，0-100），透传给内部 StreamContext。
+    pub fn set_compact_threshold_pct(&mut self, pct: f64) {
+        self.inner.compact_threshold_pct = pct;
     }
 
     /// 处理 Kiro 事件并缓冲结果

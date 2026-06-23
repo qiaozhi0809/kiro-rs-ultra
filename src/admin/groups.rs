@@ -29,6 +29,9 @@ pub struct Group {
     /// 缓存命中（session-sticky）档位覆盖；`None` 表示继承全局 `cacheModeDefault`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_mode: Option<CacheMode>,
+    /// 上下文压缩阈值覆盖（0.5 ~ 1.0）；`None` 表示继承全局 `contextCompactThresholdDefault`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compact_threshold: Option<f32>,
     /// 创建时间（ISO8601）
     pub created_at: String,
 }
@@ -142,6 +145,7 @@ impl GroupManager {
             name: trimmed.to_string(),
             description: description.map(|d| d.trim().to_string()).filter(|d| !d.is_empty()),
             cache_mode: None,
+            compact_threshold: None,
             created_at: Utc::now().to_rfc3339(),
         };
         inner.entries.insert(group.name.clone(), group.clone());
@@ -178,6 +182,29 @@ impl GroupManager {
             .get_mut(name)
             .ok_or_else(|| anyhow::anyhow!("分组不存在: {}", name))?;
         entry.cache_mode = mode;
+        let cloned = entry.clone();
+        self.save_locked(&inner);
+        Ok(cloned)
+    }
+
+    /// 更新上下文压缩阈值覆盖。`threshold = None` 表示清除（回到继承全局默认）。
+    /// 合法范围 0.5 ~ 1.0；超出范围返回错误。
+    pub fn update_compact_threshold(
+        &self,
+        name: &str,
+        threshold: Option<f32>,
+    ) -> anyhow::Result<Group> {
+        if let Some(t) = threshold {
+            if !(0.5..=1.0).contains(&t) {
+                anyhow::bail!("compactThreshold 必须在 0.5 ~ 1.0 之间，收到: {}", t);
+            }
+        }
+        let mut inner = self.inner.write();
+        let entry = inner
+            .entries
+            .get_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("分组不存在: {}", name))?;
+        entry.compact_threshold = threshold;
         let cloned = entry.clone();
         self.save_locked(&inner);
         Ok(cloned)
@@ -240,6 +267,7 @@ impl GroupManager {
                         name: trimmed.to_string(),
                         description: None,
                         cache_mode: None,
+                        compact_threshold: None,
                         created_at: now.clone(),
                     },
                 );

@@ -306,6 +306,126 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
+/// 构造"上下文窗口已满"的合成响应。
+///
+/// 触发场景：
+/// 1. 上游真砸 `CONTENT_LENGTH_EXCEEDS_THRESHOLD` 400 错误（被动）
+/// 2. 流式响应里 ContextUsage 报 percentage ≥ 阈值（主动预警，留缓冲做 compact）
+///
+/// 输出形态：
+/// - 非流式：HTTP 200 + Anthropic Message 体 + `stop_reason: "model_context_window_exceeded"`
+/// - 流式：HTTP 200 SSE + 一对完整的 message_start / message_delta / message_stop 事件，
+///   `delta.stop_reason = "model_context_window_exceeded"`
+///
+/// Claude Code 等客户端识别此 stop_reason 后会自动触发 auto-compact / 历史摘要。
+/// 不返回 400 是因为 400 会被客户端当成普通请求失败，不会进 compact 路径。
+pub(super) fn build_context_full_response(
+    model: &str,
+    is_stream: bool,
+    input_tokens: i32,
+) -> Response {
+    let message_id = format!("msg_{}", Uuid::new_v4().to_string().replace('-', ""));
+    let body_input = input_tokens.max(0);
+
+    if !is_stream {
+        let body = json!({
+            "id": message_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": "model_context_window_exceeded",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": body_input,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+            }
+        });
+        return (StatusCode::OK, Json(body)).into_response();
+    }
+
+    // 流式：拼一组完整事件
+    let mut sse = String::new();
+    let push = |sse: &mut String, event: &str, data: serde_json::Value| {
+        sse.push_str(&format!(
+            "event: {}\ndata: {}\n\n",
+            event,
+            serde_json::to_string(&data).unwrap_or_default()
+        ));
+    };
+    push(
+        &mut sse,
+        "message_start",
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "model": model,
+                "content": [],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": body_input,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        }),
+    );
+    push(
+        &mut sse,
+        "message_delta",
+        json!({
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": "model_context_window_exceeded",
+                "stop_sequence": null
+            },
+            "usage": { "output_tokens": 0 }
+        }),
+    );
+    push(
+        &mut sse,
+        "message_stop",
+        json!({ "type": "message_stop" }),
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .header("X-Accel-Buffering", "no")
+        .body(axum::body::Body::from(sse))
+        .unwrap_or_else(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to build context-full SSE response",
+            )
+                .into_response()
+        })
+}
+
+/// 把上游 / 自家"上下文满"错误改写成 200 + model_context_window_exceeded，
+/// 让客户端的 auto-compact 链路能识别并自动摘要。其它错误走 map_provider_error。
+pub(super) fn map_provider_error_with_context(
+    err: Error,
+    model: &str,
+    is_stream: bool,
+    input_tokens: i32,
+) -> Response {
+    let s = err.to_string();
+    if s.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+        tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满 → 改写为 200 + model_context_window_exceeded（客户端可触发 auto-compact）");
+        return build_context_full_response(model, is_stream, input_tokens);
+    }
+    map_provider_error(err)
+}
+
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
@@ -812,7 +932,7 @@ async fn handle_stream_request(
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
-            return map_provider_error(e);
+            return map_provider_error_with_context(e, model, true, input_tokens);
         }
     };
     let response = call_result.response;
@@ -821,6 +941,9 @@ async fn handle_stream_request(
     // 创建流处理上下文
     let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
     ctx.cache_usage = cache_usage;
+    // 注入分组生效的 compact 阈值（百分比形式），ContextUsage 事件用此判断是否提前触发
+    ctx.compact_threshold_pct =
+        (provider.token_manager().resolve_compact_threshold(group.as_deref()) * 100.0) as f64;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -1004,13 +1127,15 @@ async fn handle_non_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
 ) -> Response {
+    // 解析当前分组生效的 compact 阈值（百分比形式，用于和 contextUsage 对齐）
+    let compact_pct = provider.token_manager().resolve_compact_threshold(group.as_deref()) * 100.0;
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
-            return map_provider_error(e);
+            return map_provider_error_with_context(e, model, false, input_tokens);
         }
     };
     let response = call_result.response;
@@ -1132,13 +1257,15 @@ async fn handle_non_stream_request(
                                 (context_usage.context_usage_percentage * (window_size as f64)
                                     / 100.0) as i32;
                             context_input_tokens = Some(actual_input_tokens);
-                            // 上下文使用量达到 100% 时，设置 stop_reason 为 model_context_window_exceeded
-                            if context_usage.context_usage_percentage >= 100.0 {
+                            // ≥ 阈值（默认 95%）时主动触发 model_context_window_exceeded，
+                            // 让客户端 auto-compact 在真砸 100% 之前提前介入。
+                            if context_usage.context_usage_percentage >= compact_pct as f64 {
                                 stop_reason = "model_context_window_exceeded".to_string();
                             }
                             tracing::debug!(
-                                "收到 contextUsageEvent: {}%, 计算 input_tokens: {}",
+                                "收到 contextUsageEvent: {}% (阈值 {:.1}%), 计算 input_tokens: {}",
                                 context_usage.context_usage_percentage,
+                                compact_pct,
                                 actual_input_tokens
                             );
                         }
@@ -1567,7 +1694,7 @@ async fn handle_stream_request_buffered(
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
             tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
-            return map_provider_error(e);
+            return map_provider_error_with_context(e, model, true, fallback_input_tokens);
         }
     };
     let response = call_result.response;
@@ -1582,6 +1709,9 @@ async fn handle_stream_request_buffered(
         known_tool_names,
     );
     ctx.set_cache_usage(cache_usage);
+    ctx.set_compact_threshold_pct(
+        (provider.token_manager().resolve_compact_threshold(group.as_deref()) * 100.0) as f64,
+    );
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
