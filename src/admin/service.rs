@@ -1201,6 +1201,8 @@ impl AdminService {
             disabled: false, // 新添加的凭据默认启用
             kiro_api_key: req.kiro_api_key,
             endpoint: req.endpoint,
+            runtime_fallback: None,
+            cooldown_override: None,
             groups: req.groups,
             source_channel: req.source_channel,
             concurrency_limit: req.concurrency_limit,

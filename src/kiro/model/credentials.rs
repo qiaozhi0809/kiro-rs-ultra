@@ -15,6 +15,30 @@ pub const BUILDER_ID_PROFILE_ARN: &str =
 pub const SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
 
+/// 错误冷却策略（凭据级覆盖用）
+///
+/// 每字段独立 `Option`：`None` 时继承全局 `Config.error_cooldown_policy` 同名字段。
+/// 用于给单凭据单独收紧/放宽冷却参数，无需复制完整策略。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PartialCooldownPolicy {
+    /// 错误窗口长度（秒）。窗口内错误次数累计到 threshold 才触发冷却。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_window_secs: Option<u32>,
+    /// 触发冷却的错误次数阈值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_threshold: Option<u32>,
+    /// 冷却时长（秒）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_secs: Option<u32>,
+    /// `disable_window_secs` 内累计触发冷却 N 次后整号自动 disable。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_disable_after_trips: Option<u32>,
+    /// 累计触发计数的窗口长度（秒）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable_window_secs: Option<u32>,
+}
+
 /// Kiro OAuth 凭证
 ///
 /// `Debug` 输出经过脱敏处理：access_token / refresh_token / client_secret /
@@ -146,6 +170,25 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 凭据级 runtime fallback 开关。
+    ///
+    /// `None` = 跟随全局 `Config.runtime_fallback_enabled`（默认行为）；
+    /// `Some(true)` = 强制开启降级（即使全局关闭）；
+    /// `Some(false)` = 强制关闭降级（即使全局开启）。
+    ///
+    /// 用法：某个号在某端点上稳定（runtime 端 #50）且想避免被 ide fallback
+    /// 拉走流量，可设 `Some(false)` 钉死单端点。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_fallback: Option<bool>,
+
+    /// 凭据级冷却策略覆盖（可选）。
+    ///
+    /// 每字段独立 fallback：未设值取全局 `Config.error_cooldown_policy`。
+    /// 用于给"问题号"单独收紧（例：window=60s + threshold=3 + cooldown=900s），
+    /// 或给"健康号"放宽。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_override: Option<PartialCooldownPolicy>,
 
     /// 账号所属分组（可属于多个分组）
     ///

@@ -17,6 +17,52 @@ impl Default for TlsBackend {
     }
 }
 
+/// 错误冷却策略（全局默认）。
+///
+/// 替代旧的 `account_throttle_cooldown_secs` 单字段语义——改为"窗口计数"：
+/// 在 `error_window_secs` 内累计错误次数 ≥ `error_threshold` 才触发冷却，
+/// 冷却时长 `cooldown_secs`。`disable_window_secs` 内累计触发 N 次冷却
+/// 后整号自动 disable，避免"长期慢号"反复短冷却循环。
+///
+/// 凭据可通过 `cooldown_override` 字段独立覆盖任一子字段。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorCooldownPolicy {
+    /// 错误窗口长度（秒）。默认 60。
+    #[serde(default = "default_error_window_secs")]
+    pub error_window_secs: u32,
+    /// 触发冷却的错误次数阈值。默认 5。
+    #[serde(default = "default_error_threshold")]
+    pub error_threshold: u32,
+    /// 冷却时长（秒）。默认 600（10 分钟）。
+    #[serde(default = "default_cooldown_secs")]
+    pub cooldown_secs: u32,
+    /// `disable_window_secs` 内累计触发冷却 N 次后整号 disable。默认 3。
+    #[serde(default = "default_auto_disable_after_trips")]
+    pub auto_disable_after_trips: u32,
+    /// 累计触发计数的窗口长度（秒）。默认 3600（1 小时）。
+    #[serde(default = "default_disable_window_secs")]
+    pub disable_window_secs: u32,
+}
+
+fn default_error_window_secs() -> u32 { 60 }
+fn default_error_threshold() -> u32 { 5 }
+fn default_cooldown_secs() -> u32 { 600 }
+fn default_auto_disable_after_trips() -> u32 { 3 }
+fn default_disable_window_secs() -> u32 { 3600 }
+
+impl Default for ErrorCooldownPolicy {
+    fn default() -> Self {
+        Self {
+            error_window_secs: default_error_window_secs(),
+            error_threshold: default_error_threshold(),
+            cooldown_secs: default_cooldown_secs(),
+            auto_disable_after_trips: default_auto_disable_after_trips(),
+            disable_window_secs: default_disable_window_secs(),
+        }
+    }
+}
+
 /// 缓存命中（session-sticky 调度）强度档位。
 ///
 /// "缓存"本质是 session-sticky：同一 conversation 粘到同一账号 → 上游 prompt cache 复用率高。
@@ -206,6 +252,14 @@ pub struct Config {
     #[serde(default = "default_runtime_fallback_enabled")]
     pub runtime_fallback_enabled: bool,
 
+    /// 错误冷却策略（计数 + 窗口）。
+    ///
+    /// 替代旧的"单次 429 即冷却 N 秒"——改为"M 分钟内 N 次错误才触发；
+    /// 累计触发 K 次自动 disable"。凭据可通过 `cooldown_override` 字段覆盖
+    /// 任意子字段。详见 `ErrorCooldownPolicy` 注释。
+    #[serde(default)]
+    pub error_cooldown_policy: ErrorCooldownPolicy,
+
     /// 全局上下文压缩阈值（0.5 ~ 1.0）。
     ///
     /// 当上游 `ContextUsage` 事件报 percentage ≥ 该阈值时，代理把响应的
@@ -358,6 +412,7 @@ impl Default for Config {
             default_concurrency_limit: default_concurrency_limit(),
             cache_mode_default: default_cache_mode(),
             runtime_fallback_enabled: default_runtime_fallback_enabled(),
+            error_cooldown_policy: ErrorCooldownPolicy::default(),
             context_compact_threshold_default: default_context_compact_threshold(),
             endpoints: HashMap::new(),
             config_path: None,
