@@ -86,6 +86,11 @@ impl ClientCache {
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 并发槽位守卫，从 CallContext 转移而来。
+    /// 持有期 = 上游响应消费的整个生命周期：流式时跟随 SSE unfold state、
+    /// 非流式时跟随 `response.bytes()`。Drop 时对凭据 in_flight -1。
+    /// 命名以 `_` 起头表明外部不直接读，靠 RAII 释放。
+    pub _slot: Option<crate::kiro::token_manager::ConcurrencySlot>,
 }
 
 /// Kiro API Provider
@@ -606,6 +611,7 @@ impl KiroProvider {
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
+                    _slot: ctx._slot.take(),
                 });
             }
 
@@ -662,6 +668,7 @@ impl KiroProvider {
                             return Ok(KiroCallResult {
                                 response: fb_resp,
                                 credential_id: ctx.id,
+                                _slot: ctx._slot.take(),
                             });
                         }
                         Ok(fb_resp) => {

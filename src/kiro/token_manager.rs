@@ -5224,6 +5224,42 @@ mod tests {
         assert_eq!(snap.entries[0].in_flight, 0, "ctx 析构后 in_flight 应归零");
     }
 
+    /// 并发槽位：通过 take 转移到外部持有者后，原 ctx 析构不应释放，
+    /// 只有转移后的持有者析构时才释放。这是 KiroProvider → KiroCallResult →
+    /// 流式消费 整条链路的核心契约（见 docs/endpoint-and-cooldown-redesign.md
+    /// Phase 3）。
+    #[tokio::test]
+    async fn test_concurrency_slot_transfers_via_take() {
+        let cred = grouped_cred("c1", &[]);
+        let manager =
+            MultiTokenManager::new(Config::default(), vec![cred], None, None, false).unwrap();
+
+        let mut ctx = manager.acquire_context(None, None, None).await.unwrap();
+        assert_eq!(
+            manager.snapshot().entries[0].in_flight,
+            1,
+            "acquire 后 in_flight 应为 1"
+        );
+
+        // 模拟 KiroProvider 成功路径：把 slot 从 ctx 转移给 KiroCallResult
+        let moved_slot = ctx._slot.take();
+        assert!(moved_slot.is_some(), "take 后应拿到 slot");
+        drop(ctx);
+        assert_eq!(
+            manager.snapshot().entries[0].in_flight,
+            1,
+            "ctx 内 _slot=None，析构不应递减计数"
+        );
+
+        // 模拟流式消费结束：转移后的持有者析构
+        drop(moved_slot);
+        assert_eq!(
+            manager.snapshot().entries[0].in_flight,
+            0,
+            "moved slot 析构后 in_flight 必须归零"
+        );
+    }
+
     /// 并发上限：单账号达上限后无法再获取（满则跳过，无其他账号时全灭）。
     #[tokio::test]
     async fn test_concurrency_limit_blocks_when_full() {

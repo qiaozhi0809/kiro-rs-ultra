@@ -248,6 +248,7 @@ async fn run_round(
         }
     };
     let credential_id = call_result.credential_id;
+    let _slot = call_result._slot; // 持有到 decode_round 完成；inFlight 释放与上游消费同步
     let mut outcome =
         decode_round(call_result.response, &payload.model, &conversion.tool_name_map).await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
