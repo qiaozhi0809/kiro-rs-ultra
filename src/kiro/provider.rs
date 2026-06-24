@@ -187,9 +187,20 @@ impl KiroProvider {
     /// runtime 与 q (ide) 的上游限流桶独立——runtime 返回 400/403/429 时
     /// 立即用 ide 端点重发同一请求，大概率能通。
     /// 仅 runtime 端点有 fallback；ide / cli 返回 None（无降级目标）。
-    /// 也尊重运行时开关：token_manager.runtime_fallback_enabled = false 时直接 None。
-    fn fallback_endpoint(&self, current: &str) -> Option<Arc<dyn KiroEndpoint>> {
-        if !self.token_manager.get_runtime_fallback_enabled() {
+    ///
+    /// 开关读取顺序（凭据级 > 全局）：
+    /// 1. `credentials.runtime_fallback = Some(true)` → 强制开（即使全局关）
+    /// 2. `credentials.runtime_fallback = Some(false)` → 强制关（即使全局开）
+    /// 3. `credentials.runtime_fallback = None` → 跟随 token_manager 的全局开关
+    fn fallback_endpoint(
+        &self,
+        current: &str,
+        credentials: &KiroCredentials,
+    ) -> Option<Arc<dyn KiroEndpoint>> {
+        let enabled = credentials
+            .runtime_fallback
+            .unwrap_or_else(|| self.token_manager.get_runtime_fallback_enabled());
+        if !enabled {
             return None;
         }
         if current == "runtime" {
@@ -363,7 +374,7 @@ impl KiroProvider {
                 && !endpoint.is_account_throttled(&body)
                 && !endpoint.is_client_validation_error(&body)
             {
-                if let Some(fallback) = self.fallback_endpoint(endpoint_name_mcp) {
+                if let Some(fallback) = self.fallback_endpoint(endpoint_name_mcp, &ctx.credentials) {
                     tracing::info!(
                         "MCP 端点降级 [{}] → [{}]（凭据 #{}，HTTP {}）",
                         endpoint_name_mcp,
@@ -626,7 +637,7 @@ impl KiroProvider {
                 && !endpoint.is_account_throttled(&body)
                 && !endpoint.is_client_validation_error(&body)
             {
-                if let Some(fallback) = self.fallback_endpoint(endpoint_name) {
+                if let Some(fallback) = self.fallback_endpoint(endpoint_name, &ctx.credentials) {
                     let fb_name = fallback.name();
                     tracing::info!(
                         "端点降级 [{}] → [{}]（凭据 #{}，HTTP {}）",

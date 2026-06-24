@@ -888,6 +888,15 @@ struct CredentialEntry {
     /// `Some(t)` 且 `t > now()` 时视为不可用；`t <= now()` 时自动恢复。
     /// 不持久化，进程重启后清空。
     throttled_until: Option<Instant>,
+    /// 错误事件滑动窗口（429 / 5xx 时间戳）。
+    /// 配合 `effective_cooldown_policy.error_window_secs / error_threshold` 实现
+    /// "M 分钟内 N 次错误才触发冷却"——避免单次抖动惩罚长期健康号。
+    /// 不持久化。
+    throttle_events: VecDeque<Instant>,
+    /// 累计触发冷却的时间戳（每次冷却生效时 push 一次）。
+    /// 配合 `disable_window_secs / auto_disable_after_trips` 实现"反复触发自动 disable"，
+    /// 避免长期慢号反复短冷却循环。不持久化。
+    trip_events: VecDeque<Instant>,
     /// 当前进行中（in-flight）的请求数。由 `ConcurrencySlot` RAII 守卫增减：
     /// 请求占用该凭据时 +1，请求结束（成功/失败/网络错误/流式结束）时自动 -1。
     /// 运行时易失指标，不持久化。用 `Arc<AtomicU32>` 以便守卫脱离 entries 锁独立持有。
@@ -923,6 +932,9 @@ enum DisabledReason {
     InvalidRefreshToken,
     /// 凭据配置无效（如 authMethod=api_key 但缺少 kiroApiKey）
     InvalidConfig,
+    /// 错误冷却策略累计触发达阈值后自动禁用（"反复触发"自愈兜底）。
+    /// 与 `TooManyFailures` 区分：基于"触发冷却次数"，而非"连续失败次数"。
+    AutoThrottled,
 }
 
 /// 统计数据持久化条目
@@ -1260,6 +1272,8 @@ impl MultiTokenManager {
                     success_count: 0,
                     last_used_at: None,
                     throttled_until: None,
+                    throttle_events: VecDeque::new(),
+                    trip_events: VecDeque::new(),
                     in_flight: Arc::new(AtomicU32::new(0)),
                     ewma_latency_ms: None,
                     billed_requests: 0,
@@ -2544,6 +2558,7 @@ impl MultiTokenManager {
                             DisabledReason::QuotaExceeded => "QuotaExceeded",
                             DisabledReason::InvalidRefreshToken => "InvalidRefreshToken",
                             DisabledReason::InvalidConfig => "InvalidConfig",
+                            DisabledReason::AutoThrottled => "AutoThrottled",
                         }
                         .to_string()
                     }),
@@ -2623,30 +2638,83 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    /// 标记凭据进入临时冷却期（账号级 429 风控触发）
+    /// 标记凭据进入临时冷却期（账号级 429 风控触发，或上游 5xx 瞬态错误）
     ///
-    /// 与 `report_failure` 不同：不计入永久禁用，到期自动恢复，可用于"`suspicious activity` 429"
-    /// 这种短期账号级风控——当前凭据先冷却 N 分钟，故障转移到其它凭据。
+    /// 升级行为（计数 + 窗口）：
+    /// 1. push 当前时间戳到 `throttle_events`，剪掉 `error_window_secs` 之前的过期项
+    /// 2. 窗口内事件数 ≥ `error_threshold` 才设 `throttled_until`，否则只记录不冷却
+    /// 3. 触发冷却时 push 一个 `trip_events` 时间戳（用于自动 disable 计数）
+    /// 4. `disable_window_secs` 内 trip 数 ≥ `auto_disable_after_trips` → 整号 disable
+    /// 5. 冷却时长走凭据级覆盖，未设取全局 `error_cooldown_policy.cooldown_secs`
+    ///
+    /// `cooldown` 入参保留在签名上以兼容旧调用——但**不再被使用**，时长完全由
+    /// effective policy 决定。这是为了避免修改所有调用点。
     ///
     /// 返回剩余可用凭据数（已排除冷却中的）。
-    pub fn report_account_throttled(&self, id: u64, cooldown: StdDuration) -> usize {
+    pub fn report_account_throttled(&self, id: u64, _legacy_cooldown: StdDuration) -> usize {
         let now = Instant::now();
+        let policy = self.effective_cooldown_policy(id);
+        let win = StdDuration::from_secs(policy.error_window_secs as u64);
+        let dwin = StdDuration::from_secs(policy.disable_window_secs as u64);
+
         {
             let mut entries = self.entries.lock();
             if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
-                let until = now + cooldown;
-                // 取较晚的到期时间（多次触发时延长冷却）
-                entry.throttled_until = Some(match entry.throttled_until {
-                    Some(prev) if prev > until => prev,
-                    _ => until,
-                });
+                // 1. 加事件 + 剪窗口
+                entry.throttle_events.push_back(now);
+                while let Some(&t) = entry.throttle_events.front() {
+                    if now.duration_since(t) > win {
+                        entry.throttle_events.pop_front();
+                    } else {
+                        break;
+                    }
+                }
                 // 计入累计失败（账号风控不动连续 failure_count，避免冷却结束后误禁用）
                 entry.total_failure_count += 1;
-                tracing::warn!(
-                    "凭据 #{} 触发账号级风控，冷却 {} 秒",
-                    id,
-                    cooldown.as_secs()
+
+                let in_window = entry.throttle_events.len() as u32;
+                tracing::debug!(
+                    "凭据 #{} 错误窗口计数 {}/{}（{}s 内）",
+                    id, in_window, policy.error_threshold, policy.error_window_secs
                 );
+
+                // 2. 达阈值才设冷却
+                if in_window >= policy.error_threshold {
+                    let cooldown = StdDuration::from_secs(policy.cooldown_secs as u64);
+                    let until = now + cooldown;
+                    entry.throttled_until = Some(match entry.throttled_until {
+                        Some(prev) if prev > until => prev,
+                        _ => until,
+                    });
+                    // 触发冷却 → push 一个 trip 事件
+                    entry.trip_events.push_back(now);
+                    // 清空错误窗口，避免冷却结束后立即又达阈值
+                    entry.throttle_events.clear();
+
+                    tracing::warn!(
+                        "凭据 #{} 触发账号级风控，冷却 {} 秒（窗口 {}s 内累计 {} 次错误）",
+                        id, cooldown.as_secs(), policy.error_window_secs, in_window
+                    );
+
+                    // 3. 累计 trips 窗口剪枝
+                    while let Some(&t) = entry.trip_events.front() {
+                        if now.duration_since(t) > dwin {
+                            entry.trip_events.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+
+                    // 4. 反复触发 → 自动 disable
+                    if entry.trip_events.len() as u32 >= policy.auto_disable_after_trips {
+                        entry.disabled = true;
+                        entry.disabled_reason = Some(DisabledReason::AutoThrottled);
+                        tracing::error!(
+                            "凭据 #{} 因 {}s 内累计触发冷却 {} 次，自动 disable",
+                            id, policy.disable_window_secs, entry.trip_events.len()
+                        );
+                    }
+                }
             }
 
             let throttled_now = Instant::now();
@@ -2657,6 +2725,31 @@ impl MultiTokenManager {
                         && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
                 })
                 .count()
+        }
+    }
+
+    /// 计算指定凭据的生效冷却策略（凭据级覆盖 > 全局兜底）。
+    ///
+    /// 每子字段独立 fallback——凭据 `cooldown_override.error_threshold = Some(3)`
+    /// 但其他字段未设 → 阈值用 3、其他字段用全局值。
+    fn effective_cooldown_policy(&self, id: u64) -> crate::model::config::ErrorCooldownPolicy {
+        let global = self.config.error_cooldown_policy.clone();
+        let entries = self.entries.lock();
+        let override_opt = entries
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.credentials.cooldown_override.clone());
+        drop(entries);
+
+        let Some(o) = override_opt else { return global; };
+        crate::model::config::ErrorCooldownPolicy {
+            error_window_secs: o.error_window_secs.unwrap_or(global.error_window_secs),
+            error_threshold: o.error_threshold.unwrap_or(global.error_threshold),
+            cooldown_secs: o.cooldown_secs.unwrap_or(global.cooldown_secs),
+            auto_disable_after_trips: o
+                .auto_disable_after_trips
+                .unwrap_or(global.auto_disable_after_trips),
+            disable_window_secs: o.disable_window_secs.unwrap_or(global.disable_window_secs),
         }
     }
 
@@ -3478,6 +3571,8 @@ impl MultiTokenManager {
                 success_count: 0,
                 last_used_at: None,
                 throttled_until: None,
+                throttle_events: VecDeque::new(),
+                trip_events: VecDeque::new(),
                 in_flight: Arc::new(AtomicU32::new(0)),
                 ewma_latency_ms: None,
                 billed_requests: 0,
@@ -5257,6 +5352,113 @@ mod tests {
             manager.snapshot().entries[0].in_flight,
             0,
             "moved slot 析构后 in_flight 必须归零"
+        );
+    }
+
+    /// 错误冷却：窗口阈值前不应触发冷却（容忍单次抖动）。
+    #[tokio::test]
+    async fn test_throttle_window_below_threshold_no_cooldown() {
+        let cred = grouped_cred("c1", &[]);
+        let mut config = Config::default();
+        // 5s 窗口、5 次阈值（默认值，显式声明便于阅读）
+        config.error_cooldown_policy.error_window_secs = 60;
+        config.error_cooldown_policy.error_threshold = 5;
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let id = manager.snapshot().entries[0].id;
+
+        for _ in 0..4 {
+            manager.report_account_throttled(id, StdDuration::from_secs(0));
+        }
+        assert!(
+            manager.snapshot().entries[0].throttled_remaining_secs.is_none(),
+            "4 次错误（< 阈值 5）不应触发冷却"
+        );
+    }
+
+    /// 错误冷却：达阈值才触发；冷却时长走 policy.cooldown_secs，与入参 cooldown 无关。
+    #[tokio::test]
+    async fn test_throttle_window_at_threshold_triggers_cooldown() {
+        let cred = grouped_cred("c1", &[]);
+        let mut config = Config::default();
+        config.error_cooldown_policy.error_window_secs = 60;
+        config.error_cooldown_policy.error_threshold = 3;
+        config.error_cooldown_policy.cooldown_secs = 600;
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let id = manager.snapshot().entries[0].id;
+
+        for _ in 0..3 {
+            // 入参传 0 但实际冷却时长应来自 policy
+            manager.report_account_throttled(id, StdDuration::from_secs(0));
+        }
+        let snap = manager.snapshot();
+        let remaining_secs = snap.entries[0]
+            .throttled_remaining_secs
+            .expect("3 次累计 = 阈值 → 应触发冷却");
+        assert!(
+            remaining_secs > 500,
+            "冷却时长应取 policy.cooldown_secs=600，实际剩余 {} 秒",
+            remaining_secs
+        );
+    }
+
+    /// 错误冷却：累计触发达阈值后整号自动 disable（避免长期慢号反复短冷却）。
+    #[tokio::test]
+    async fn test_repeated_trips_auto_disable() {
+        let cred = grouped_cred("c1", &[]);
+        let mut config = Config::default();
+        // 极小阈值便于测试：1 次错误就 trip，3 次 trip 就 disable
+        config.error_cooldown_policy.error_window_secs = 60;
+        config.error_cooldown_policy.error_threshold = 1;
+        config.error_cooldown_policy.cooldown_secs = 1;
+        config.error_cooldown_policy.auto_disable_after_trips = 3;
+        config.error_cooldown_policy.disable_window_secs = 3600;
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let id = manager.snapshot().entries[0].id;
+
+        for _ in 0..2 {
+            manager.report_account_throttled(id, StdDuration::from_secs(0));
+        }
+        assert!(
+            !manager.snapshot().entries[0].disabled,
+            "2 次 trip 不到 disable 阈值（3）"
+        );
+
+        manager.report_account_throttled(id, StdDuration::from_secs(0));
+        assert!(
+            manager.snapshot().entries[0].disabled,
+            "3 次 trip = 阈值 → 整号应自动 disable"
+        );
+        assert_eq!(
+            manager.snapshot().entries[0].disabled_reason.as_deref(),
+            Some("AutoThrottled")
+        );
+    }
+
+    /// 凭据级覆盖：单凭据 cooldown_override 优先于全局策略。
+    #[tokio::test]
+    async fn test_credential_cooldown_override() {
+        let mut cred = grouped_cred("c1", &[]);
+        // 凭据级覆盖：阈值 = 2（全局是 5）
+        cred.cooldown_override = Some(crate::kiro::model::credentials::PartialCooldownPolicy {
+            error_threshold: Some(2),
+            ..Default::default()
+        });
+        let mut config = Config::default();
+        config.error_cooldown_policy.error_threshold = 5;
+        config.error_cooldown_policy.cooldown_secs = 600;
+        let manager = MultiTokenManager::new(config, vec![cred], None, None, false).unwrap();
+        let id = manager.snapshot().entries[0].id;
+
+        manager.report_account_throttled(id, StdDuration::from_secs(0));
+        assert!(
+            manager.snapshot().entries[0].throttled_remaining_secs.is_none(),
+            "1 次 < 凭据级阈值 2"
+        );
+
+        manager.report_account_throttled(id, StdDuration::from_secs(0));
+        assert!(
+            manager.snapshot().entries[0].throttled_remaining_secs.is_some(),
+            "2 次 = 凭据级阈值（不是全局 5），应触发冷却"
         );
     }
 
