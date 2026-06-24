@@ -81,9 +81,10 @@ export function EndpointPolicyControls() {
 
       {/* 2. 起点分段控件（ide / runtime） */}
       <div
-        className="inline-flex h-7 items-center rounded-full border border-border bg-card/60 p-0.5 backdrop-blur"
-        title="未单独配 endpoint 的凭据默认从哪个端点起点；运行时切换 + 持久化"
+        className="inline-flex h-7 items-center gap-1.5 rounded-full border border-border bg-card/60 p-0.5 pl-2 backdrop-blur"
+        title="未单独配 endpoint 的凭据默认从哪个端点起点。已设凭据级覆盖的号不受此影响——查看左边的「分布徽章」即每个端点上挂的号数。"
       >
+        <span className="text-[11px] text-muted-foreground">默认起点</span>
         <button
           type="button"
           onClick={() => onChangeDefault("ide")}

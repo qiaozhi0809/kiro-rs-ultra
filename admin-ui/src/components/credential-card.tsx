@@ -18,6 +18,7 @@ import {
   Gauge,
   Flame,
   Info,
+  Sliders,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -67,6 +68,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { EditCredentialDialog } from "@/components/edit-credential-dialog";
+import { CredentialPolicyDialog } from "@/components/credential-policy-dialog";
 import { UpdateTokenDialog } from "@/components/update-token-dialog";
 import { ReloginDialog } from "@/components/relogin-dialog";
 import { CredentialFailuresDialog } from "@/components/credential-failures-dialog";
@@ -253,6 +255,7 @@ export function CredentialCard({
   const [showReloginDialog, setShowReloginDialog] = useState(false);
   const [showFailuresDialog, setShowFailuresDialog] = useState(false);
   const [showModelsDialog, setShowModelsDialog] = useState(false);
+  const [showPolicyDialog, setShowPolicyDialog] = useState(false);
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
@@ -554,6 +557,10 @@ export function CredentialCard({
         >
           <Boxes />
           查看可用模型
+        </DropdownMenuItem>
+        <DropdownMenuItem onSelect={() => setShowPolicyDialog(true)}>
+          <Sliders />
+          调度策略（端点 / 冷却）
         </DropdownMenuItem>
         {throttleRemaining > 0 && (
           <DropdownMenuItem
@@ -1405,6 +1412,11 @@ export function CredentialCard({
       <EditCredentialDialog
         open={showEditDialog}
         onOpenChange={setShowEditDialog}
+        credential={credential}
+      />
+      <CredentialPolicyDialog
+        open={showPolicyDialog}
+        onOpenChange={setShowPolicyDialog}
         credential={credential}
       />
       <UpdateTokenDialog
