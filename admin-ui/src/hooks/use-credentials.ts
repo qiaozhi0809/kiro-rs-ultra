@@ -19,12 +19,18 @@ import {
   setAccountThrottleConfig,
   getEndpointPolicy,
   setEndpointPolicy,
+  getErrorCooldownPolicy,
+  setErrorCooldownPolicy,
+  setCredentialEndpointPolicy,
+  setCredentialCooldownPolicy,
   getLogGovernanceConfig,
   setLogGovernanceConfig,
   resetSuccessCount,
   resetAllSuccessCount,
   testCredential,
   warmupCredential,
+  type CredentialEndpointPolicyPatch,
+  type CredentialCooldownPolicyPatch,
 } from '@/api/credentials'
 import type { AddCredentialRequest, UpdateCredentialRequest, UpdateRefreshTokenRequest } from '@/types/api'
 
@@ -272,6 +278,50 @@ export function useSetEndpointPolicy() {
     mutationFn: setEndpointPolicy,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['endpointPolicy'] })
+    },
+  })
+}
+
+// 获取全局错误冷却策略
+export function useErrorCooldownPolicy() {
+  return useQuery({
+    queryKey: ['errorCooldownPolicy'],
+    queryFn: getErrorCooldownPolicy,
+  })
+}
+
+// 修改全局错误冷却策略
+export function useSetErrorCooldownPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setErrorCooldownPolicy,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['errorCooldownPolicy'] })
+    },
+  })
+}
+
+// 凭据级端点策略覆盖
+export function useSetCredentialEndpointPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, patch }: { id: number; patch: CredentialEndpointPolicyPatch }) =>
+      setCredentialEndpointPolicy(id, patch),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+      queryClient.invalidateQueries({ queryKey: ['endpointPolicy'] })
+    },
+  })
+}
+
+// 凭据级冷却策略覆盖
+export function useSetCredentialCooldownPolicy() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: ({ id, patch }: { id: number; patch: CredentialCooldownPolicyPatch }) =>
+      setCredentialCooldownPolicy(id, patch),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
   })
 }

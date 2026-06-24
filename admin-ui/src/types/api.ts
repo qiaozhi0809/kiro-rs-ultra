@@ -6,6 +6,19 @@ export interface CredentialsStatusResponse {
   credentials: CredentialStatusItem[]
 }
 
+/**
+ * 凭据级冷却策略覆盖（每子字段独立 Option）
+ *
+ * 字段缺省 = 跟随全局对应字段；显式数字 = 凭据级强制覆盖。
+ */
+export interface PartialCooldownPolicy {
+  errorWindowSecs?: number
+  errorThreshold?: number
+  cooldownSecs?: number
+  autoDisableAfterTrips?: number
+  disableWindowSecs?: number
+}
+
 // 单个凭据状态
 export interface CredentialStatusItem {
   id: number
@@ -32,6 +45,14 @@ export interface CredentialStatusItem {
   /** 账号级风控冷却剩余秒数（>0 表示冷却中） */
   throttledRemainingSecs?: number
   endpoint: string
+  /** 凭据级 runtime fallback 开关；undefined = 跟随全局；true/false = 强制 */
+  runtimeFallback?: boolean
+  /** 凭据级冷却策略覆盖；undefined = 未覆盖；用于编辑回填 */
+  cooldownOverride?: PartialCooldownPolicy
+  /** 当前错误窗口内累计错误数（429/5xx） */
+  throttleEventCount?: number
+  /** 当前 disable_window_secs 内累计触发冷却次数 */
+  tripCount?: number
   /** 账号所属分组（可属于多个分组） */
   groups?: string[]
   /** 账号来源渠道（纯备注） */

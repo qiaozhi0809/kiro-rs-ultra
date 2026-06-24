@@ -80,6 +80,17 @@ pub struct CredentialStatusItem {
     pub disabled_reason: Option<String>,
     /// 端点名称（决定该凭据走哪套 Kiro API，已回退到默认端点）
     pub endpoint: String,
+    /// 凭据级 runtime fallback 开关原始值（None = 跟随全局；Some(v) = 强制）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_fallback: Option<bool>,
+    /// 凭据级冷却策略覆盖原始值（None = 未覆盖；用于编辑回填）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_override:
+        Option<crate::kiro::model::credentials::PartialCooldownPolicy>,
+    /// 当前错误窗口内累计的错误事件数（429/5xx）；运行时易失
+    pub throttle_event_count: u32,
+    /// 当前 disable_window_secs 内累计触发冷却次数；运行时易失
+    pub trip_count: u32,
     /// 账号所属分组（可属于多个分组）
     #[serde(default)]
     pub groups: Vec<String>,

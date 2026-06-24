@@ -1000,6 +1000,17 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 凭据级 runtime fallback 开关原始值；None = 跟随全局
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_fallback: Option<bool>,
+    /// 凭据级冷却策略覆盖；None = 未覆盖
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cooldown_override:
+        Option<crate::kiro::model::credentials::PartialCooldownPolicy>,
+    /// 当前错误窗口内累计错误数（429/5xx）；运行时易失指标
+    pub throttle_event_count: u32,
+    /// 当前 disable_window_secs 内累计触发冷却次数；运行时易失指标
+    pub trip_count: u32,
     /// 账号所属分组（可属于多个分组）
     #[serde(default)]
     pub groups: Vec<String>,
@@ -2573,6 +2584,10 @@ impl MultiTokenManager {
                         .map(|d| d.as_secs())
                         .filter(|s| *s > 0),
                     endpoint: e.credentials.endpoint.clone(),
+                    runtime_fallback: e.credentials.runtime_fallback,
+                    cooldown_override: e.credentials.cooldown_override.clone(),
+                    throttle_event_count: e.throttle_events.len() as u32,
+                    trip_count: e.trip_events.len() as u32,
                     groups: e.credentials.groups.clone(),
                     source_channel: e.credentials.source_channel.clone(),
                     in_flight: e.in_flight.load(Ordering::SeqCst),

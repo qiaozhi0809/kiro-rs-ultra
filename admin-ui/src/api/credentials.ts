@@ -482,6 +482,69 @@ export async function setEndpointPolicy(
   return data
 }
 
+// 全局错误冷却策略（所有字段都是必填，由后端默认值兜底）
+export interface ErrorCooldownPolicy {
+  errorWindowSecs: number
+  errorThreshold: number
+  cooldownSecs: number
+  autoDisableAfterTrips: number
+  disableWindowSecs: number
+}
+
+export async function getErrorCooldownPolicy(): Promise<ErrorCooldownPolicy> {
+  const { data } = await api.get<ErrorCooldownPolicy>('/config/cooldown-policy')
+  return data
+}
+
+export async function setErrorCooldownPolicy(
+  patch: Partial<ErrorCooldownPolicy>,
+): Promise<ErrorCooldownPolicy> {
+  const { data } = await api.put<ErrorCooldownPolicy>('/config/cooldown-policy', patch)
+  return data
+}
+
+/**
+ * 凭据级端点策略 PATCH 请求
+ *
+ * 三态语义（双层 Option）：
+ * - 字段缺省 = 不更新
+ * - 字段值 null = 重置为"跟随全局"
+ * - 字段值具体值 = 强制覆盖
+ */
+export interface CredentialEndpointPolicyPatch {
+  endpoint?: 'ide' | 'runtime' | null
+  runtimeFallback?: boolean | null
+}
+
+export async function setCredentialEndpointPolicy(
+  id: number,
+  patch: CredentialEndpointPolicyPatch,
+): Promise<void> {
+  await api.patch(`/credentials/${id}/endpoint-policy`, patch)
+}
+
+/**
+ * 凭据级冷却策略覆盖 PATCH 请求
+ *
+ * 子字段三态：缺省 = 不改；null = 重置；具体值 = 强制。
+ * 设 clearAll=true 一键清空整个 override（凭据所有冷却字段都跟随全局）。
+ */
+export interface CredentialCooldownPolicyPatch {
+  errorWindowSecs?: number | null
+  errorThreshold?: number | null
+  cooldownSecs?: number | null
+  autoDisableAfterTrips?: number | null
+  disableWindowSecs?: number | null
+  clearAll?: boolean
+}
+
+export async function setCredentialCooldownPolicy(
+  id: number,
+  patch: CredentialCooldownPolicyPatch,
+): Promise<void> {
+  await api.patch(`/credentials/${id}/cooldown-policy`, patch)
+}
+
 export interface LogGovernanceConfig {
   traceEnabled: boolean
   traceRetentionDays: number
