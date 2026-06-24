@@ -19,6 +19,7 @@ import {
 import {
   useLoadBalancingMode, useSetLoadBalancingMode,
   useAccountThrottleConfig, useSetAccountThrottleConfig,
+  useErrorCooldownPolicy, useSetErrorCooldownPolicy,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey } from '@/api/credentials'
@@ -256,6 +257,7 @@ function FullTools({ controls }: { controls: ToolControls }) {
 }
 
 function CompactTools({ controls }: { controls: ToolControls }) {
+  const [healthOpen, setHealthOpen] = useState(false)
   const throttleProps = {
     config: controls.throttleConfig,
     loading: controls.isLoadingThrottle,
@@ -265,7 +267,14 @@ function CompactTools({ controls }: { controls: ToolControls }) {
   }
 
   return (
-    <DropdownMenu modal={false}>
+    <>
+      <ThrottleConfigButton
+        {...throttleProps}
+        hideTrigger
+        externalOpen={healthOpen}
+        onExternalOpenChange={setHealthOpen}
+      />
+      <DropdownMenu modal={false}>
       <DropdownMenuTrigger asChild>
         <Button variant="outline" size="icon" title="更多操作">
           <MoreHorizontal className="h-4 w-4" />
@@ -290,13 +299,21 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         <DropdownMenuItem onSelect={controls.openImageUpdate}>
           <UploadCloud />镜像在线更新
         </DropdownMenuItem>
-        <ThrottleCompactItems {...throttleProps} />
+        <DropdownMenuItem
+          onSelect={(e) => {
+            e.preventDefault()
+            setHealthOpen(true)
+          }}
+        >
+          <ShieldCheck />账号健康度…
+        </DropdownMenuItem>
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
         <DropdownMenuItem onSelect={controls.openKeyDialog}>
           <Key />修改登录API密钥（管理面板登录）
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+    </>
   )
 }
 
@@ -390,89 +407,216 @@ interface ThrottleState {
   failover: boolean
 }
 
-interface CustomCooldownFormProps {
-  cooldownMin: number
-  customMin: string
-  disabled: boolean
-  onCustomMinChange: (value: string) => void
-  onSubmit: (e: React.FormEvent) => void
-}
-
 interface ThrottleTriggerProps extends ComponentPropsWithoutRef<typeof Button> {
   loading: boolean
   saving: boolean
   state: ThrottleState
 }
 
-const COOLDOWN_PRESETS = [
-  { label: '5 分钟', secs: 5 * 60 },
-  { label: '15 分钟', secs: 15 * 60 },
-  { label: '30 分钟', secs: 30 * 60 },
-  { label: '1 小时', secs: 60 * 60 },
-  { label: '2 小时', secs: 2 * 60 * 60 },
-]
-
 const DEFAULT_COOLDOWN_SECS = 30 * 60
 const SECONDS_PER_MINUTE = 60
-const MIN_CUSTOM_COOLDOWN_MINUTES = 1
-const MAX_CUSTOM_COOLDOWN_MINUTES = 1440
 
 /**
- * 故障转移开关 + 冷却时长设置（紧凑下拉）
+ * 账号健康度（合并：故障转移开关 + 风控冷却策略 5 字段）
  *
- * 主按钮文案显示当前状态；下拉里:
- * - 顶部一个 Switch 切换 failover
- * - 5 个预设时长 + 一个自定义输入（分钟）
+ * 顶部按钮显示当前 failover 状态；点击开整个 Dialog：
+ * - 第 1 行：连续失败下线（说明性，固定 3 次，不可改 — kiro-rs 历史兜底）
+ * - 第 2 行：风控故障转移（开关 + 5 个冷却策略字段）
+ *
+ * 设计：把"故障转移开关"和"错误冷却策略"合并到一个面板，因为逻辑上是一套
+ * （前者 = 总开关；后者 = 触发条件 + 时长 + 自动 disable 阈值）。
  */
 function ThrottleConfigButton({
-  config, loading, saving, onToggleFailover, onChangeCooldown,
-}: ThrottleConfigButtonProps) {
-  const [open, setOpen] = useState(false)
-  const [customMin, setCustomMin] = useState('')
+  config, loading, saving, onToggleFailover, onChangeCooldown: _onChangeCooldown,
+  hideTrigger = false, externalOpen, onExternalOpenChange,
+}: ThrottleConfigButtonProps & {
+  hideTrigger?: boolean
+  externalOpen?: boolean
+  onExternalOpenChange?: (open: boolean) => void
+}) {
+  const [internalOpen, setInternalOpen] = useState(false)
+  const open = externalOpen ?? internalOpen
+  const setOpen = onExternalOpenChange ?? setInternalOpen
   const state = readThrottleState(config)
+  const { data: policy } = useErrorCooldownPolicy()
+  const { mutate: setPolicy, isPending: savingPolicy } = useSetErrorCooldownPolicy()
+
+  // 五个字段的本地表单状态
+  const [windowSecs, setWindowSecs] = useState('')
+  const [threshold, setThreshold] = useState('')
+  const [cooldownSecs, setCooldownSecs] = useState('')
+  const [autoDisable, setAutoDisable] = useState('')
+  const [disableWindow, setDisableWindow] = useState('')
 
   useEffect(() => {
-    if (!open) setCustomMin('')
-  }, [open])
-
-  const submitCustom = (e: React.FormEvent) => {
-    e.preventDefault()
-    const min = parseInt(customMin, 10)
-    if (invalidCooldownMinutes(min)) {
-      toast.error('请输入 1-1440 之间的分钟数')
-      return
+    if (open && policy) {
+      setWindowSecs(String(policy.errorWindowSecs))
+      setThreshold(String(policy.errorThreshold))
+      setCooldownSecs(String(policy.cooldownSecs))
+      setAutoDisable(String(policy.autoDisableAfterTrips))
+      setDisableWindow(String(policy.disableWindowSecs))
     }
-    onChangeCooldown(min * SECONDS_PER_MINUTE)
-    setOpen(false)
+  }, [open, policy])
+
+  const busy = loading || saving || savingPolicy
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault()
+    const parse = (s: string) => {
+      const n = parseInt(s.trim(), 10)
+      return Number.isFinite(n) && n > 0 ? n : undefined
+    }
+    setPolicy(
+      {
+        errorWindowSecs: parse(windowSecs),
+        errorThreshold: parse(threshold),
+        cooldownSecs: parse(cooldownSecs),
+        autoDisableAfterTrips: parse(autoDisable),
+        disableWindowSecs: parse(disableWindow),
+      },
+      {
+        onSuccess: () => {
+          toast.success('风控策略已更新')
+          setOpen(false)
+        },
+        onError: (err) => toast.error(extractErrorMessage(err)),
+      },
+    )
   }
 
   return (
-    <DropdownMenu open={open} onOpenChange={setOpen}>
-      <DropdownMenuTrigger asChild>
-        <ThrottleTrigger loading={loading} saving={saving} state={state} />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-64">
-        <ThrottleStatusPanel
+    <>
+      {!hideTrigger && (
+        <ThrottleTrigger
+          loading={loading}
           saving={saving}
           state={state}
-          onToggleFailover={onToggleFailover}
+          onClick={() => setOpen(true)}
         />
-        <ThrottleCooldownPanel
-          customMin={customMin}
-          saving={saving}
-          state={state}
-          onChangeCooldown={onChangeCooldown}
-          onCustomMinChange={setCustomMin}
-          onDone={() => setOpen(false)}
-          onSubmitCustom={submitCustom}
-        />
-      </DropdownMenuContent>
-    </DropdownMenu>
+      )}
+      <Dialog open={open} onOpenChange={setOpen}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>账号健康度</DialogTitle>
+            <DialogDescription>
+              坏号自动隔离 / 风控自动下线的两套机制
+            </DialogDescription>
+          </DialogHeader>
+
+          <form onSubmit={handleSubmit}>
+            <div className="space-y-4 py-2">
+              {/* ① 连续失败下线（说明，不可改） */}
+              <div className="rounded-xl border border-border/60 bg-muted/30 p-3">
+                <div className="text-sm font-medium">① 连续失败下线（兜底）</div>
+                <p className="mt-1.5 text-xs text-muted-foreground">
+                  任意 API 失败（认证 / 网络 / 5xx）连续 3 次 → 永久禁用
+                  （任意成功重置计数）。这是 kiro-rs 历史兜底，写死不可改。
+                  禁用原因 <code className="font-mono">TooManyFailures</code>，运维需手动恢复。
+                </p>
+              </div>
+
+              {/* ② 风控故障转移 + 冷却策略 */}
+              <div className="space-y-3 rounded-xl border border-border/60 bg-secondary/30 p-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm font-medium">② 风控故障转移</span>
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground">
+                      {state.failover ? '已启用' : '已关闭'}
+                    </span>
+                    <Switch
+                      checked={state.failover}
+                      disabled={busy}
+                      onCheckedChange={onToggleFailover}
+                      aria-label="启用风控故障转移"
+                    />
+                  </div>
+                </div>
+
+                <p className="text-xs text-muted-foreground">
+                  AWS 风控（429 + suspicious activity）时切走坏号；下面是
+                  「几次算坏 / 冷却多久 / 反复几次开除」的细则。关闭开关后这些参数不生效。
+                </p>
+
+                <div className={state.failover ? '' : 'opacity-50 pointer-events-none'}>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-muted-foreground">几次算坏：窗口（秒）</label>
+                      <Input
+                        type="number"
+                        min={1}
+                        value={windowSecs}
+                        onChange={(e) => setWindowSecs(e.target.value)}
+                        disabled={busy}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-muted-foreground">几次算坏：次数</label>
+                      <Input
+                        type="number"
+                        min={1}
+                        value={threshold}
+                        onChange={(e) => setThreshold(e.target.value)}
+                        disabled={busy}
+                      />
+                    </div>
+                    <div className="col-span-2 space-y-1">
+                      <label className="text-[11px] text-muted-foreground">拉黑多久（秒）</label>
+                      <Input
+                        type="number"
+                        min={1}
+                        value={cooldownSecs}
+                        onChange={(e) => setCooldownSecs(e.target.value)}
+                        disabled={busy}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-muted-foreground">开除：窗口（秒）</label>
+                      <Input
+                        type="number"
+                        min={1}
+                        value={disableWindow}
+                        onChange={(e) => setDisableWindow(e.target.value)}
+                        disabled={busy}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <label className="text-[11px] text-muted-foreground">开除：累计触发次数</label>
+                      <Input
+                        type="number"
+                        min={1}
+                        value={autoDisable}
+                        onChange={(e) => setAutoDisable(e.target.value)}
+                        disabled={busy}
+                      />
+                    </div>
+                  </div>
+
+                  <p className="mt-2 text-[11px] text-muted-foreground">
+                    语义：「{windowSecs || '?'}s 内累计 {threshold || '?'} 次 AWS 风控」→ 拉黑 {cooldownSecs || '?'}s；
+                    「{disableWindow || '?'}s 内累计被拉黑 {autoDisable || '?'} 次」→ 自动 disable
+                    （原因 <code className="font-mono">AutoThrottled</code>）。凭据可独立覆盖。
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <DialogFooter>
+              <Button type="button" variant="outline" onClick={() => setOpen(false)} disabled={busy}>
+                取消
+              </Button>
+              <Button type="submit" disabled={busy || !policy}>
+                {savingPolicy ? '保存中...' : '保存'}
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
+    </>
   )
 }
 
 const ThrottleTrigger = forwardRef<HTMLButtonElement, ThrottleTriggerProps>(
-  function ThrottleTrigger({ loading, saving, state, ...props }, ref) {
+  function ThrottleTrigger({ loading, saving, state, onClick, ...props }, ref) {
     return (
       <Button
         {...props}
@@ -480,6 +624,7 @@ const ThrottleTrigger = forwardRef<HTMLButtonElement, ThrottleTriggerProps>(
         variant="outline"
         size="sm"
         disabled={loading || saving}
+        onClick={onClick}
         title={throttleTitle(loading, state)}
       >
         {state.failover ? (
@@ -495,204 +640,6 @@ const ThrottleTrigger = forwardRef<HTMLButtonElement, ThrottleTriggerProps>(
   },
 )
 
-function ThrottleStatusPanel({
-  saving, state, onToggleFailover,
-}: {
-  saving: boolean
-  state: ThrottleState
-  onToggleFailover: () => void
-}) {
-  return (
-    <>
-      <DropdownMenuLabel>账号级风控故障转移</DropdownMenuLabel>
-      <div className="px-2 pb-2">
-        <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
-          <ThrottleStatusText failover={state.failover} />
-          <Switch
-            checked={state.failover}
-            disabled={saving}
-            onCheckedChange={() => onToggleFailover()}
-          />
-        </div>
-      </div>
-    </>
-  )
-}
-
-function ThrottleStatusText({ failover }: { failover: boolean }) {
-  return (
-    <div className="text-xs">
-      <div className="font-medium text-foreground">
-        {failover ? '开启' : '关闭'}
-      </div>
-      <div className="text-muted-foreground leading-snug">
-        {failover
-          ? '上游对当前账号触发临时限速时，自动冷却该凭据并切换到下一个可用凭据'
-          : '上游对当前账号触发临时限速时，仅按瞬态错误重试，不切换凭据'}
-      </div>
-    </div>
-  )
-}
-
-function ThrottleCooldownPanel({
-  customMin, saving, state, onChangeCooldown, onCustomMinChange, onDone, onSubmitCustom,
-}: {
-  customMin: string
-  saving: boolean
-  state: ThrottleState
-  onChangeCooldown: (secs: number) => void
-  onCustomMinChange: (value: string) => void
-  onDone?: () => void
-  onSubmitCustom: (e: React.FormEvent) => void
-}) {
-  const disabled = saving || !state.failover
-
-  return (
-    <>
-      <DropdownMenuLabel className="pt-1">冷却时长</DropdownMenuLabel>
-      <div className={cooldownPanelClassName(state.failover)}>
-        <CooldownPresetButtons
-          cooldownSecs={state.cooldownSecs}
-          disabled={disabled}
-          onChangeCooldown={onChangeCooldown}
-          onDone={onDone}
-        />
-        <CustomCooldownForm
-          cooldownMin={state.cooldownMin}
-          customMin={customMin}
-          disabled={disabled}
-          onCustomMinChange={onCustomMinChange}
-          onSubmit={onSubmitCustom}
-        />
-      </div>
-    </>
-  )
-}
-
-function CustomCooldownForm({
-  cooldownMin, customMin, disabled, onCustomMinChange, onSubmit,
-}: CustomCooldownFormProps) {
-  return (
-    <form onSubmit={onSubmit} className="mt-2 flex items-center gap-1.5">
-      <Input
-        type="number"
-        min={MIN_CUSTOM_COOLDOWN_MINUTES}
-        max={MAX_CUSTOM_COOLDOWN_MINUTES}
-        placeholder={`自定义（当前 ${cooldownMin}）`}
-        value={customMin}
-        onChange={(e) => onCustomMinChange(e.target.value)}
-        disabled={disabled}
-        className="h-7 text-xs"
-      />
-      <span className="text-xs text-muted-foreground">分钟</span>
-      <Button
-        type="submit"
-        size="sm"
-        variant="outline"
-        className="h-7 text-xs"
-        disabled={disabled || !customMin.trim()}
-      >
-        保存
-      </Button>
-    </form>
-  )
-}
-
-function ThrottleCompactItems(props: ThrottleConfigButtonProps) {
-  const { loading, saving, onToggleFailover, onChangeCooldown } = props
-  const [customMin, setCustomMin] = useState('')
-  const state = readThrottleState(props.config)
-  const busy = loading || saving
-
-  const submitCustom = (e: React.FormEvent) => {
-    e.preventDefault()
-    const min = parseInt(customMin, 10)
-    if (invalidCooldownMinutes(min)) {
-      toast.error('请输入 1-1440 之间的分钟数')
-      return
-    }
-    onChangeCooldown(min * SECONDS_PER_MINUTE)
-    setCustomMin('')
-  }
-
-  return (
-    <>
-      <DropdownMenuLabel>故障转移</DropdownMenuLabel>
-      <DropdownMenuItem
-        disabled={busy}
-        onSelect={onToggleFailover}
-      >
-        {state.failover ? <ShieldCheck /> : <ShieldAlert />}
-        {compactThrottleText(loading, state)}
-      </DropdownMenuItem>
-      <ThrottleCooldownPanel
-        customMin={customMin}
-        saving={busy}
-        state={state}
-        onChangeCooldown={onChangeCooldown}
-        onCustomMinChange={setCustomMin}
-        onSubmitCustom={submitCustom}
-      />
-    </>
-  )
-}
-
-function CooldownPresetButtons({
-  cooldownSecs, disabled, onChangeCooldown, onDone,
-}: {
-  cooldownSecs: number
-  disabled: boolean
-  onChangeCooldown: (secs: number) => void
-  onDone?: () => void
-}) {
-  return (
-    <div className="grid grid-cols-3 gap-1">
-      {COOLDOWN_PRESETS.map((preset) => (
-        <CooldownPresetButton
-          key={preset.secs}
-          active={preset.secs === cooldownSecs}
-          disabled={disabled}
-          label={preset.label}
-          secs={preset.secs}
-          onChangeCooldown={onChangeCooldown}
-          onDone={onDone}
-        />
-      ))}
-    </div>
-  )
-}
-
-function CooldownPresetButton({
-  active, disabled, label, secs, onChangeCooldown, onDone,
-}: {
-  active: boolean
-  disabled: boolean
-  label: string
-  secs: number
-  onChangeCooldown: (secs: number) => void
-  onDone?: () => void
-}) {
-  return (
-    <Button
-      type="button"
-      size="sm"
-      variant={active ? 'default' : 'outline'}
-      className="h-7 text-xs"
-      disabled={disabled}
-      onClick={() => {
-        if (!active) onChangeCooldown(secs)
-        onDone?.()
-      }}
-    >
-      {label}
-    </Button>
-  )
-}
-
-function secondsToMinutes(seconds: number) {
-  return Math.round(seconds / SECONDS_PER_MINUTE)
-}
-
 function readThrottleState(
   config: ThrottleConfigButtonProps['config'],
 ): ThrottleState {
@@ -704,6 +651,10 @@ function readThrottleState(
   }
 }
 
+function secondsToMinutes(seconds: number) {
+  return Math.round(seconds / SECONDS_PER_MINUTE)
+}
+
 function throttleTitle(loading: boolean, state: ThrottleState) {
   if (loading) return '加载中…'
   if (!state.failover) return '账号级风控故障转移：关闭'
@@ -713,23 +664,5 @@ function throttleTitle(loading: boolean, state: ThrottleState) {
 function throttleTriggerText(loading: boolean, state: ThrottleState) {
   if (loading) return '加载中…'
   if (!state.failover) return '不切换'
-  return `故障转移 · ${state.cooldownMin}m`
-}
-
-function compactThrottleText(loading: boolean, state: ThrottleState) {
-  if (loading) return '故障转移加载中'
-  if (!state.failover) return '开启故障转移'
-  return `关闭故障转移 · ${state.cooldownMin}m`
-}
-
-function invalidCooldownMinutes(minutes: number) {
-  return (
-    Number.isNaN(minutes) ||
-    minutes < MIN_CUSTOM_COOLDOWN_MINUTES ||
-    minutes > MAX_CUSTOM_COOLDOWN_MINUTES
-  )
-}
-
-function cooldownPanelClassName(failover: boolean) {
-  return `px-2 pb-2 ${failover ? '' : 'opacity-60'}`
+  return `健康度 · ${state.cooldownMin}m`
 }
