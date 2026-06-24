@@ -611,6 +611,52 @@ pub async fn set_endpoint_policy(
     }
 }
 
+/// GET /api/admin/config/cooldown-policy
+/// 获取全局错误冷却策略
+pub async fn get_error_cooldown_policy(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_error_cooldown_policy())
+}
+
+/// PUT /api/admin/config/cooldown-policy
+/// 修改全局错误冷却策略（5 字段可选，仅改传的）
+pub async fn set_error_cooldown_policy(
+    State(state): State<AdminState>,
+    Json(payload): Json<super::types::SetErrorCooldownPolicyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_error_cooldown_policy(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PATCH /api/admin/credentials/:id/endpoint-policy
+/// 凭据级端点策略覆盖（endpoint / runtimeFallback 三态字段）
+pub async fn set_credential_endpoint_policy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<super::types::SetCredentialEndpointPolicyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_endpoint_policy(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 端点策略已更新", id)))
+            .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// PATCH /api/admin/credentials/:id/cooldown-policy
+/// 凭据级冷却策略覆盖（5 子字段三态 + clearAll 一键重置）
+pub async fn set_credential_cooldown_policy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+    Json(payload): Json<super::types::SetCredentialCooldownPolicyRequest>,
+) -> impl IntoResponse {
+    match state.service.set_credential_cooldown_policy(id, payload) {
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 冷却策略已更新", id)))
+            .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// GET /api/admin/config/compact-threshold
 /// 获取全局上下文压缩阈值默认值
 pub async fn get_compact_threshold(State(state): State<AdminState>) -> impl IntoResponse {

@@ -24,8 +24,10 @@ use super::{
         test_credential,
         warmup_credential,
         set_account_throttle_config, set_client_key_disabled, set_compact_threshold,
-        set_credential_disabled,
-        set_credential_overage, set_credential_priority, set_endpoint_policy, set_global_proxy,
+        set_credential_cooldown_policy, set_credential_disabled,
+        set_credential_endpoint_policy,
+        set_credential_overage, set_credential_priority, set_endpoint_policy,
+        set_error_cooldown_policy, get_error_cooldown_policy, set_global_proxy,
         set_load_balancing_mode, set_log_governance_config, set_proxy_enabled, set_update_config,
         social_oauth_callback, start_idc_login, start_idc_relogin, start_social_login,
         start_social_relogin, stats_by_credential, stats_by_model, stats_overview,
@@ -68,6 +70,14 @@ pub fn create_admin_router(state: AdminState) -> Router {
         )
         .route("/credentials/{id}/disabled", post(set_credential_disabled))
         .route("/credentials/{id}/priority", post(set_credential_priority))
+        .route(
+            "/credentials/{id}/endpoint-policy",
+            axum::routing::patch(set_credential_endpoint_policy),
+        )
+        .route(
+            "/credentials/{id}/cooldown-policy",
+            axum::routing::patch(set_credential_cooldown_policy),
+        )
         .route("/credentials/{id}/reset", post(reset_failure_count))
         .route("/credentials/{id}/clear-throttle", post(clear_throttle))
         .route(
@@ -111,6 +121,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/endpoint-policy",
             get(get_endpoint_policy).put(set_endpoint_policy),
+        )
+        .route(
+            "/config/cooldown-policy",
+            get(get_error_cooldown_policy).put(set_error_cooldown_policy),
         )
         .route(
             "/config/compact-threshold",

@@ -30,7 +30,8 @@ use super::types::{
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
     QuotaExceededResult, SetAccountThrottleConfigRequest, SetEndpointPolicyRequest,
-    SetLoadBalancingModeRequest,
+    SetLoadBalancingModeRequest, ErrorCooldownPolicyResponse, SetErrorCooldownPolicyRequest,
+    SetCredentialEndpointPolicyRequest, SetCredentialCooldownPolicyRequest,
     SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
     StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
     UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -2036,6 +2037,93 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
 
         Ok(self.get_account_throttle_config())
+    }
+
+    /// 读取全局错误冷却策略
+    pub fn get_error_cooldown_policy(&self) -> ErrorCooldownPolicyResponse {
+        let p = self.token_manager.get_error_cooldown_policy();
+        ErrorCooldownPolicyResponse {
+            error_window_secs: p.error_window_secs,
+            error_threshold: p.error_threshold,
+            cooldown_secs: p.cooldown_secs,
+            auto_disable_after_trips: p.auto_disable_after_trips,
+            disable_window_secs: p.disable_window_secs,
+        }
+    }
+
+    /// 更新全局错误冷却策略（5 个字段都可选 = 仅改传的）
+    pub fn set_error_cooldown_policy(
+        &self,
+        req: SetErrorCooldownPolicyRequest,
+    ) -> Result<ErrorCooldownPolicyResponse, AdminServiceError> {
+        if req.error_window_secs.is_none()
+            && req.error_threshold.is_none()
+            && req.cooldown_secs.is_none()
+            && req.auto_disable_after_trips.is_none()
+            && req.disable_window_secs.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供一个字段".to_string(),
+            ));
+        }
+        self.token_manager
+            .set_error_cooldown_policy(
+                req.error_window_secs,
+                req.error_threshold,
+                req.cooldown_secs,
+                req.auto_disable_after_trips,
+                req.disable_window_secs,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        Ok(self.get_error_cooldown_policy())
+    }
+
+    /// 设置凭据级端点策略覆盖
+    pub fn set_credential_endpoint_policy(
+        &self,
+        id: u64,
+        req: SetCredentialEndpointPolicyRequest,
+    ) -> Result<(), AdminServiceError> {
+        if req.endpoint.is_none() && req.runtime_fallback.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 endpoint 或 runtimeFallback 一个字段".to_string(),
+            ));
+        }
+        self.token_manager
+            .set_credential_endpoint_policy(id, req.endpoint, req.runtime_fallback)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        Ok(())
+    }
+
+    /// 设置凭据级冷却策略覆盖
+    pub fn set_credential_cooldown_policy(
+        &self,
+        id: u64,
+        req: SetCredentialCooldownPolicyRequest,
+    ) -> Result<(), AdminServiceError> {
+        let nothing = req.error_window_secs.is_none()
+            && req.error_threshold.is_none()
+            && req.cooldown_secs.is_none()
+            && req.auto_disable_after_trips.is_none()
+            && req.disable_window_secs.is_none()
+            && !req.clear_all;
+        if nothing {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供一个字段（或设 clearAll=true 一键重置）".to_string(),
+            ));
+        }
+        self.token_manager
+            .set_credential_cooldown_policy(
+                id,
+                req.error_window_secs,
+                req.error_threshold,
+                req.cooldown_secs,
+                req.auto_disable_after_trips,
+                req.disable_window_secs,
+                req.clear_all,
+            )
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+        Ok(())
     }
 
     /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）

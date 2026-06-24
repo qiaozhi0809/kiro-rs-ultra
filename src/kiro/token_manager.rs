@@ -1084,6 +1084,9 @@ pub struct MultiTokenManager {
     account_throttle_failover: AtomicBool,
     /// 账号级风控冷却时长（秒，运行时可修改）
     account_throttle_cooldown_secs: AtomicU64,
+    /// 错误冷却策略（运行时可修改 + 持久化）。
+    /// 凭据可通过 `cooldown_override` 字段独立覆盖任一子字段。
+    error_cooldown_policy: Mutex<crate::model::config::ErrorCooldownPolicy>,
     /// 最近一次统计持久化时间（用于 debounce）
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
@@ -1330,6 +1333,7 @@ impl MultiTokenManager {
         let runtime_fallback_enabled = config.runtime_fallback_enabled;
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        let error_cooldown_policy = config.error_cooldown_policy.clone();
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1345,6 +1349,7 @@ impl MultiTokenManager {
             runtime_fallback_enabled: AtomicBool::new(runtime_fallback_enabled),
             account_throttle_failover: AtomicBool::new(throttle_failover),
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
+            error_cooldown_policy: Mutex::new(error_cooldown_policy),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             sticky_map: Mutex::new(HashMap::new()),
@@ -2733,7 +2738,7 @@ impl MultiTokenManager {
     /// 每子字段独立 fallback——凭据 `cooldown_override.error_threshold = Some(3)`
     /// 但其他字段未设 → 阈值用 3、其他字段用全局值。
     fn effective_cooldown_policy(&self, id: u64) -> crate::model::config::ErrorCooldownPolicy {
-        let global = self.config.error_cooldown_policy.clone();
+        let global = self.error_cooldown_policy.lock().clone();
         let entries = self.entries.lock();
         let override_opt = entries
             .iter()
@@ -2800,6 +2805,87 @@ impl MultiTokenManager {
         // 立即按新优先级重新选择当前凭据（无论持久化是否成功）
         self.select_highest_priority();
         // 持久化更改
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 更新凭据级端点策略（runtimeFallback / endpoint 字段）。
+    ///
+    /// 每参数三态：`None` = 不修改；`Some(None)` = 重置该字段为"跟随全局"；
+    /// `Some(Some(value))` = 强制设为该值。
+    pub fn set_credential_endpoint_policy(
+        &self,
+        id: u64,
+        endpoint: Option<Option<String>>,
+        runtime_fallback: Option<Option<bool>>,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+            if let Some(ep_change) = endpoint {
+                // 内层 None = 重置；Some(s) = 强制
+                if let Some(ref s) = ep_change {
+                    if s != "ide" && s != "runtime" {
+                        anyhow::bail!("endpoint 必须是 'ide' 或 'runtime'，收到: {}", s);
+                    }
+                }
+                entry.credentials.endpoint = ep_change;
+            }
+            if let Some(fb_change) = runtime_fallback {
+                entry.credentials.runtime_fallback = fb_change;
+            }
+        }
+        self.persist_credentials()?;
+        Ok(())
+    }
+
+    /// 更新凭据级冷却策略覆盖。
+    ///
+    /// `clear_all = true` 时整体清空 override（凭据所有冷却字段都跟随全局）。
+    /// 否则按 PATCH 三态语义：`None` = 不改；`Some(None)` = 重置；
+    /// `Some(Some(v))` = 强制。整个 override 在所有子字段都为 None 时被清空。
+    pub fn set_credential_cooldown_policy(
+        &self,
+        id: u64,
+        error_window_secs: Option<Option<u32>>,
+        error_threshold: Option<Option<u32>>,
+        cooldown_secs: Option<Option<u32>>,
+        auto_disable_after_trips: Option<Option<u32>>,
+        disable_window_secs: Option<Option<u32>>,
+        clear_all: bool,
+    ) -> anyhow::Result<()> {
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries
+                .iter_mut()
+                .find(|e| e.id == id)
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?;
+
+            if clear_all {
+                entry.credentials.cooldown_override = None;
+            } else {
+                let mut current = entry
+                    .credentials
+                    .cooldown_override
+                    .clone()
+                    .unwrap_or_default();
+                if let Some(v) = error_window_secs { current.error_window_secs = v; }
+                if let Some(v) = error_threshold { current.error_threshold = v; }
+                if let Some(v) = cooldown_secs { current.cooldown_secs = v; }
+                if let Some(v) = auto_disable_after_trips { current.auto_disable_after_trips = v; }
+                if let Some(v) = disable_window_secs { current.disable_window_secs = v; }
+                // 全空 = 等价 None，避免无意义的空对象
+                let all_empty = current.error_window_secs.is_none()
+                    && current.error_threshold.is_none()
+                    && current.cooldown_secs.is_none()
+                    && current.auto_disable_after_trips.is_none()
+                    && current.disable_window_secs.is_none();
+                entry.credentials.cooldown_override = if all_empty { None } else { Some(current) };
+            }
+        }
         self.persist_credentials()?;
         Ok(())
     }
@@ -4027,6 +4113,84 @@ impl MultiTokenManager {
         config
             .save()
             .with_context(|| format!("持久化 runtime 降级开关失败: {}", config_path.display()))?;
+        Ok(())
+    }
+
+    /// 获取全局错误冷却策略（Admin API）
+    pub fn get_error_cooldown_policy(&self) -> crate::model::config::ErrorCooldownPolicy {
+        self.error_cooldown_policy.lock().clone()
+    }
+
+    /// 更新全局错误冷却策略（Admin API）。运行时立即生效 + 持久化。
+    /// 每参数 `None` = 不修改；`Some(v)` = 强制覆盖。
+    pub fn set_error_cooldown_policy(
+        &self,
+        error_window_secs: Option<u32>,
+        error_threshold: Option<u32>,
+        cooldown_secs: Option<u32>,
+        auto_disable_after_trips: Option<u32>,
+        disable_window_secs: Option<u32>,
+    ) -> anyhow::Result<crate::model::config::ErrorCooldownPolicy> {
+        let new_policy = {
+            let mut policy = self.error_cooldown_policy.lock();
+            if let Some(v) = error_window_secs {
+                if v == 0 || v > 86400 {
+                    anyhow::bail!("errorWindowSecs 必须在 1..=86400");
+                }
+                policy.error_window_secs = v;
+            }
+            if let Some(v) = error_threshold {
+                if v == 0 {
+                    anyhow::bail!("errorThreshold 不能为 0");
+                }
+                policy.error_threshold = v;
+            }
+            if let Some(v) = cooldown_secs {
+                if v == 0 || v > 86400 {
+                    anyhow::bail!("cooldownSecs 必须在 1..=86400");
+                }
+                policy.cooldown_secs = v;
+            }
+            if let Some(v) = auto_disable_after_trips {
+                if v == 0 {
+                    anyhow::bail!("autoDisableAfterTrips 不能为 0");
+                }
+                policy.auto_disable_after_trips = v;
+            }
+            if let Some(v) = disable_window_secs {
+                if v == 0 || v > 86400 * 7 {
+                    anyhow::bail!("disableWindowSecs 必须在 1..=604800（7 天）");
+                }
+                policy.disable_window_secs = v;
+            }
+            policy.clone()
+        };
+
+        if let Err(err) = self.persist_error_cooldown_policy(&new_policy) {
+            tracing::warn!("错误冷却策略持久化失败（仅当前进程生效）: {}", err);
+        }
+        tracing::info!("错误冷却策略已更新: {:?}", new_policy);
+        Ok(new_policy)
+    }
+
+    fn persist_error_cooldown_policy(
+        &self,
+        policy: &crate::model::config::ErrorCooldownPolicy,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = match self.config.config_path() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，错误冷却策略仅在当前进程生效");
+                return Ok(());
+            }
+        };
+        let mut config = Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        config.error_cooldown_policy = policy.clone();
+        config
+            .save()
+            .with_context(|| format!("持久化错误冷却策略失败: {}", config_path.display()))?;
         Ok(())
     }
 

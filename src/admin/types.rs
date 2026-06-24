@@ -1,7 +1,19 @@
 //! Admin API 类型定义
 
 use crate::admin::proxy_pool::ProxyHealth;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// PATCH 风格三态字段反序列化：
+/// - 字段缺省（key 不存在）→ `None`（不更新）
+/// - 字段值为 `null` → `Some(None)`（重置为"跟随全局"）
+/// - 字段值为具体值 → `Some(Some(value))`（更新到该值）
+fn deserialize_optional_field<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
+}
 
 // ============ 凭据状态 ============
 
@@ -528,6 +540,76 @@ pub struct SetAccountThrottleConfigRequest {
     /// 冷却时长（秒）；缺省表示不修改，1..=86400
     #[serde(default)]
     pub cooldown_secs: Option<u64>,
+}
+
+/// 错误冷却策略响应（全局 GET）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorCooldownPolicyResponse {
+    /// 错误窗口长度（秒）
+    pub error_window_secs: u32,
+    /// 触发冷却的错误次数阈值
+    pub error_threshold: u32,
+    /// 冷却时长（秒）
+    pub cooldown_secs: u32,
+    /// disable_window_secs 内累计触发冷却 N 次后整号 disable
+    pub auto_disable_after_trips: u32,
+    /// 累计触发计数的窗口长度（秒）
+    pub disable_window_secs: u32,
+}
+
+/// 错误冷却策略请求（全局 PUT，所有字段可选）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetErrorCooldownPolicyRequest {
+    #[serde(default)]
+    pub error_window_secs: Option<u32>,
+    #[serde(default)]
+    pub error_threshold: Option<u32>,
+    #[serde(default)]
+    pub cooldown_secs: Option<u32>,
+    #[serde(default)]
+    pub auto_disable_after_trips: Option<u32>,
+    #[serde(default)]
+    pub disable_window_secs: Option<u32>,
+}
+
+/// 凭据级端点策略 PATCH 请求
+///
+/// 字段双层 Option：外层缺省 = 不更新该字段；内层 None = 重置为"跟随全局"。
+/// 示例：`{"endpoint": "ide", "runtimeFallback": null}` → 钉死 ide 起点 +
+/// 重置 fallback 为跟随全局；`{"endpoint": null}` → 重置 endpoint 为跟随全局。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialEndpointPolicyRequest {
+    /// 凭据级首选端点；缺省 = 不更新；`null` = 重置为跟随全局
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub endpoint: Option<Option<String>>,
+    /// 凭据级 fallback 开关；缺省 = 不更新；`null` = 重置为跟随全局
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub runtime_fallback: Option<Option<bool>>,
+}
+
+/// 凭据级冷却覆盖 PATCH 请求
+///
+/// 每子字段独立 Option：缺省 = 不更新；显式 `null` = 该子字段重置为跟随全局。
+/// 整个 override 重置请用 PATCH 体 `{"clearAll": true}`。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetCredentialCooldownPolicyRequest {
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub error_window_secs: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub error_threshold: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub cooldown_secs: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub auto_disable_after_trips: Option<Option<u32>>,
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    pub disable_window_secs: Option<Option<u32>>,
+    /// 一键清空整个 override（凭据所有字段都跟随全局）
+    #[serde(default)]
+    pub clear_all: bool,
 }
 
 /// 日志治理配置响应
