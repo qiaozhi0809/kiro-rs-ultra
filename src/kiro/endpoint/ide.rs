@@ -115,7 +115,7 @@ impl KiroEndpoint for IdeEndpoint {
     }
 
     fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
-        inject_profile_arn(body, ctx.credentials.streaming_profile_arn().as_deref())
+        inject_profile_arn(body, ctx.credentials.effective_profile_arn())
     }
 }
 
