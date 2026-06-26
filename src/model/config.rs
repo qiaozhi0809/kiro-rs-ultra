@@ -279,6 +279,18 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 空响应自动重试次数（仅 buffered 流式路径生效）。
+    ///
+    /// 上游 Kiro 在大上下文下会偶发返回"空响应流"——零 output、无 content 块、
+    /// stop_reason 兜底成 `end_turn`。客户端（如 Claude Code）见 `end_turn` 即停，
+    /// 用户被迫手动"继续"。buffered 路径在把事件吐给客户端前已全缓冲，可在检测到
+    /// 纯空响应时透明地重发上游、丢弃空结果，客户端无感知。
+    ///
+    /// `max_tokens` / `model_context_window_exceeded` 是合法终止，绝不重试。
+    /// 默认 2；设 0 关闭该兜底。
+    #[serde(default = "default_empty_response_retries")]
+    pub empty_response_retries: u32,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -374,6 +386,10 @@ fn default_context_compact_threshold() -> f32 {
     0.95
 }
 
+fn default_empty_response_retries() -> u32 {
+    2
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -415,6 +431,7 @@ impl Default for Config {
             error_cooldown_policy: ErrorCooldownPolicy::default(),
             context_compact_threshold_default: default_context_compact_threshold(),
             endpoints: HashMap::new(),
+            empty_response_retries: default_empty_response_retries(),
             config_path: None,
         }
     }
@@ -478,5 +495,25 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_response_retries_defaults_to_2() {
+        // 默认结构体与"配置缺省该字段"两条路径都应得到默认值 2。
+        assert_eq!(Config::default().empty_response_retries, 2);
+        let c: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(c.empty_response_retries, 2);
+    }
+
+    #[test]
+    fn empty_response_retries_zero_disables() {
+        // 显式 0 表示关闭兜底，必须原样读出（不被默认值覆盖）。
+        let c: Config = serde_json::from_str(r#"{"emptyResponseRetries":0}"#).unwrap();
+        assert_eq!(c.empty_response_retries, 0);
     }
 }

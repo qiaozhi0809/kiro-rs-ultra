@@ -1717,8 +1717,23 @@ async fn handle_stream_request_buffered(
         (provider.token_manager().resolve_compact_threshold(group.as_deref()) * 100.0) as f64,
     );
 
+    // 空响应自动重试次数（0 = 关闭）。大上下文下上游偶发空响应流，buffered 路径
+    // 在吐给客户端前已全缓冲，可透明重发上游、丢弃空结果，客户端无感知。
+    let max_empty_retries = provider.token_manager().config().empty_response_retries;
+
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer, slot);
+    let stream = create_buffered_sse_stream(
+        response,
+        ctx,
+        hook,
+        credential_id,
+        tracer,
+        slot,
+        provider.clone(),
+        request_body.to_string(),
+        group.clone(),
+        max_empty_retries,
+    );
 
     // 返回 SSE 响应
     Response::builder()
@@ -1735,8 +1750,9 @@ async fn handle_stream_request_buffered(
 /// 工作流程：
 /// 1. 等待上游流完成，期间只发送 ping 保活信号
 /// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
-/// 3. 流结束后，用正确的 input_tokens 更正 message_start 事件
-/// 4. 一次性发送所有事件
+/// 3. 流结束后，若是"纯空响应"且仍有重试次数，则透明重发上游（客户端无感知）
+/// 4. 否则用正确的 input_tokens 更正 message_start 事件，一次性发送所有事件
+#[allow(clippy::too_many_arguments)]
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
@@ -1744,6 +1760,10 @@ fn create_buffered_sse_stream(
     credential_id: u64,
     tracer: std::sync::Arc<RequestTracer>,
     _slot: Option<crate::kiro::token_manager::ConcurrencySlot>,
+    provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
+    request_body: String,
+    group: Option<String>,
+    max_empty_retries: u32,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1759,8 +1779,13 @@ fn create_buffered_sse_stream(
             tracer,
             0u64,
             _slot,
+            provider,
+            request_body,
+            group,
+            max_empty_retries,
+            0u32, // empty_retry_count：已用空响应重试次数
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes, _slot)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, mut credential_id, tracer, mut sent_bytes, mut _slot, provider, request_body, group, max_empty_retries, mut empty_retry_count)| async move {
             if finished {
                 return None;
             }
@@ -1775,7 +1800,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, _slot)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count)));
                     }
 
                     // 然后处理数据流
@@ -1828,9 +1853,49 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count)));
                             }
                             None => {
+                                // 流结束。先判定是否为"纯空响应"——上游零输出、无 tool_use、
+                                // 无显式 stop_reason override（max_tokens / context_window 都算合法终止）。
+                                // 若是且仍有重试额度，则透明重发上游：重置缓冲、换新流，客户端无感知。
+                                if max_empty_retries > 0
+                                    && empty_retry_count < max_empty_retries
+                                    && ctx.is_empty_response()
+                                {
+                                    match provider
+                                        .call_api_stream(&request_body, Some(tracer.as_ref()), group.as_deref())
+                                        .await
+                                    {
+                                        Ok(retry_result) => {
+                                            empty_retry_count += 1;
+                                            tracing::warn!(
+                                                "检测到上游空响应，透明重试 {}/{}（凭据 #{} → #{}）",
+                                                empty_retry_count,
+                                                max_empty_retries,
+                                                credential_id,
+                                                retry_result.credential_id,
+                                            );
+                                            // 换新凭据 / 释放旧并发槽（旧 _slot 被覆盖即 drop）。
+                                            credential_id = retry_result.credential_id;
+                                            _slot = retry_result._slot;
+                                            body_stream = retry_result.response.bytes_stream();
+                                            decoder = EventStreamDecoder::new();
+                                            ctx.reset_for_retry();
+                                            sent_bytes = 0;
+                                            // 继续 loop 消费新流；不发任何终止事件，客户端仍在等。
+                                            continue;
+                                        }
+                                        Err(e) => {
+                                            // 重试调用本身失败：不卡死，降级为发出当前（空）结果。
+                                            tracing::warn!(
+                                                "空响应重试调用失败，降级返回空结果: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
@@ -1852,7 +1917,7 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count)));
                             }
                         }
                     }

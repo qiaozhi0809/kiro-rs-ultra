@@ -876,6 +876,18 @@ impl SseStateManager {
         }
     }
 
+    /// 是否设置过显式 stop_reason override（max_tokens / model_context_window_exceeded 等）。
+    ///
+    /// 用于空响应判定：有 override 即为上游合法终止，绝不能当空响应重试。
+    pub fn has_explicit_stop_reason(&self) -> bool {
+        self.stop_reason.is_some()
+    }
+
+    /// 本轮是否出现过 tool_use。
+    pub fn has_tool_use(&self) -> bool {
+        self.has_tool_use
+    }
+
     /// 处理 message_start 事件
     pub fn handle_message_start(&mut self, event: serde_json::Value) -> Option<SseEvent> {
         if self.message_started {
@@ -2178,6 +2190,20 @@ pub struct BufferedStreamContext {
     event_buffer: Vec<SseEvent>,
     /// 是否已经生成了初始事件
     initial_events_generated: bool,
+    /// 重建 inner 所需的原始构造参数（透明重试时用同一份参数重置）。
+    rebuild: BufferedRebuildParams,
+}
+
+/// `BufferedStreamContext` 透明重试时重建内部 `StreamContext` 所需的原始参数快照。
+#[derive(Clone)]
+struct BufferedRebuildParams {
+    model: String,
+    estimated_input_tokens: i32,
+    thinking_enabled: bool,
+    tool_name_map: HashMap<String, String>,
+    known_tool_names: std::collections::HashSet<String>,
+    cache_usage: super::cache_metering::CacheUsage,
+    compact_threshold_pct: f64,
 }
 
 impl BufferedStreamContext {
@@ -2189,6 +2215,16 @@ impl BufferedStreamContext {
         tool_name_map: HashMap<String, String>,
         known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
+        let model = model.into();
+        let rebuild = BufferedRebuildParams {
+            model: model.clone(),
+            estimated_input_tokens,
+            thinking_enabled,
+            tool_name_map: tool_name_map.clone(),
+            known_tool_names: known_tool_names.clone(),
+            cache_usage: super::cache_metering::CacheUsage::default(),
+            compact_threshold_pct: 100.0,
+        };
         let inner = StreamContext::new_with_thinking(
             model,
             estimated_input_tokens,
@@ -2200,17 +2236,40 @@ impl BufferedStreamContext {
             inner,
             event_buffer: Vec::new(),
             initial_events_generated: false,
+            rebuild,
         }
     }
 
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
     pub fn set_cache_usage(&mut self, cache_usage: super::cache_metering::CacheUsage) {
+        self.rebuild.cache_usage = cache_usage.clone();
         self.inner.cache_usage = cache_usage;
     }
 
     /// 设置 compact 阈值（百分比，0-100），透传给内部 StreamContext。
     pub fn set_compact_threshold_pct(&mut self, pct: f64) {
+        self.rebuild.compact_threshold_pct = pct;
         self.inner.compact_threshold_pct = pct;
+    }
+
+    /// 透明重试前重置：清空缓冲、用原始构造参数重建一个全新的内部 StreamContext。
+    ///
+    /// 仅在 [`is_empty_response`](Self::is_empty_response) 为真、决定重发上游时调用。
+    /// 重建后 output_tokens / 内容块 / stop_reason 等全部归零，等价于一次全新请求的
+    /// 处理状态；保留的只有 model / input_tokens / tool 表 / cache / 阈值这些请求级配置。
+    pub fn reset_for_retry(&mut self) {
+        let mut inner = StreamContext::new_with_thinking(
+            self.rebuild.model.clone(),
+            self.rebuild.estimated_input_tokens,
+            self.rebuild.thinking_enabled,
+            self.rebuild.tool_name_map.clone(),
+            self.rebuild.known_tool_names.clone(),
+        );
+        inner.cache_usage = self.rebuild.cache_usage.clone();
+        inner.compact_threshold_pct = self.rebuild.compact_threshold_pct;
+        self.inner = inner;
+        self.event_buffer.clear();
+        self.initial_events_generated = false;
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -2278,6 +2337,22 @@ impl BufferedStreamContext {
             read,
             self.inner.credits,
         )
+    }
+
+    /// 判定本轮上游响应是否为"纯空响应"——即应触发透明重试的形态。
+    ///
+    /// 仅当三者同时成立才为真：
+    /// - `output_tokens == 0`（模型零输出）
+    /// - 没有 tool_use（否则 stop_reason=tool_use，是合法终止）
+    /// - 没有任何显式 stop_reason override（max_tokens / model_context_window_exceeded
+    ///   都是上游合法终止，绝不能重试）
+    ///
+    /// 即只捕获那种 stop_reason 会兜底成裸 `end_turn` 的空响应（生产实测：大上下文
+    /// 偶发，客户端见 end_turn 即停、用户被迫手动"继续"）。
+    pub fn is_empty_response(&self) -> bool {
+        self.inner.output_tokens == 0
+            && !self.inner.state_manager.has_tool_use()
+            && !self.inner.state_manager.has_explicit_stop_reason()
     }
 }
 
@@ -4158,5 +4233,110 @@ mod tests {
                 && e.data["content_block"]["type"] == "redacted_thinking"
                 && e.data["content_block"]["data"] == "encrypted-thinking"
         }));
+    }
+
+    // ---- is_empty_response: 空响应自动重试兜底的判定核心 ----
+
+    fn empty_ctx() -> BufferedStreamContext {
+        BufferedStreamContext::new(
+            "test-model",
+            100,
+            false,
+            std::collections::HashMap::new(),
+            std::collections::HashSet::new(),
+        )
+    }
+
+    fn assistant_event(content: &str) -> crate::kiro::model::events::Event {
+        // AssistantResponseEvent 的 extra 是私有字段，测试只能走反序列化构造。
+        let resp: crate::kiro::model::events::AssistantResponseEvent =
+            serde_json::from_value(serde_json::json!({ "content": content })).unwrap();
+        crate::kiro::model::events::Event::AssistantResponse(resp)
+    }
+
+    #[test]
+    fn empty_response_pure_blank_is_empty() {
+        // 上游只下发空 assistant 文本（零 output、无块、stop_reason 兜底 end_turn）：
+        // 这正是被迫"继续"的空响应形态，必须判定为空 → 触发重试。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&assistant_event(""));
+        assert!(ctx.is_empty_response());
+    }
+
+    #[test]
+    fn empty_response_no_events_is_empty() {
+        // 上游连一个事件都没下发就 EOF：同样是空响应。
+        let ctx = empty_ctx();
+        assert!(ctx.is_empty_response());
+    }
+
+    #[test]
+    fn empty_response_with_text_is_not_empty() {
+        // 有真实文本输出 → 非空，绝不能重试（会重复扣费 + 二次输出）。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&assistant_event("hello world"));
+        assert!(!ctx.is_empty_response());
+    }
+
+    #[test]
+    fn empty_response_content_length_exceeded_is_not_empty() {
+        // ContentLengthExceededException → stop_reason=max_tokens，是合法终止，
+        // 即便零文本也绝不能重试。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&crate::kiro::model::events::Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        });
+        assert!(!ctx.is_empty_response());
+    }
+
+    #[test]
+    fn empty_response_with_tool_use_is_not_empty() {
+        // 有 tool_use（stop_reason=tool_use）→ 合法终止，不重试。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&crate::kiro::model::events::Event::ToolUse(
+            crate::kiro::model::events::ToolUseEvent {
+                name: "exec_command".to_string(),
+                tool_use_id: "toolu_01".to_string(),
+                input: r#"{"cmd":"ls"}"#.to_string(),
+                stop: true,
+            },
+        ));
+        assert!(!ctx.is_empty_response());
+    }
+
+    // ---- reset_for_retry: 透明重试前重置缓冲与上下文 ----
+
+    #[test]
+    fn reset_for_retry_clears_buffer_and_output() {
+        // 缓冲了一轮（空）响应后重置：event_buffer 必须清空、output_tokens 归零，
+        // 以便用同一份请求重新消费上游、且不污染最终用量。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&assistant_event("partial"));
+        assert!(ctx.final_usage().1 > 0, "前置条件：应有 output");
+
+        ctx.reset_for_retry();
+
+        let events = ctx.finish_and_get_all_events();
+        // 重置后 finish 不应残留上一轮的内容块（只剩重新生成的 message_start/stop 骨架）。
+        assert!(
+            !events.iter().any(|e| e.event == "content_block_delta"),
+            "重置后不应残留上一轮的 content_block_delta，实际: {:?}",
+            events.iter().map(|e| &e.event).collect::<Vec<_>>()
+        );
+        assert_eq!(ctx.final_usage().1, 0, "重置后 output_tokens 应归零");
+    }
+
+    #[test]
+    fn reset_for_retry_restores_empty_detection() {
+        // 重置后若再喂入真实文本，应能正确判为"非空"——证明 inner 是全新的、
+        // 没有沿用上一轮状态。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&assistant_event(""));
+        assert!(ctx.is_empty_response());
+
+        ctx.reset_for_retry();
+        ctx.process_and_buffer(&assistant_event("real answer"));
+        assert!(!ctx.is_empty_response());
     }
 }
