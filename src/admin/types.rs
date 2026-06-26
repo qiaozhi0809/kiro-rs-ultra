@@ -1098,6 +1098,15 @@ pub struct ExportedCredentials {
     pub auth_method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// External IdP token 端点（Microsoft Entra 等，例 `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+    /// External IdP issuer URL（`iss` 字段同源，元数据用途）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer_url: Option<String>,
+    /// External IdP OAuth scope 列表（空格分隔，刷新 token 时必须带上）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
 }
 
 /// 账号导出文件中的单个账号（嵌套 `Account` 结构）

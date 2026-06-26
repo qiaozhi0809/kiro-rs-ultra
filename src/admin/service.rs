@@ -362,24 +362,36 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
             .filter(|s| !s.is_empty())
     }
 
-    // authMethod 规范化："idc" → "IdC"，其余按 social 处理
+    // authMethod 规范化：
+    //   "idc" / "builder-id" / "iam"      → "IdC"
+    //   "external_idp" / "external-idp"   → "external_idp"（保留，否则丢失 Entra 等元数据语义）
+    //   其余（含 "social"）               → "social"
     let auth_method = non_empty(cred.auth_method.clone()).map(|m| {
         if m.eq_ignore_ascii_case("idc")
             || m.eq_ignore_ascii_case("builder-id")
             || m.eq_ignore_ascii_case("iam")
         {
             "IdC".to_string()
+        } else if m.eq_ignore_ascii_case("external_idp") || m.eq_ignore_ascii_case("external-idp") {
+            "external_idp".to_string()
         } else {
             "social".to_string()
         }
     });
     let is_idc = auth_method.as_deref() == Some("IdC");
+    let is_external_idp = auth_method.as_deref() == Some("external_idp");
 
     let provider = non_empty(cred.provider.clone());
     // idp 与 provider 同义；缺失时按认证方式回退到合法的身份提供商
-    let idp = provider
-        .clone()
-        .unwrap_or_else(|| if is_idc { "BuilderId" } else { "Google" }.to_string());
+    let idp = provider.clone().unwrap_or_else(|| {
+        if is_external_idp {
+            "ExternalIdp".to_string()
+        } else if is_idc {
+            "BuilderId".to_string()
+        } else {
+            "Google".to_string()
+        }
+    });
 
     let status = if cred.disabled {
         "unknown".to_string()
@@ -424,6 +436,11 @@ fn credential_to_export_account(cred: KiroCredentials) -> Option<ExportedAccount
         expires_at: expires_at_ms,
         auth_method,
         provider: provider.clone(),
+        // External IdP 元数据：roundtrip 必备。social / idc 通常都为 None，
+        // 序列化时被 skip_serializing_if 略过；external_idp 账号则完整保留
+        token_endpoint: non_empty(cred.token_endpoint.clone()),
+        issuer_url: non_empty(cred.issuer_url.clone()),
+        scopes: non_empty(cred.scopes.clone()),
     };
 
     Some(ExportedAccount {
@@ -3484,6 +3501,63 @@ mod tests {
         cred.auth_method = Some("api_key".to_string());
         // 无 refreshToken → 跳过
         assert!(credential_to_export_account(cred).is_none());
+    }
+
+    #[test]
+    fn export_external_idp_preserves_metadata() {
+        // 回归测试：external_idp 账号导出时必须保留 4 个关键字段，
+        // 否则 roundtrip 导回会被识别成 social 导致刷新失败。
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("rt-entra".to_string());
+        cred.access_token = Some("eyJ.access.token".to_string());
+        cred.auth_method = Some("external_idp".to_string());
+        cred.provider = Some("ExternalIdp".to_string());
+        cred.client_id = Some("482b5fd8-bb62-4a8e-be45-2229f0df6540".to_string());
+        cred.token_endpoint = Some(
+            "https://login.microsoftonline.com/abc-tenant/oauth2/v2.0/token".to_string(),
+        );
+        cred.issuer_url = Some("https://login.microsoftonline.com/abc-tenant/v2.0".to_string());
+        cred.scopes = Some("api://x/codewhisperer:conversations offline_access".to_string());
+        cred.region = Some("us-east-1".to_string());
+        cred.email = Some("entra@example.com".to_string());
+
+        let acc = credential_to_export_account(cred).expect("应生成账号");
+
+        // authMethod 保留为 external_idp（之前 bug 是变 social）
+        assert_eq!(acc.credentials.auth_method.as_deref(), Some("external_idp"));
+        // provider 保留
+        assert_eq!(acc.credentials.provider.as_deref(), Some("ExternalIdp"));
+        // 顶层 idp 也用 ExternalIdp（KAM 1.8.3 要求顶层有 idp 字段）
+        assert_eq!(acc.idp, "ExternalIdp");
+        // 三个新字段都正确填入
+        assert_eq!(
+            acc.credentials.token_endpoint.as_deref(),
+            Some("https://login.microsoftonline.com/abc-tenant/oauth2/v2.0/token")
+        );
+        assert_eq!(
+            acc.credentials.issuer_url.as_deref(),
+            Some("https://login.microsoftonline.com/abc-tenant/v2.0")
+        );
+        assert_eq!(
+            acc.credentials.scopes.as_deref(),
+            Some("api://x/codewhisperer:conversations offline_access")
+        );
+        assert_eq!(acc.credentials.client_id.as_deref(), Some("482b5fd8-bb62-4a8e-be45-2229f0df6540"));
+    }
+
+    #[test]
+    fn export_social_does_not_emit_external_idp_fields() {
+        // 反向回归：纯 social 账号不应该带 tokenEndpoint 等字段（noise）
+        let mut cred = KiroCredentials::default();
+        cred.refresh_token = Some("rt-social".to_string());
+        cred.auth_method = Some("social".to_string());
+        cred.provider = Some("Google".to_string());
+
+        let acc = credential_to_export_account(cred).expect("应生成账号");
+        assert_eq!(acc.credentials.auth_method.as_deref(), Some("social"));
+        assert!(acc.credentials.token_endpoint.is_none());
+        assert!(acc.credentials.issuer_url.is_none());
+        assert!(acc.credentials.scopes.is_none());
     }
 
     #[test]
