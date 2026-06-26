@@ -70,6 +70,78 @@ function normalizeExpiresAt(value: unknown): string | undefined {
   return undefined
 }
 
+/**
+ * 从 accessToken（JWT）的 iss / scp / azp 字段反推 External IdP 元数据。
+ *
+ * 适用场景：KAM 导出 Microsoft Entra 账号时只填了 accessToken / refreshToken / clientId，
+ * 没填 tokenEndpoint / issuerUrl / scopes（KAM 的导出格式缺陷）。这些信息其实都已经
+ * 编码在 accessToken 的 payload 里，本函数无网络解码 JWT、推导出完整元数据。
+ *
+ * 输入：accessToken 字符串（无效 JWT 直接返回 null）
+ * 输出：{ tokenEndpoint, issuerUrl, scopes, clientIdHint } 或 null
+ *
+ * 只支持 Microsoft（iss 含 login.microsoftonline.com）。其它 OIDC 提供商以后可以扩展。
+ */
+function detectEntraFromAccessToken(
+  accessToken: string | undefined,
+): { tokenEndpoint: string; issuerUrl: string; scopes: string; clientIdHint?: string } | null {
+  if (!accessToken) return null
+  const parts = accessToken.split('.')
+  if (parts.length !== 3) return null
+  let payload: Record<string, unknown>
+  try {
+    // Base64URL → Base64 → UTF-8。浏览器 atob 不接 base64url，先替换。
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = b64 + '==='.slice((b64.length + 3) % 4)
+    const json = decodeURIComponent(
+      atob(padded)
+        .split('')
+        .map((c) => '%' + c.charCodeAt(0).toString(16).padStart(2, '0'))
+        .join(''),
+    )
+    payload = JSON.parse(json)
+  } catch {
+    return null
+  }
+  const iss = typeof payload.iss === 'string' ? payload.iss : ''
+  if (!iss.includes('login.microsoftonline.com')) return null
+  // iss 格式：https://login.microsoftonline.com/{tenant}/v2.0 或 .../v1.0
+  // 推导：
+  //   issuerUrl   = iss
+  //   tokenEndpoint = https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token
+  const tenantMatch = iss.match(/login\.microsoftonline\.com\/([^/]+)\//)
+  const tenant = tenantMatch?.[1]
+  if (!tenant) return null
+  const tokenEndpoint = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`
+  // scopes：优先用 JWT 自带的 scp（空格分隔的 scope 列表）；总是追加 offline_access 拿 refresh_token。
+  // azp 是接收方 application ID（公共客户端通常 = aud），可用作 clientId 兜底。
+  const scp = typeof payload.scp === 'string' ? payload.scp.trim() : ''
+  const azp = typeof payload.azp === 'string' ? payload.azp.trim() : ''
+  const aud = typeof payload.aud === 'string' ? payload.aud.trim() : ''
+  // scp 形如 "codewhisperer:conversations codewhisperer:completions"；
+  // 但 token 刷新需要带完整 audience 前缀的 scope（如 "api://{appId}/codewhisperer:conversations"）+ offline_access
+  const appId = azp || aud
+  let fullScopes: string
+  if (scp && appId) {
+    fullScopes =
+      scp
+        .split(/\s+/)
+        .filter(Boolean)
+        .map((s) => (s.includes('://') || s === 'offline_access' ? s : `api://${appId}/${s}`))
+        .join(' ') + ' offline_access'
+  } else if (appId) {
+    fullScopes = `api://${appId}/codewhisperer:conversations api://${appId}/codewhisperer:completions offline_access`
+  } else {
+    fullScopes = 'codewhisperer:conversations codewhisperer:completions offline_access'
+  }
+  return {
+    tokenEndpoint,
+    issuerUrl: iss,
+    scopes: fullScopes,
+    clientIdHint: appId || undefined,
+  }
+}
+
 interface VerificationResult {
   index: number
   status: 'pending' | 'checking' | 'verifying' | 'verified' | 'imported' | 'duplicate' | 'failed' | 'skipped'
@@ -362,13 +434,30 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
         }
         existingTokenHashes.add(tokenHash)
 
-        const clientId = cred.clientId?.trim() || undefined
+        const rawClientId = cred.clientId?.trim() || undefined
         const clientSecret = cred.clientSecret?.trim() || undefined
-        const tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
-        const scopes = cred.scopes?.trim() || undefined
-        const issuerUrl = cred.issuerUrl?.trim() || undefined
-        const rawAuthMethod = cred.authMethod?.trim().toLowerCase()
+        let tokenEndpoint = cred.tokenEndpoint?.trim() || undefined
+        let scopes = cred.scopes?.trim() || undefined
+        let issuerUrl = cred.issuerUrl?.trim() || undefined
+        let rawAuthMethod = cred.authMethod?.trim().toLowerCase()
         const rawProvider = cred.provider?.trim()
+
+        // KAM 导出 Entra 账号时常常丢字段（authMethod=social / provider=Google /
+        // 缺 tokenEndpoint / issuerUrl / scopes），但 accessToken 的 iss 仍然指向
+        // login.microsoftonline.com。这里反解 JWT 自动补齐元数据，把它正确识别为
+        // external_idp，避免掉进 social 路径触发"social 不该带 clientId"的报错。
+        const entra = detectEntraFromAccessToken(cred.accessToken?.trim())
+        let clientId = rawClientId
+        if (entra) {
+          if (!tokenEndpoint) tokenEndpoint = entra.tokenEndpoint
+          if (!issuerUrl) issuerUrl = entra.issuerUrl
+          if (!scopes) scopes = entra.scopes
+          if (!clientId && entra.clientIdHint) clientId = entra.clientIdHint
+          // 强制覆盖 authMethod：KAM 把 Entra 标记成 'social' 是错的
+          if (rawAuthMethod !== 'external_idp' && rawAuthMethod !== 'external-idp') {
+            rawAuthMethod = 'external_idp'
+          }
+        }
 
         // 三路识别认证方式：
         // 1) 显式 authMethod=external_idp / provider=ExternalIdp / 携带 tokenEndpoint
@@ -396,9 +485,14 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
           })
           continue
         }
-        // idc 模式下必须同时提供 clientId 和 clientSecret
+        // social 模式不应携带 clientId / clientSecret（KAM 偶尔会把 Entra 账号
+        // 错标 social 但带 clientId，detectEntraFromAccessToken 已覆盖大多数场景；
+        // 走到这里说明既不是 Entra 也不是 idc，多余字段是数据噪音，明确拒绝）
         if (authMethod === 'social' && (clientId || clientSecret)) {
-          updateResult(i, { status: 'failed', error: 'idc 模式需要同时提供 clientId 和 clientSecret' })
+          updateResult(i, {
+            status: 'failed',
+            error: 'social 模式不应携带 clientId / clientSecret（如果是 idc 请同时提供两者；如果是 External IdP 请补 tokenEndpoint）',
+          })
           continue
         }
 
