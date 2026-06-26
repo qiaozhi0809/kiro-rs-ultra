@@ -965,9 +965,47 @@ async fn handle_stream_request(
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
 
+/// 空响应重试时，单次上游重新调用的硬超时（秒）。
+///
+/// 重试期间 ping 已与重试 future 并发驱动、不会因 await 停发，所以这个超时
+/// 不是为了保活，而是给 failover 风暴兜底：避免极端情况下重试调用长时间挂起
+/// 占用资源。超时后降级为发出当前（空）结果。
+const RETRY_CALL_TIMEOUT_SECS: u64 = 30;
+
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
     Bytes::from("event: ping\ndata: {\"type\": \"ping\"}\n\n")
+}
+
+/// buffered 流收尾：flush 缓冲事件、记 usage/trace（success 口径），返回待发字节。
+///
+/// 抽出复用：正常流结束、以及空响应重试调用失败的降级路径，都走同一套 success 收尾。
+fn finish_buffered_success(
+    ctx: &mut BufferedStreamContext,
+    hook: &UsageRecordHook,
+    credential_id: u64,
+    tracer: &RequestTracer,
+) -> Vec<Result<Bytes, Infallible>> {
+    let all_events = ctx.finish_and_get_all_events();
+    let (i, o, cc, cr, credits) = ctx.final_usage();
+    hook.record(credential_id, i, o, cc, cr, credits, "success");
+    tracer.finalize(
+        "success",
+        None,
+        None,
+        None,
+        TraceUsage {
+            input_tokens: i.max(0) as u64,
+            output_tokens: o.max(0) as u64,
+            cache_creation_tokens: cc.max(0) as u64,
+            cache_read_tokens: cr.max(0) as u64,
+            credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+        },
+    );
+    all_events
+        .into_iter()
+        .map(|e| Ok(Bytes::from(e.to_sse_string())))
+        .collect()
 }
 
 /// 创建 SSE 事件流
@@ -1753,6 +1791,24 @@ async fn handle_stream_request_buffered(
 /// 3. 流结束后，若是"纯空响应"且仍有重试次数，则透明重发上游（客户端无感知）
 /// 4. 否则用正确的 input_tokens 更正 message_start 事件，一次性发送所有事件
 #[allow(clippy::too_many_arguments)]
+/// 空响应重试的"进行中" future 槽。
+///
+/// 存进 unfold 状态、跨闭包调用存活，使得重试上游期间 ping 能与之并发驱动
+/// （await 不再独占闭包）。`'static + Send`：future 自持 provider/request_body/
+/// group/tracer 的克隆，不借用状态里的同名值，避免自引用。
+type PendingRetry = std::pin::Pin<
+    Box<dyn std::future::Future<Output = anyhow::Result<crate::kiro::provider::KiroCallResult>> + Send>,
+>;
+
+/// 创建缓冲 SSE 事件流
+///
+/// 工作流程：
+/// 1. 等待上游流完成，期间只发送 ping 保活信号
+/// 2. 使用 StreamContext 的事件处理逻辑处理所有 Kiro 事件，结果缓存
+/// 3. 流结束后，若是"纯空响应"且仍有重试次数，则透明重发上游（客户端无感知，
+///    重试 future 与 ping 并发驱动，等待期间 ping 不停）
+/// 4. 否则用正确的 input_tokens 更正 message_start 事件，一次性发送所有事件
+#[allow(clippy::too_many_arguments)]
 fn create_buffered_sse_stream(
     response: reqwest::Response,
     ctx: BufferedStreamContext,
@@ -1784,13 +1840,60 @@ fn create_buffered_sse_stream(
             group,
             max_empty_retries,
             0u32, // empty_retry_count：已用空响应重试次数
+            None::<PendingRetry>, // pending_retry：重试进行中的 future
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, mut credential_id, tracer, mut sent_bytes, mut _slot, provider, request_body, group, max_empty_retries, mut empty_retry_count)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, mut credential_id, tracer, mut sent_bytes, mut _slot, provider, request_body, group, max_empty_retries, mut empty_retry_count, mut pending_retry)| async move {
             if finished {
                 return None;
             }
 
             loop {
+                // 重试等待模式：pending_retry 有 future 时，只并发驱动 {ping, 重试 future}，
+                // 不 poll 旧 body_stream（已耗尽）。take 出来避免与流式分支共借 pending_retry。
+                if let Some(mut fut) = pending_retry.take() {
+                    tokio::select! {
+                        biased;
+
+                        // ping 保活：重试还没好，把 future 放回去，下次闭包继续等。
+                        _ = ping_interval.tick() => {
+                            tracing::trace!("发送 ping 保活事件（空响应重试等待中）");
+                            pending_retry = Some(fut);
+                            let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
+                            return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count, pending_retry)));
+                        }
+
+                        // 重试调用完成（pending_retry 已 take 走，保持 None）。
+                        retry_outcome = &mut fut => {
+                            match retry_outcome {
+                                Ok(retry_result) => {
+                                    tracing::warn!(
+                                        "上游空响应重试 {}/{} 完成（凭据 #{} → #{}）",
+                                        empty_retry_count,
+                                        max_empty_retries,
+                                        credential_id,
+                                        retry_result.credential_id,
+                                    );
+                                    // 换新凭据 / 释放旧并发槽（旧 _slot 被覆盖即 drop）。
+                                    credential_id = retry_result.credential_id;
+                                    _slot = retry_result._slot;
+                                    body_stream = retry_result.response.bytes_stream();
+                                    decoder = EventStreamDecoder::new();
+                                    ctx.reset_for_retry();
+                                    sent_bytes = 0;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    // 重试调用失败 / 超时：不卡死，降级为发出当前（空）结果。
+                                    tracing::warn!("空响应重试调用失败，降级返回空结果: {}", e);
+                                    let bytes = finish_buffered_success(&mut ctx, &hook, credential_id, tracer.as_ref());
+                                    return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count, pending_retry)));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 流式模式：并发驱动 {ping, body_stream}。
                 tokio::select! {
                     // 使用 biased 模式，优先检查 ping 定时器
                     // 避免在上游 chunk 密集时 ping 被"饿死"
@@ -1800,7 +1903,7 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count, pending_retry)));
                     }
 
                     // 然后处理数据流
@@ -1853,71 +1956,49 @@ fn create_buffered_sse_stream(
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count, pending_retry)));
                             }
                             None => {
-                                // 流结束。先判定是否为"纯空响应"——上游零输出、无 tool_use、
-                                // 无显式 stop_reason override（max_tokens / context_window 都算合法终止）。
-                                // 若是且仍有重试额度，则透明重发上游：重置缓冲、换新流，客户端无感知。
+                                // 流结束。判定是否为"纯空响应"——上游零输出、无 tool_use、无显式
+                                // stop_reason override（max_tokens / context_window 都算合法终止）。
+                                // 若是且仍有重试额度，则构造重试 future 存入 pending_retry，下一轮
+                                // loop 进入重试等待模式由 select 与 ping 并发驱动，本闭包不在此 await。
                                 if max_empty_retries > 0
                                     && empty_retry_count < max_empty_retries
                                     && ctx.is_empty_response()
                                 {
-                                    match provider
-                                        .call_api_stream(&request_body, Some(tracer.as_ref()), group.as_deref())
+                                    empty_retry_count += 1;
+                                    tracing::warn!(
+                                        "检测到上游空响应，发起透明重试 {}/{}",
+                                        empty_retry_count,
+                                        max_empty_retries,
+                                    );
+                                    // future 自持各依赖的克隆，'static + Send，不借用状态值。
+                                    let provider2 = provider.clone();
+                                    let tracer2 = tracer.clone();
+                                    let body2 = request_body.clone();
+                                    let group2 = group.clone();
+                                    let fut: PendingRetry = Box::pin(async move {
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(RETRY_CALL_TIMEOUT_SECS),
+                                            provider2.call_api_stream(&body2, Some(tracer2.as_ref()), group2.as_deref()),
+                                        )
                                         .await
-                                    {
-                                        Ok(retry_result) => {
-                                            empty_retry_count += 1;
-                                            tracing::warn!(
-                                                "检测到上游空响应，透明重试 {}/{}（凭据 #{} → #{}）",
-                                                empty_retry_count,
-                                                max_empty_retries,
-                                                credential_id,
-                                                retry_result.credential_id,
-                                            );
-                                            // 换新凭据 / 释放旧并发槽（旧 _slot 被覆盖即 drop）。
-                                            credential_id = retry_result.credential_id;
-                                            _slot = retry_result._slot;
-                                            body_stream = retry_result.response.bytes_stream();
-                                            decoder = EventStreamDecoder::new();
-                                            ctx.reset_for_retry();
-                                            sent_bytes = 0;
-                                            // 继续 loop 消费新流；不发任何终止事件，客户端仍在等。
-                                            continue;
+                                        {
+                                            Ok(r) => r,
+                                            Err(_) => Err(anyhow::anyhow!(
+                                                "空响应重试调用超时（{}s）",
+                                                RETRY_CALL_TIMEOUT_SECS
+                                            )),
                                         }
-                                        Err(e) => {
-                                            // 重试调用本身失败：不卡死，降级为发出当前（空）结果。
-                                            tracing::warn!(
-                                                "空响应重试调用失败，降级返回空结果: {}",
-                                                e
-                                            );
-                                        }
-                                    }
+                                    });
+                                    pending_retry = Some(fut);
+                                    continue;
                                 }
 
-                                // 流结束，完成处理并返回所有事件（已更正 input_tokens）
-                                let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, cc, cr, credits) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, credits, "success");
-                                tracer.finalize(
-                                    "success",
-                                    None,
-                                    None,
-                                    None,
-                                    TraceUsage {
-                                        input_tokens: i.max(0) as u64,
-                                        output_tokens: o.max(0) as u64,
-                                        cache_creation_tokens: cc.max(0) as u64,
-                                        cache_read_tokens: cr.max(0) as u64,
-                                        credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
-                                    },
-                                );
-                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
-                                    .into_iter()
-                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
-                                    .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count)));
+                                // 非空响应或重试已用尽：正常收尾，一次性发送所有事件。
+                                let bytes = finish_buffered_success(&mut ctx, &hook, credential_id, tracer.as_ref());
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count, pending_retry)));
                             }
                         }
                     }
