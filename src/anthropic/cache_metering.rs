@@ -4,10 +4,11 @@
 //! 只给 credit 计费量），所以这里在中转层自行模拟"提示词缓存"，复现 Anthropic
 //! 滑动窗口缓存的「最长公共前缀命中」语义：
 //!
-//! - 把 prompt 的稳定前缀按 message 边界切成一条递增前缀段链：
-//!   `[tools+system] → [+msg0] → [+msg1] → ... → [+msg(n-2)]`，每段 hash 是
-//!   「从头累积到该边界」的指纹，token 是该前缀的累计估算。
-//! - 最后一条 message（当前轮新输入）不切段——它是本轮 cache_creation 的尾部。
+//! - 把 prompt 的稳定前缀按 message 边界和显式 `cache_control` block 切成一条
+//!   递增前缀段链：`[tools+system] → [+msg0] → ... → [+cache_control block]`，
+//!   每段 hash 是「从头累积到该边界」的指纹，token 是该前缀的累计估算。
+//! - 最后一条 message（当前轮新输入）默认不切段；但其中显式带 `cache_control`
+//!   的 content block 会被视为客户端声明的稳定前缀断点。
 //! - lookup 取最深命中段 = 最长已缓存前缀 = `cache_read_input_tokens`；其后到
 //!   末段 = `cache_creation_input_tokens`；完全 miss → cache_read = 0。
 //!
@@ -93,8 +94,8 @@ impl CacheUsage {
         let cache_total = cache_total.min(total);
         // 在缓存覆盖部分内部，按 estimate 口径的 read/creation 占比二次拆分。
         let read = if self.cache_covered_est > 0 {
-            ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64)).round()
-                as i32
+            ((cache_total as f64) * (self.cache_read as f64 / self.cache_covered_est as f64))
+                .round() as i32
         } else {
             0
         };
@@ -313,8 +314,9 @@ struct Segment {
 /// （未被任何 cache_control 覆盖）属于真 input，不计入缓存——这正是 `prompt_total_est`
 /// 与 `cache_covered_est` 的差值。
 ///
-/// 没有任何 cache_control 断点时，返回全零的 `CacheUsage`（`split_against_total`
-/// 会把 total 全部计入 input）且不写入。
+/// 没有任何可缓存断点时，返回全零的 `CacheUsage`（`split_against_total`
+/// 会把 total 全部计入 input）且不写入。典型例子是：无 tools/system、只有一条
+/// 当前 user message，且这条 message 里没有显式 `cache_control` block。
 ///
 /// `key_id` 是客户端 Key id，用于会话隔离：前缀哈希会混入一个隔离种子（优先取
 /// 请求 metadata 里的 session，否则退回 key_id），使不同会话 / 不同客户端 Key 的
@@ -340,7 +342,10 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
             .zip(results.iter())
             .enumerate()
             .map(|(i, (s, r))| {
-                format!("[{i}] hash={} cum={} hit={}", s.hash, s.cumulative_tokens, r.hit)
+                format!(
+                    "[{i}] hash={} cum={} hit={}",
+                    s.hash, s.cumulative_tokens, r.hit
+                )
             })
             .collect();
         tracing::debug!(
@@ -374,7 +379,8 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
 /// 从请求体里按顺序提取断点段：tools → system → messages
 ///
 /// 这个顺序与 Anthropic 拼接 prompt 的顺序对齐：tools 在最前，system 次之，
-/// 然后才是 messages。每遇到一个 cache_control 断点就产生一个 Segment。
+/// 然后才是 messages。tools/system 会作为基础前缀段；messages 默认按历史
+/// message 边界切段，显式 `cache_control` content block 也会产生 Segment。
 /// 累计 token 数随处理顺序累加，永远是当前位置的"前缀总量"。
 ///
 /// 返回 `(segments, prompt_total_est)`，其中 `prompt_total_est` 是喂完整个 prompt
@@ -408,6 +414,9 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&digest[..8]);
         let hash = u64::from_be_bytes(buf);
+        if segments.last().is_some_and(|s| s.hash == hash) {
+            return;
+        }
         segments.push(Segment {
             hash,
             cumulative_tokens: cum,
@@ -417,11 +426,13 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
 
     // 前缀链匹配模型（复现 Anthropic 滑动窗口缓存的"最长公共前缀命中"语义）：
     //
-    // 把 prompt 的稳定前缀按 message 边界切成一条**递增前缀段链**：
+    // 把 prompt 的稳定前缀按 message 边界和显式 cache_control block 切成一条
+    // **递增前缀段链**：
     //   [tools+system] → [+msg0] → [+msg1] → ... → [+msg(n-2)]
     // 每个段的 hash 是「从头累积到该边界」的指纹，token 是该前缀的累计估算。
-    // 最后一条 message（当前轮新输入）只喂进哈希算 prompt_total_est，**不切段**
-    // ——它是本轮 cache_creation 的尾部，且不应被当作可复用前缀。
+    // 最后一条 message（当前轮新输入）只喂进哈希算 prompt_total_est，默认不按
+    // message 边界切段；但如果其中某个 content block 显式带 cache_control，
+    // 就认为客户端在声明「到这里为止是稳定前缀」，仍然切一个段。
     //
     // 为什么这样能跨轮命中：历史消息在多轮间逐字节不变，所以 Turn N+1 的
     // [+msg_k] 段 hash 必然等于 Turn N 写入的同一个 [+msg_k] 段。lookup 取最深
@@ -441,7 +452,12 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
         let mut sorted_tools: Vec<&Tool> = tools.iter().collect();
         sorted_tools.sort_by_key(|t| &t.name);
         for t in sorted_tools {
-            feed(&mut hasher, &tool_signature(t), &tool_token_text(t), &mut cum_tokens);
+            feed(
+                &mut hasher,
+                &tool_signature(t),
+                &tool_token_text(t),
+                &mut cum_tokens,
+            );
         }
     }
 
@@ -461,7 +477,12 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
             .position(|s| s.cache_control.is_some())
             .unwrap_or(0);
         for sys in systems.iter().skip(skip_until) {
-            feed(&mut hasher, &system_signature(sys), &sys.text, &mut cum_tokens);
+            feed(
+                &mut hasher,
+                &system_signature(sys),
+                &sys.text,
+                &mut cum_tokens,
+            );
         }
     }
 
@@ -470,7 +491,9 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
         commit(&hasher, cum_tokens, &mut segments, ttl);
     }
 
-    // 3. messages：除最后一条外，每条 message 边界切一个递增前缀段。
+    // 3. messages：除最后一条外，每条 message 边界切一个递增前缀段；
+    // 任意 message 内显式带 cache_control 的 content block 也切段，支持
+    // 「最后一条 user 中：稳定长上下文 block + 当前问题 block」的客户端形态。
     let last_idx = req.messages.len().saturating_sub(1);
     for (idx, msg) in req.messages.iter().enumerate() {
         // role 进哈希（区分 user/assistant 边界），但不计入 token。
@@ -493,7 +516,8 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                         hasher.update(media_type.as_bytes());
                         hasher.update(b"|");
                         hasher.update(data.as_bytes());
-                        let img_tokens = crate::image_resize::estimate_image_tokens(media_type, data);
+                        let img_tokens =
+                            crate::image_resize::estimate_image_tokens(media_type, data);
                         cum_tokens = cum_tokens.saturating_add(img_tokens);
                     } else {
                         feed(
@@ -503,11 +527,14 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
                             &mut cum_tokens,
                         );
                     }
+                    if has_cache_control_value(v) && cum_tokens > 0 {
+                        commit(&hasher, cum_tokens, &mut segments, ttl);
+                    }
                 }
             }
             _ => {}
         }
-        // 最后一条不切段（当前轮新输入，属 cache_creation 尾部）。
+        // 最后一条默认不按 message 边界切段；显式 cache_control block 已在上面切段。
         if idx != last_idx {
             commit(&hasher, cum_tokens, &mut segments, ttl);
         }
@@ -670,6 +697,10 @@ fn image_source_parts(v: &serde_json::Value) -> (&str, &str) {
         .and_then(|x| x.as_str())
         .unwrap_or("");
     (media_type, data)
+}
+
+fn has_cache_control_value(v: &serde_json::Value) -> bool {
+    v.get("cache_control").is_some()
 }
 
 #[cfg(test)]
@@ -845,6 +876,62 @@ mod tests {
         assert_eq!(u.split_against_total(123), (123, 0, 0));
     }
 
+    #[test]
+    fn current_user_cache_control_block_hits_with_dynamic_tail() {
+        // 下游常见形态：同一条当前 user 里同时塞「稳定长上下文」和「当前问题」。
+        // 只要把稳定上下文拆成独立 content block 并打 cache_control，最后一条
+        // message 内部也应产生断点；当前问题 block 留在断点之后，不影响命中。
+        use super::super::types::{Message, MessagesRequest, Metadata};
+        let cache = CacheMeter::new(None);
+        let stable_context = "stable repository context ".repeat(120);
+
+        let make = |question: &str| MessagesRequest {
+            model: "x".to_string(),
+            max_tokens: 8,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "text",
+                        "text": stable_context,
+                        "cache_control": {"type": "ephemeral"}
+                    },
+                    {
+                        "type": "text",
+                        "text": question
+                    }
+                ]),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: Some(Metadata {
+                user_id: Some("user_probe_account__session_same".to_string()),
+            }),
+        };
+
+        let u1 = compute_cache_usage(&cache, &make("question one"), 1);
+        assert!(
+            u1.cache_covered_est > 0,
+            "stable block should create a covered prefix"
+        );
+        assert_eq!(u1.cache_read, 0, "first request cannot read a new prefix");
+        assert!(
+            u1.prompt_total_est > u1.cache_covered_est,
+            "dynamic question tail should remain uncached input"
+        );
+
+        let u2 = compute_cache_usage(&cache, &make("question two"), 1);
+        assert_eq!(
+            u2.cache_read, u1.cache_covered_est,
+            "second request should read the stable block despite a different question tail"
+        );
+        assert_eq!(u2.cache_covered_est, u1.cache_covered_est);
+    }
+
     /// 构造一个普通工具，input_schema 的顶层 key 按给定顺序插入。
     /// 用于验证：无论插入顺序如何，tool_signature 都稳定（BTreeMap 保证）。
     fn build_tool_with_schema_order(insert_required_first: bool) -> super::super::types::Tool {
@@ -880,7 +967,8 @@ mod tests {
     }
 
     #[test]
-    fn compute_cache_usage_tools_hit_regardless_of_schema_order() {        use super::super::types::{CacheControl, Message, MessagesRequest};
+    fn compute_cache_usage_tools_hit_regardless_of_schema_order() {
+        use super::super::types::{CacheControl, Message, MessagesRequest};
 
         let make_req = |insert_required_first: bool| {
             let mut tool = build_tool_with_schema_order(insert_required_first);
@@ -937,7 +1025,9 @@ mod tests {
         }
     }
 
-    fn req_with_messages(messages: Vec<super::super::types::Message>) -> super::super::types::MessagesRequest {
+    fn req_with_messages(
+        messages: Vec<super::super::types::Message>,
+    ) -> super::super::types::MessagesRequest {
         use super::super::types::MessagesRequest;
         MessagesRequest {
             model: "claude-sonnet-4-5-20250929".to_string(),
@@ -1194,9 +1284,18 @@ mod tests {
             model: "claude-opus-4-8".to_string(),
             max_tokens: 64,
             messages: vec![
-                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
-                Message { role: "assistant".into(), content: serde_json::json!([{"type":"text","text":body}]) },
-                Message { role: "user".into(), content: serde_json::json!([{"type":"text","text":body}]) },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "assistant".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
+                Message {
+                    role: "user".into(),
+                    content: serde_json::json!([{"type":"text","text":body}]),
+                },
             ],
             stream: false,
             system: None,
@@ -1273,7 +1372,10 @@ mod tests {
         // 用 image_resize 的同款 PNG 生成器造一张 750×750（≈750 token）的真图。
         let png = make_test_png(750, 750);
         let img_tokens = crate::image_resize::estimate_image_tokens("image/png", &png) as i32;
-        assert!(img_tokens > 100, "前提：测试图应有可观 token，实测 {img_tokens}");
+        assert!(
+            img_tokens > 100,
+            "前提：测试图应有可观 token，实测 {img_tokens}"
+        );
 
         let make = |trailing: &str| MessagesRequest {
             model: "m".to_string(),
@@ -1286,8 +1388,14 @@ mod tests {
                         {"type":"text","text":"describe"}
                     ]),
                 },
-                Message { role: "assistant".to_string(), content: serde_json::json!("a pixel") },
-                Message { role: "user".to_string(), content: serde_json::json!(trailing) },
+                Message {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!("a pixel"),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: serde_json::json!(trailing),
+                },
             ],
             stream: false,
             system: None,
@@ -1305,7 +1413,9 @@ mod tests {
         // 最深历史段至少覆盖到 [含图user] 段，covered 应 ≥ 图片 token（远大于纯文本）。
         assert!(
             u1.cache_covered_est >= img_tokens + text_only - 5,
-            "covered({}) 应含图片 token({})", u1.cache_covered_est, img_tokens
+            "covered({}) 应含图片 token({})",
+            u1.cache_covered_est,
+            img_tokens
         );
         assert_eq!(u1.cache_read, 0);
 
@@ -1313,7 +1423,9 @@ mod tests {
         let u2 = compute_cache_usage(&cache, &make("q2"), 1);
         assert!(
             u2.cache_read >= img_tokens,
-            "含图历史应跨轮命中且 read({}) 含图片 token({})", u2.cache_read, img_tokens
+            "含图历史应跨轮命中且 read({}) 含图片 token({})",
+            u2.cache_read,
+            img_tokens
         );
     }
 
@@ -1329,7 +1441,8 @@ mod tests {
             }
         }
         let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png).unwrap();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
         B64.encode(&buf)
     }
 }
