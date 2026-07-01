@@ -1190,6 +1190,10 @@ fn merge_assistant_messages(
 
     let mut all_tool_uses: Vec<ToolUseEntry> = Vec::new();
     let mut content_parts: Vec<String> = Vec::new();
+    // 客户端在网络抖动重连后可能重放同一轮 assistant 消息，导致连续消息里
+    // 携带相同 tool_use_id；按 id 去重，避免合并后同一条消息内出现重复 id
+    // 被上游 Bedrock 判定为 TOOL_DUPLICATE。
+    let mut seen_tool_use_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for msg in messages {
         let converted = convert_assistant_message(msg, tool_name_map)?;
@@ -1198,7 +1202,11 @@ fn merge_assistant_messages(
             content_parts.push(am.content);
         }
         if let Some(tus) = am.tool_uses {
-            all_tool_uses.extend(tus);
+            for tu in tus {
+                if seen_tool_use_ids.insert(tu.tool_use_id.clone()) {
+                    all_tool_uses.push(tu);
+                }
+            }
         }
     }
 
@@ -2310,6 +2318,34 @@ mod tests {
         let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
+    }
+
+    #[test]
+    fn test_merge_consecutive_assistant_messages_dedups_repeated_tool_use_id() {
+        // 生产实测：客户端网络抖动重连后重放了同一轮 assistant 消息，
+        // 两条连续消息携带相同 tool_use_id，合并前若不去重，上游 Bedrock
+        // 会因同一条消息 content 内出现 duplicate id 返回 400 TOOL_DUPLICATE。
+        use super::super::types::Message as AnthropicMessage;
+
+        let msg1 = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_use", "id": "toolu_dup", "name": "read_file", "input": {"path": "/a.txt"}}
+            ]),
+        };
+        let msg2 = AnthropicMessage {
+            role: "assistant".to_string(),
+            content: serde_json::json!([
+                {"type": "tool_use", "id": "toolu_dup", "name": "read_file", "input": {"path": "/a.txt"}}
+            ]),
+        };
+
+        let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
+        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
+
+        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        assert_eq!(tool_uses.len(), 1, "相同 tool_use_id 应被去重为一条");
+        assert_eq!(tool_uses[0].tool_use_id, "toolu_dup");
     }
 
     #[test]
