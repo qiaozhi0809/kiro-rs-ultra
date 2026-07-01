@@ -32,6 +32,11 @@ const MAX_TTL_SECS: i64 = 3600;
 /// 默认 TTL（5min，ephemeral 默认值）
 const DEFAULT_TTL_SECS: i64 = 5 * 60;
 
+/// 软过期宽限期：条目过期后仍在此窗口内视为命中。
+/// 原理：上游 Anthropic 的 TTL 是滑动窗口（每次命中续期），本地 TTL 过期不代表
+/// 上游也过期了。30 分钟内的"过期"条目大概率在上游仍然存活。
+const GRACE_PERIOD_SECS: i64 = 30 * 60;
+
 /// 单个缓存条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
@@ -161,6 +166,11 @@ impl CacheMeter {
                     entry.last_hit_at = now;
                     true
                 }
+                // 软过期：条目已过期但在宽限期内，上游大概率仍命中
+                Some(entry) if (now - entry.expires_at) < GRACE_PERIOD_SECS => {
+                    entry.last_hit_at = now;
+                    true
+                }
                 _ => false,
             };
             out.push(SegmentResult { hit, tokens: *t });
@@ -244,13 +254,12 @@ impl CacheMeter {
         });
     }
 
-    /// 删除已过期条目（lookup 不命中过期时只是返回 miss，不会顺手清理；
-    /// 这里在后台周期里清一次，避免内存膨胀）。
+    /// 删除已过期条目（超过 grace period 才清理，保留软过期窗口内的条目）。
     pub fn evict_expired(&self) {
         let now = now_secs();
         let mut inner = self.inner.lock();
         let before = inner.entries.len();
-        inner.entries.retain(|_, v| v.expires_at > now);
+        inner.entries.retain(|_, v| (now - v.expires_at) < GRACE_PERIOD_SECS);
         if inner.entries.len() != before {
             inner.dirty = true;
         }
@@ -724,11 +733,11 @@ mod tests {
     fn ttl_expiry_makes_entry_miss() {
         let cache = CacheMeter::new(None);
         cache.record(&[42], &[100], 60);
-        // 手动让条目过期
+        // 手动让条目过期超过 grace period
         {
             let mut inner = cache.inner.lock();
             if let Some(e) = inner.entries.get_mut(&42) {
-                e.expires_at = now_secs() - 1;
+                e.expires_at = now_secs() - GRACE_PERIOD_SECS - 1;
             }
         }
         let r = cache.lookup(&[42], &[100]);
@@ -742,11 +751,40 @@ mod tests {
         {
             let mut inner = cache.inner.lock();
             for (_, v) in inner.entries.iter_mut() {
-                v.expires_at = now_secs() - 1;
+                v.expires_at = now_secs() - GRACE_PERIOD_SECS - 1;
             }
         }
         cache.evict_expired();
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn grace_period_keeps_recently_expired_as_hit() {
+        let cache = CacheMeter::new(None);
+        cache.record(&[99], &[500], 60);
+        // 过期 10 分钟（在 30 分钟 grace period 内）
+        {
+            let mut inner = cache.inner.lock();
+            if let Some(e) = inner.entries.get_mut(&99) {
+                e.expires_at = now_secs() - 600;
+            }
+        }
+        let r = cache.lookup(&[99], &[500]);
+        assert!(r[0].hit, "expired within grace period should still hit");
+    }
+
+    #[test]
+    fn evict_preserves_entries_within_grace_period() {
+        let cache = CacheMeter::new(None);
+        cache.record(&[1, 2], &[5, 5], 60);
+        {
+            let mut inner = cache.inner.lock();
+            for (_, v) in inner.entries.iter_mut() {
+                v.expires_at = now_secs() - 600; // 过期 10 分钟，在 grace 内
+            }
+        }
+        cache.evict_expired();
+        assert_eq!(cache.len(), 2, "entries within grace should be preserved");
     }
 
     #[test]
