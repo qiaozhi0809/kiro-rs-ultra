@@ -204,8 +204,16 @@ const PASSTHROUGH_MODELS: &[&str] = &[
 pub fn map_model(model: &str) -> Option<String> {
     let model_lower = model.to_lowercase();
 
-    if model_lower.contains("sonnet") {
-        if model_lower.contains("sonnet-5") || model_lower.contains("sonnet 5") {
+    if model_lower.contains("fable") {
+        // Fable 5：与 Mythos 5 同底座；目前仅 5 代
+        Some("claude-fable-5".to_string())
+    } else if model_lower.contains("sonnet") {
+        if model_lower.contains("sonnet-5")
+            || model_lower.contains("sonnet5")
+            || model_lower.contains("sonnet.5")
+            || model_lower.contains("sonnet 5")
+        {
+            // 精确匹配 5 代，避免命中 legacy claude-3-5-sonnet / 4-5
             Some("claude-sonnet-5".to_string())
         } else if model_lower.contains("4-8") || model_lower.contains("4.8") {
             Some("claude-sonnet-4.8".to_string())
@@ -252,7 +260,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
                 || mapped == "claude-sonnet-4.8"
                 || mapped == "claude-opus-4.6"
                 || mapped == "claude-opus-4.7"
-                || mapped == "claude-opus-4.8" =>
+                || mapped == "claude-opus-4.8"
+                || mapped == "claude-fable-5" =>
         {
             1_000_000
         }
@@ -348,9 +357,10 @@ fn normalize_effort_for_model(model_id: &str, raw_effort: &str) -> Option<String
 fn model_supports_xhigh_effort(model_id: &str) -> bool {
     let model = model_id.to_ascii_lowercase();
 
-    // Anthropic documents xhigh for Opus 4.7/4.8, Fable 5, and Mythos 5.
+    // Anthropic documents xhigh for Opus 4.7/4.8, Sonnet 5, Fable 5, and Mythos 5.
     if model.contains("opus-4.7")
         || model.contains("opus-4.8")
+        || model.contains("sonnet-5")
         || model.contains("fable-5")
         || model.contains("mythos-5")
         || model.contains("claude-5")
