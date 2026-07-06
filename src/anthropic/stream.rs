@@ -1020,7 +1020,14 @@ impl ToolJsonAccumulator {
 
     /// 流结束时收尾：若仍有从未收到 `stop=true` 的缓冲，说明上游在工具参数
     /// 写到一半时截断，返回 `IncompleteJson`（取字节数最多的那个作代表）。
+    ///
+    /// 例外：**0 字节缓冲**——上游只开了 tool_use 头、一个 delta 都没送就断，
+    /// 这是探测/心跳类调用（如 `zzz_probe`）的正常形态，不是"半截 JSON"，
+    /// 静默丢弃即可，避免把正常心跳误报成 bad_request。
     pub fn finish(&mut self) -> Result<(), ToolJsonAccumulatorError> {
+        // 先清掉所有 0 字节缓冲（上游从未发送任何 delta，视为未开始）
+        self.buffers.retain(|_, (_, input)| !input.is_empty());
+
         if let Some((tool_use_id, (name, input))) = self
             .buffers
             .iter()
@@ -2791,6 +2798,22 @@ mod tests {
         assert!(matches!(err, ToolJsonAccumulatorError::IncompleteJson { .. }));
         // 已取出残留后再 finish() 应成功。
         assert!(acc.finish().is_ok());
+    }
+
+    #[test]
+    fn tool_json_accumulator_empty_buffer_silently_discarded() {
+        // 上游只发了 tool_use 头（name 已知），一个字节的 input delta 都没送就断。
+        // 这是探测类调用（如 zzz_probe）的正常形态，finish() 应静默 Ok，不报 IncompleteJson。
+        let mut acc = ToolJsonAccumulator::new();
+        assert!(
+            acc.push(&tool_evt("t1", "zzz_probe", "", false), &HashMap::new())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            acc.finish().is_ok(),
+            "0 字节缓冲应被视为未开始，静默丢弃"
+        );
     }
 
     #[test]
