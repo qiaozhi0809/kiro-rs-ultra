@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use clap::Parser;
-use kiro::endpoint::{CliEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint};
+use kiro::endpoint::{
+    CliEndpoint, CodewhispererEndpoint, IdeEndpoint, KiroEndpoint, RuntimeEndpoint,
+};
 use kiro::model::credentials::{CredentialsConfig, KiroCredentials};
 use kiro::provider::KiroProvider;
 use kiro::token_manager::MultiTokenManager;
