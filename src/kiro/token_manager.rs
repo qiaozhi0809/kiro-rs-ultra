@@ -740,8 +740,15 @@ pub(crate) async fn list_available_profiles(
         }
 
         let body_text = response.text().await.unwrap_or_default();
+
+        // BuilderId 账号不支持此操作，返回 403 AccessDeniedException，
+        // 属于确定性"无 profile"，不应作为错误冒泡（否则 ensure_profile_arn
+        // 不会标记已尝试，导致每次请求都重复查询）。
+        if status.as_u16() == 403 && body_text.contains("AccessDeniedException") {
+            return Ok(ListAvailableProfilesResponse::default());
+        }
+
         last_error = Some(format!("{} {}", status, body_text));
-        // 403 等错误继续尝试下一个候选端点
     }
 
     // 没有任何端点返回 profile：若至少有一次成功但为空，视为"该账号无 Enterprise profile"
