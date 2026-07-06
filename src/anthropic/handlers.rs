@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request};
+use super::converter::{ConversionError, convert_request_with_mode};
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -817,12 +817,12 @@ pub async fn post_messages(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
             .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -831,6 +831,9 @@ pub async fn post_messages(
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
+                }
+                ConversionError::UnsupportedToolMapping(reason) => {
+                    ("invalid_request_error", format!("工具映射不支持: {}", reason))
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
@@ -1127,10 +1130,30 @@ fn create_sse_stream(
                             Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot)))
                         }
                         None => {
-                            // 流结束，发送最终事件
+                            // 流结束，发送最终事件（generate_final_events 内部会 finish()
+                            // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
-                            record_stream_usage(&hook, &ctx, credential_id, "success");
-                            tracer.finalize("success", None, None, None, stream_trace_usage(&ctx));
+                            if let Some(message) = ctx.tool_json_error_message() {
+                                // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
+                                // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
+                                record_stream_usage(&hook, &ctx, credential_id, "error");
+                                tracer.finalize(
+                                    "error",
+                                    Some(outcome::BAD_REQUEST),
+                                    Some(&message),
+                                    None,
+                                    stream_trace_usage(&ctx),
+                                );
+                            } else {
+                                record_stream_usage(&hook, &ctx, credential_id, "success");
+                                tracer.finalize(
+                                    "success",
+                                    None,
+                                    None,
+                                    None,
+                                    stream_trace_usage(&ctx),
+                                );
+                            }
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1261,9 +1284,10 @@ async fn handle_non_stream_request(
     // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
 
-    // 收集工具调用的增量 JSON
-    let mut tool_json_buffers: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    // 工具调用参数 JSON 累积器：按 tool_use_id 缓冲分片，stop 时整体解析。
+    // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
+    let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
+    let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
 
     for result in decoder.decode_iter() {
         match result {
@@ -1292,39 +1316,15 @@ async fn handle_non_stream_request(
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
-
-                            // 累积工具的 JSON 输入
-                            let buffer = tool_json_buffers
-                                .entry(tool_use.tool_use_id.clone())
-                                .or_insert_with(String::new);
-                            buffer.push_str(&tool_use.input);
-
-                            // 如果是完整的工具调用，添加到列表
-                            if tool_use.stop {
-                                let input: serde_json::Value = if buffer.is_empty() {
-                                    serde_json::json!({})
-                                } else {
-                                    serde_json::from_str(buffer).unwrap_or_else(|e| {
-                                        tracing::warn!(
-                                            "工具输入 JSON 解析失败: {}, tool_use_id: {}",
-                                            e,
-                                            tool_use.tool_use_id
-                                        );
-                                        serde_json::json!({})
-                                    })
-                                };
-
-                                let original_name = tool_name_map
-                                    .get(&tool_use.name)
-                                    .cloned()
-                                    .unwrap_or_else(|| tool_use.name.clone());
-
-                                tool_uses.push(json!({
-                                    "type": "tool_use",
-                                    "id": tool_use.tool_use_id,
-                                    "name": original_name,
-                                    "input": input
-                                }));
+                            match tool_accumulator.push(&tool_use, &tool_name_map) {
+                                Ok(Some(completed)) => {
+                                    tool_uses.push(completed.to_anthropic_block());
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::error!("{}", e);
+                                    tool_json_error = Some(e);
+                                }
                             }
                         }
                         Event::ContextUsage(context_usage) => {
@@ -1366,10 +1366,41 @@ async fn handle_non_stream_request(
         }
     }
 
+    // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
+    // finish() 返回 IncompleteJson。已有错误则保持不变。
+    if tool_json_error.is_none()
+        && let Err(e) = tool_accumulator.finish()
+    {
+        tracing::error!("{}", e);
+        tool_json_error = Some(e);
+    }
+
+    // 工具调用 JSON 半截 / 非法：非流式路径尚未发送任何字节，直接回 502，
+    // 明确暴露上游问题，而不是把无法解析的参数当成完整调用返回。
+    if let Some(err) = tool_json_error {
+        let message = err.message();
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "error",
+            Some(outcome::BAD_REQUEST),
+            Some(&message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("upstream_tool_json_error", message)),
+        )
+            .into_response();
+    }
+
     // 确定 stop_reason
     if has_tool_use && stop_reason == "end_turn" {
         stop_reason = "tool_use".to_string();
     }
+
+    // 剥离混入文本的字面 <tool_use> XML 泄漏（非流式：整段文本已就绪，一次性剥离）。
+    let text_content = crate::kiro::model::events::strip_tool_use_xml_leaks(&text_content);
 
     // 构建响应内容
     let mut content = build_non_stream_content(
@@ -1619,12 +1650,12 @@ pub async fn post_messages_cc(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone(), state.tool_compatibility_mode)
             .await;
     }
 
     // 转换请求
-    let conversion_result = match convert_request(&payload) {
+    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1633,6 +1664,9 @@ pub async fn post_messages_cc(
                 }
                 ConversionError::EmptyMessages => {
                     ("invalid_request_error", "消息列表为空".to_string())
+                }
+                ConversionError::UnsupportedToolMapping(reason) => {
+                    ("invalid_request_error", format!("工具映射不支持: {}", reason))
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
@@ -1995,7 +2029,7 @@ fn create_buffered_sse_stream(
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count, pending_retry)));
                             }
                             None => {
-                                // 流结束。判定是否为"纯空响应"——上游零输出、无 tool_use、无显式
+                                // 流结束。先判定是否为"纯空响应"——上游零输出、无 tool_use、无显式
                                 // stop_reason override（max_tokens / context_window 都算合法终止）。
                                 // 若是且仍有重试额度，则构造重试 future 存入 pending_retry，下一轮
                                 // loop 进入重试等待模式由 select 与 ping 并发驱动，本闭包不在此 await。
@@ -2032,8 +2066,35 @@ fn create_buffered_sse_stream(
                                     continue;
                                 }
 
-                                // 非空响应或重试已用尽：正常收尾，一次性发送所有事件。
-                                let bytes = finish_buffered_success(&mut ctx, &hook, credential_id, tracer.as_ref());
+                                // 非空响应或重试已用尽：正常收尾。整体解析工具入参并
+                                // 一次性发送所有事件；若有半截 / 非法工具调用 JSON，
+                                // ctx.tool_json_error_message() 会返回错误，据此记 error。
+                                let all_events = ctx.finish_and_get_all_events();
+                                let (i, o, cc, cr, credits) = ctx.final_usage();
+                                let trace_usage = TraceUsage {
+                                    input_tokens: i.max(0) as u64,
+                                    output_tokens: o.max(0) as u64,
+                                    cache_creation_tokens: cc.max(0) as u64,
+                                    cache_read_tokens: cr.max(0) as u64,
+                                    credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                };
+                                if let Some(message) = ctx.tool_json_error_message() {
+                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    tracer.finalize(
+                                        "error",
+                                        Some(outcome::BAD_REQUEST),
+                                        Some(&message),
+                                        None,
+                                        trace_usage,
+                                    );
+                                } else {
+                                    hook.record(credential_id, i, o, cc, cr, credits, "success");
+                                    tracer.finalize("success", None, None, None, trace_usage);
+                                }
+                                let bytes: Vec<Result<Bytes, Infallible>> = all_events
+                                    .into_iter()
+                                    .map(|e| Ok(Bytes::from(e.to_sse_string())))
+                                    .collect();
                                 return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes, _slot, provider, request_body, group, max_empty_retries, empty_retry_count, pending_retry)));
                             }
                         }

@@ -84,6 +84,19 @@ impl Default for CacheMode {
     }
 }
 
+/// 工具兼容模式。
+///
+/// - `ClaudeCode`（默认）：把 Claude Code 内置工具（Write/Edit/Bash/Read/Glob/Grep/LS/WebSearch）
+///   的工具名与入参双向适配为 Kiro 内置工具（fs_write/str_replace/... ），并替换为 Kiro 内置 schema。
+/// - `Raw`：保留旧行为，直接透传客户端工具名/schema，用于排障。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolCompatibilityMode {
+    #[default]
+    ClaudeCode,
+    Raw,
+}
+
 /// KNA 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -212,6 +225,11 @@ pub struct Config {
     /// 独立的 `{"type": "thinking", ...}` 内容块,与流式响应行为一致。
     #[serde(default = "default_extract_thinking")]
     pub extract_thinking: bool,
+
+    /// 工具兼容模式。默认 `claude-code`：把 Claude Code 内置工具名/入参双向适配为
+    /// Kiro 内置工具；`raw` 保留旧行为、直接透传客户端工具 schema，用于排障。
+    #[serde(default = "default_tool_compatibility_mode")]
+    pub tool_compatibility_mode: ToolCompatibilityMode,
 
     /// 默认端点名称（凭据未显式指定 endpoint 时使用，默认 "ide"）
     #[serde(default = "default_endpoint")]
@@ -352,6 +370,10 @@ fn default_extract_thinking() -> bool {
     true
 }
 
+fn default_tool_compatibility_mode() -> ToolCompatibilityMode {
+    ToolCompatibilityMode::ClaudeCode
+}
+
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
 }
@@ -421,6 +443,7 @@ impl Default for Config {
             account_throttle_failover: default_account_throttle_failover(),
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             extract_thinking: default_extract_thinking(),
+            tool_compatibility_mode: default_tool_compatibility_mode(),
             default_endpoint: default_endpoint(),
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
