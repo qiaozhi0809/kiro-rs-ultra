@@ -124,6 +124,8 @@ async fn main() {
         endpoints.insert(cli.name().to_string(), Arc::new(cli));
         let runtime = RuntimeEndpoint::new();
         endpoints.insert(runtime.name().to_string(), Arc::new(runtime));
+        let codewhisperer = CodewhispererEndpoint::new();
+        endpoints.insert(codewhisperer.name().to_string(), Arc::new(codewhisperer));
     }
 
     // 校验默认端点存在

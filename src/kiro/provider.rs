@@ -182,11 +182,15 @@ impl KiroProvider {
             .ok_or_else(|| anyhow::anyhow!("未知端点: {}", name))
     }
 
-    /// 端点降级：runtime → ide。
+    /// 端点降级链：runtime → ide → codewhisperer。
     ///
-    /// runtime 与 q (ide) 的上游限流桶独立——runtime 返回 400/403/429 时
-    /// 立即用 ide 端点重发同一请求，大概率能通。
-    /// 仅 runtime 端点有 fallback；ide / cli 返回 None（无降级目标）。
+    /// AWS 后台对 `runtime.{region}.kiro.dev` / `q.{region}.amazonaws.com`
+    /// / `codewhisperer.{region}.amazonaws.com` 三个 host + 服务 target 各自
+    /// **独立限流**——某个桶被击穿时切到下一桶大概率能通。参考 Kiro-Go 三桶策略。
+    ///
+    /// 语义：**错误驱动、逐级下探**。当前桶被 400/403/429 拒后调本函数拿到下一个桶，
+    /// 若下一桶也被拒可递归再调（provider.rs 里循环即可）。
+    /// 链尾（`codewhisperer` / `ide`/`cli` 未开 fallback）返回 `None`。
     ///
     /// 开关读取顺序（凭据级 > 全局）：
     /// 1. `credentials.runtime_fallback = Some(true)` → 强制开（即使全局关）
@@ -203,10 +207,10 @@ impl KiroProvider {
         if !enabled {
             return None;
         }
-        if current == "runtime" {
-            self.endpoints.get("ide").cloned()
-        } else {
-            None
+        match current {
+            "runtime" => self.endpoints.get("ide").cloned(),
+            "ide" => self.endpoints.get("codewhisperer").cloned(),
+            _ => None,
         }
     }
 
@@ -374,11 +378,16 @@ impl KiroProvider {
                 && !endpoint.is_account_throttled(&body)
                 && !endpoint.is_client_validation_error(&body)
             {
-                if let Some(fallback) = self.fallback_endpoint(endpoint_name_mcp, &ctx.credentials) {
+                // 链式端点降级 runtime → ide → codewhisperer
+                let mut cur_name: &str = endpoint_name_mcp;
+                while let Some(fallback) =
+                    self.fallback_endpoint(cur_name, &ctx.credentials)
+                {
+                    let fb_name = fallback.name();
                     tracing::info!(
                         "MCP 端点降级 [{}] → [{}]（凭据 #{}，HTTP {}）",
-                        endpoint_name_mcp,
-                        fallback.name(),
+                        cur_name,
+                        fb_name,
                         ctx.id,
                         status.as_u16()
                     );
@@ -404,12 +413,21 @@ impl KiroProvider {
                         }
                         Ok(fb_resp) => {
                             tracing::warn!(
-                                "MCP 降级端点也失败（HTTP {}），回退常规重试",
+                                "MCP 降级端点 [{}] 也失败（HTTP {}），尝试链上下一桶",
+                                fb_name,
                                 fb_resp.status().as_u16()
                             );
+                            cur_name = fb_name;
+                            continue;
                         }
                         Err(fb_err) => {
-                            tracing::warn!("MCP 降级端点网络错误: {}", fb_err);
+                            tracing::warn!(
+                                "MCP 降级端点 [{}] 网络错误: {}，尝试链上下一桶",
+                                fb_name,
+                                fb_err
+                            );
+                            cur_name = fb_name;
+                            continue;
                         }
                     }
                 }
@@ -637,11 +655,16 @@ impl KiroProvider {
                 && !endpoint.is_account_throttled(&body)
                 && !endpoint.is_client_validation_error(&body)
             {
-                if let Some(fallback) = self.fallback_endpoint(endpoint_name, &ctx.credentials) {
+                // 链式端点降级 runtime → ide → codewhisperer：
+                // 每桶都是 AWS 内部独立限流单元，逐级下探直到成功或链尾。
+                let mut cur_name: &str = endpoint_name;
+                while let Some(fallback) =
+                    self.fallback_endpoint(cur_name, &ctx.credentials)
+                {
                     let fb_name = fallback.name();
                     tracing::info!(
                         "端点降级 [{}] → [{}]（凭据 #{}，HTTP {}）",
-                        endpoint_name,
+                        cur_name,
                         fb_name,
                         ctx.id,
                         status.as_u16()
@@ -684,27 +707,31 @@ impl KiroProvider {
                         }
                         Ok(fb_resp) => {
                             let fb_status = fb_resp.status();
-                            let fb_body = fb_resp.text().await.unwrap_or_default();
+                            let fb_body_text = fb_resp.text().await.unwrap_or_default();
                             tracing::warn!(
-                                "降级端点 [{}] 也失败（HTTP {}），回退常规重试",
+                                "降级端点 [{}] 也失败（HTTP {}），尝试链上下一桶",
                                 fb_name,
                                 fb_status.as_u16()
                             );
                             Self::emit_attempt(
                                 sink, attempt, ctx.id, fb_name, Some(fb_status.as_u16()),
-                                outcome::TRANSIENT, Some(&fb_body), attempt_start,
+                                outcome::TRANSIENT, Some(&fb_body_text), attempt_start,
                             );
+                            cur_name = fb_name;
+                            continue;
                         }
                         Err(fb_err) => {
                             tracing::warn!(
-                                "降级端点 [{}] 网络错误: {}",
+                                "降级端点 [{}] 网络错误: {}，尝试链上下一桶",
                                 fb_name,
                                 fb_err
                             );
+                            cur_name = fb_name;
+                            continue;
                         }
                     }
-                    // fallback 也失败了，继续常规流程（用原始 status/body 走下面的分支）
                 }
+                // fallback 链全部走完仍失败：回退常规流程（换号 / 冷却 / 上报错误）
             }
             // ─── 端点降级结束 ────────────────────────────────────────
 

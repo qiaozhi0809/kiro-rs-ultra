@@ -12,10 +12,12 @@ use crate::kiro::model::credentials::KiroCredentials;
 use crate::model::config::Config;
 
 pub mod cli;
+pub mod codewhisperer;
 pub mod ide;
 pub mod runtime;
 
 pub use cli::CliEndpoint;
+pub use codewhisperer::CodewhispererEndpoint;
 pub use ide::IdeEndpoint;
 pub use runtime::RuntimeEndpoint;
 
