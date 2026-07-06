@@ -3253,7 +3253,12 @@ mod tests {
         };
 
         let messages: Vec<&AnthropicMessage> = vec![&msg1, &msg2];
-        let result = merge_assistant_messages(&messages, &mut HashMap::new()).expect("合并应成功");
+        let result = merge_assistant_messages(
+            &messages,
+            &mut HashMap::new(),
+            ToolCompatibilityMode::ClaudeCode,
+        )
+        .expect("合并应成功");
 
         let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1, "相同 tool_use_id 应被去重为一条");
