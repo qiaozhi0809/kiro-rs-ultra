@@ -1494,7 +1494,23 @@ fn convert_tools(
 }
 
 /// 生成thinking标签前缀
+///
+/// 历史遗留的"伪协议"：把 `<thinking_mode>/<thinking_effort>/<max_thinking_length>`
+/// 塞到 system prompt 里给模型看。真正生效的思考档位是走 API 层
+/// `additionalModelRequestFields.output_config.effort`（见 `kiro.rs`），XML 前缀
+/// 只对**不接受该字段的老模型**做兜底。
+///
+/// 对支持原生 reasoning 的模型（`model_supports_native_reasoning`）**完全跳过**
+/// XML 注入，避免以下泄漏：
+///   1. 与 Claude Code 客户端自带的 `<reasoning_effort>NN</reasoning_effort>`
+///      在 system 里并存，模型被问到时可能吐出 `high` 而非数字；
+///   2. `<thinking_mode>enabled ... max_thinking_length=N` 让模型直接复述
+///      "thinking enabled, budget 20000"。
 fn generate_thinking_prefix(req: &MessagesRequest, model_id: &str) -> Option<String> {
+    // 支持 API 层 output_config 的模型不再注入 XML，杜绝泄漏。
+    if model_supports_native_reasoning(model_id) {
+        return None;
+    }
     if let Some(t) = &req.thinking {
         if t.thinking_type == "enabled" {
             return Some(format!(
@@ -2048,6 +2064,47 @@ mod tests {
             fields.output_config.unwrap().effort,
             "high",
             "opus 4.6 upstream only accepts low/medium/high/max, so xhigh should downgrade"
+        );
+    }
+
+    #[test]
+    fn test_thinking_prefix_skipped_for_native_reasoning_models() {
+        // 支持 API 层 output_config 的模型不应再注入 <thinking_mode>/<thinking_effort>
+        // XML 前缀（防止 system prompt 泄漏 "high"）。
+        for model in [
+            "claude-opus-4.6",
+            "claude-opus-4.7",
+            "claude-opus-4.8",
+            "claude-sonnet-4.6",
+            "claude-sonnet-5",
+            "claude-fable-5",
+        ] {
+            let req_adaptive = minimal_adaptive_thinking_request_with_output_config(model);
+            assert!(
+                generate_thinking_prefix(&req_adaptive, model).is_none(),
+                "{model}: adaptive thinking should NOT inject XML prefix"
+            );
+
+            let mut req_enabled = minimal_thinking_request(model, "enabled");
+            req_enabled.model = model.to_string();
+            assert!(
+                generate_thinking_prefix(&req_enabled, model).is_none(),
+                "{model}: enabled thinking should NOT inject XML prefix"
+            );
+        }
+    }
+
+    #[test]
+    fn test_thinking_prefix_retained_for_legacy_models() {
+        // 不接受 API 层 output_config 的老模型仍保留 XML 兜底，
+        // 否则思考模式会失效。
+        let legacy_model = "claude-sonnet-4-5-20250929";
+        let req = minimal_thinking_request(legacy_model, "enabled");
+        let prefix = generate_thinking_prefix(&req, legacy_model)
+            .expect("legacy model should still receive XML prefix");
+        assert!(
+            prefix.contains("<thinking_mode>enabled</thinking_mode>"),
+            "legacy enabled thinking should keep <thinking_mode> tag, got: {prefix}"
         );
     }
 
