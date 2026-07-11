@@ -467,6 +467,19 @@ fn rest_api_region_candidates(sso_region: &str) -> [&'static str; 2] {
     }
 }
 
+fn usage_limits_url(host: &str, _credentials: &KiroCredentials) -> String {
+    // Kiro 0.9.2 accepts these REST calls without profileArn. A resolved ARN is
+    // only for the streaming endpoint and makes this legacy request malformed.
+    format!(
+        "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true",
+        host
+    )
+}
+
+fn available_models_url(host: &str, _credentials: &KiroCredentials) -> String {
+    format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host)
+}
+
 /// 获取使用额度信息
 pub(crate) async fn get_usage_limits(
     credentials: &KiroCredentials,
@@ -487,12 +500,6 @@ pub(crate) async fn get_usage_limits(
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
-    let profile_arn_query = credentials
-        .effective_profile_arn()
-        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
-        .unwrap_or_default();
-
     // 构建 User-Agent headers
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -505,10 +512,7 @@ pub(crate) async fn get_usage_limits(
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = format!(
-            "https://{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true{}",
-            host, profile_arn_query
-        );
+        let url = usage_limits_url(&host, credentials);
 
         let mut request = client
             .get(&url)
@@ -586,12 +590,6 @@ pub(crate) async fn get_available_models(
     let os_name = &config.system_version;
     let node_version = &config.node_version;
 
-    // profileArn 查询串：仅发送真实 ARN，跳过 BuilderID 占位符
-    let profile_arn_query = credentials
-        .effective_profile_arn()
-        .map(|arn| format!("&profileArn={}", urlencoding::encode(arn)))
-        .unwrap_or_default();
-
     // 构建 User-Agent headers（与 get_usage_limits 保持一致）
     let user_agent = format!(
         "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
@@ -604,10 +602,7 @@ pub(crate) async fn get_available_models(
     let mut last_error: Option<String> = None;
     for (idx, region) in candidates.iter().enumerate() {
         let host = format!("q.{}.amazonaws.com", region);
-        let url = format!(
-            "https://{}/ListAvailableModels?origin=AI_EDITOR{}",
-            host, profile_arn_query
-        );
+        let url = available_models_url(&host, credentials);
 
         let mut request = client
             .get(&url)
@@ -5094,6 +5089,26 @@ mod tests {
         assert_eq!(
             rest_api_region_candidates(sso_region),
             ["us-east-1", "eu-central-1"]
+        );
+    }
+
+    #[test]
+    fn test_usage_rest_urls_omit_resolved_profile_arn() {
+        let credentials = KiroCredentials {
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/REAL123".to_string(),
+            ),
+            ..Default::default()
+        };
+        let host = "q.us-east-1.amazonaws.com";
+
+        assert_eq!(
+            usage_limits_url(host, &credentials),
+            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST&isEmailRequired=true"
+        );
+        assert_eq!(
+            available_models_url(host, &credentials),
+            "https://q.us-east-1.amazonaws.com/ListAvailableModels?origin=AI_EDITOR"
         );
     }
 
