@@ -428,6 +428,25 @@ pub(super) fn map_provider_error_with_context(
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
+    if let Some(rate_limit) = err.downcast_ref::<crate::kiro::error::UpstreamRateLimitError>() {
+        tracing::warn!(error = %err, "上游限流（映射为 429）");
+        let mut response = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "Upstream rate limit exceeded. Retry later.",
+            )),
+        )
+            .into_response();
+        if let Some(value) = rate_limit
+            .retry_after()
+            .and_then(|value| value.parse::<header::HeaderValue>().ok())
+        {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return response;
+    }
+
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -805,7 +824,7 @@ pub async fn post_messages(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens, key_ctx.group.as_deref()).await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
         let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
@@ -1639,7 +1658,7 @@ pub async fn post_messages_cc(
             payload.tools.clone(),
         ) as i32;
 
-        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
+        let resp = websearch::handle_websearch_request(provider, &payload, input_tokens, key_ctx.group.as_deref()).await;
         let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
@@ -2140,6 +2159,18 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn upstream_rate_limit_maps_to_429_with_retry_after() {
+        let err = crate::kiro::error::UpstreamRateLimitError::new(Some("1800".to_string()));
+        let resp = map_provider_error(err.into());
+
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            resp.headers().get(header::RETRY_AFTER).unwrap(),
+            "1800"
+        );
     }
 
     #[test]

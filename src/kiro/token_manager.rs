@@ -533,6 +533,9 @@ pub(crate) async fn get_usage_limits(
         let response = request.send().await?;
 
         let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(crate::kiro::error::UpstreamRateLimitError::from_headers(response.headers()).into());
+        }
         if status.is_success() {
             let data: UsageLimitsResponse = response.json().await?;
             return Ok(data);
@@ -623,6 +626,9 @@ pub(crate) async fn get_available_models(
         let response = request.send().await?;
 
         let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(crate::kiro::error::UpstreamRateLimitError::from_headers(response.headers()).into());
+        }
         if status.is_success() {
             let data: ListAvailableModelsResponse = response.json().await?;
             return Ok(data);
@@ -826,6 +832,9 @@ pub(crate) async fn set_user_preference(
         let response = request.send().await?;
 
         let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(crate::kiro::error::UpstreamRateLimitError::from_headers(response.headers()).into());
+        }
         if status.is_success() {
             return Ok(());
         }
@@ -1510,6 +1519,30 @@ impl MultiTokenManager {
             .lock()
             .iter()
             .filter(|e| !e.disabled && !e.throttled_until.map(|t| t > now).unwrap_or(false))
+            .count()
+    }
+
+    /// 获取当前请求范围内的可用凭据数量。
+    ///
+    /// 与全局 [`Self::available_count`] 不同，这里同时应用模型能力和客户端 Key
+    /// 绑定的分组过滤，供严格隔离场景判断是否还能故障转移。
+    pub fn available_count_for_request(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> usize {
+        let now = Instant::now();
+        self.entries
+            .lock()
+            .iter()
+            .filter(|entry| {
+                !entry.disabled
+                    && !entry
+                        .throttled_until
+                        .map(|until| until > now)
+                        .unwrap_or(false)
+                    && credential_matches_request(&entry.credentials, model, group)
+            })
             .count()
     }
 
@@ -5517,6 +5550,27 @@ mod tests {
         assert!(manager.select_next_credential(None, Some("nope")).is_none());
         // 未绑定分组(None) → 可选到账号
         assert!(manager.select_next_credential(None, None).is_some());
+    }
+
+    #[test]
+    fn test_available_count_for_request_respects_group_throttle() {
+        let mut config = Config::default();
+        config.error_cooldown_policy.error_threshold = 1;
+        config.error_cooldown_policy.cooldown_secs = 60;
+        let manager = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("a", &["g1"]), grouped_cred("b", &["g2"])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.available_count_for_request(None, Some("g1")), 1);
+        // g1 的唯一凭据进入冷却后，即使全局还有 g2，g1 也必须视为无可用账号。
+        assert_eq!(manager.report_account_throttled(1, StdDuration::from_secs(60)), 1);
+        assert_eq!(manager.available_count_for_request(None, Some("g1")), 0);
+        assert_eq!(manager.available_count_for_request(None, Some("g2")), 1);
     }
 
     #[tokio::test]

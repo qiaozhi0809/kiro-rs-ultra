@@ -82,7 +82,7 @@ pub async fn set_credential_disabled(
             let action = if payload.disabled { "禁用" } else { "启用" };
             Json(SuccessResponse::new(format!("凭据 #{} 已{}", id, action))).into_response()
         }
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -99,7 +99,7 @@ pub async fn set_credential_priority(
             id, payload.priority
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -115,7 +115,7 @@ pub async fn reset_failure_count(
             id
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -127,7 +127,7 @@ pub async fn clear_throttle(
 ) -> impl IntoResponse {
     match state.service.clear_throttle(id) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 风控冷却已解除", id))).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -139,7 +139,7 @@ pub async fn clear_concurrency(
 ) -> impl IntoResponse {
     match state.service.clear_concurrency(id) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 并发计数已清零", id))).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -159,7 +159,7 @@ pub async fn get_credential_balance(
         .unwrap_or(false);
     match state.service.get_balance(id, force).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -171,7 +171,7 @@ pub async fn get_credential_models(
 ) -> impl IntoResponse {
     match state.service.get_available_models(id).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -185,7 +185,7 @@ pub async fn test_credential(
 ) -> impl IntoResponse {
     match state.service.test_conversation(id).await {
         Ok(()) => Json(super::types::SuccessResponse::new("测活成功：该凭据可以正常对话")).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -204,7 +204,7 @@ pub async fn warmup_credential(
         .unwrap_or(10);
     match state.service.warmup_credential(id, count).await {
         Ok(result) => Json(result).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -229,7 +229,7 @@ pub async fn set_credential_overage(
             if payload.enabled { "开启" } else { "关闭" }
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -248,7 +248,7 @@ pub async fn add_credential(
 ) -> impl IntoResponse {
     match state.service.add_credential(payload).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -365,7 +365,7 @@ pub async fn delete_credential(
 ) -> impl IntoResponse {
     match state.service.delete_credential(id) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已删除", id))).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -378,7 +378,7 @@ pub async fn update_credential(
 ) -> impl IntoResponse {
     match state.service.update_credential(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 已更新", id))).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -395,7 +395,7 @@ pub async fn update_refresh_token(
             id
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -411,7 +411,7 @@ pub async fn force_refresh_token(
             id
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -424,7 +424,7 @@ pub async fn reset_all_success_count(State(state): State<AdminState>) -> impl In
             count
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -440,7 +440,7 @@ pub async fn reset_success_count(
             id
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -459,7 +459,7 @@ pub async fn add_proxy(
 ) -> impl IntoResponse {
     match state.service.add_proxy(payload.url, payload.label) {
         Ok(entry) => Json(entry).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -486,7 +486,7 @@ pub async fn delete_proxy(
 ) -> impl IntoResponse {
     match state.service.delete_proxy(id) {
         Ok(_) => Json(SuccessResponse::new(format!("代理 #{} 已删除", id))).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -508,7 +508,7 @@ pub async fn set_proxy_enabled(
             if enabled { "启用" } else { "禁用" }
         )))
         .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -521,7 +521,7 @@ pub async fn assign_proxy_to_credential(
 ) -> impl IntoResponse {
     match state.service.assign_proxy_to_credential(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理已更新", id))).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -533,7 +533,7 @@ pub async fn check_proxy(
 ) -> impl IntoResponse {
     match state.service.check_proxy(id).await {
         Ok(resp) => Json(resp).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -554,7 +554,7 @@ pub async fn assign_proxies_round_robin(
         .assign_proxies_round_robin(payload.credential_ids)
     {
         Ok(resp) => Json(resp).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -573,7 +573,7 @@ pub async fn set_load_balancing_mode(
 ) -> impl IntoResponse {
     match state.service.set_load_balancing_mode(payload) {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -589,7 +589,7 @@ pub async fn set_account_throttle_config(
 ) -> impl IntoResponse {
     match state.service.set_account_throttle_config(payload) {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -607,7 +607,7 @@ pub async fn set_endpoint_policy(
 ) -> impl IntoResponse {
     match state.service.set_endpoint_policy(payload) {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -625,7 +625,7 @@ pub async fn set_error_cooldown_policy(
 ) -> impl IntoResponse {
     match state.service.set_error_cooldown_policy(payload) {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -639,7 +639,7 @@ pub async fn set_credential_endpoint_policy(
     match state.service.set_credential_endpoint_policy(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 端点策略已更新", id)))
             .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -653,7 +653,7 @@ pub async fn set_credential_cooldown_policy(
     match state.service.set_credential_cooldown_policy(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 冷却策略已更新", id)))
             .into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -711,7 +711,7 @@ pub async fn set_log_governance_config(
 ) -> impl IntoResponse {
     match state.service.set_log_governance_config(payload) {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -723,7 +723,7 @@ pub async fn start_idc_login(
 ) -> impl IntoResponse {
     match state.service.start_idc_login(payload).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -735,7 +735,7 @@ pub async fn poll_idc_login(
 ) -> impl IntoResponse {
     match state.service.poll_idc_login(&session_id).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -747,7 +747,7 @@ pub async fn start_social_login(
 ) -> impl IntoResponse {
     match state.service.start_social_login(payload).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -759,7 +759,7 @@ pub async fn poll_social_login(
 ) -> impl IntoResponse {
     match state.service.poll_social_login(&session_id).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -784,7 +784,7 @@ pub async fn complete_social_login(
         .await
     {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -888,7 +888,7 @@ pub async fn set_global_proxy(
 ) -> impl IntoResponse {
     match state.service.set_global_proxy(payload.proxy_url) {
         Ok(_) => Json(SuccessResponse::new("全局代理已更新")).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -906,7 +906,7 @@ pub async fn set_update_config(
 ) -> impl IntoResponse {
     match state.service.set_update_config(payload) {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -915,7 +915,7 @@ pub async fn set_update_config(
 pub async fn pull_update_image(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.pull_update_image().await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -924,7 +924,7 @@ pub async fn pull_update_image(State(state): State<AdminState>) -> impl IntoResp
 pub async fn apply_image_update(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.apply_image_update().await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -933,7 +933,7 @@ pub async fn apply_image_update(State(state): State<AdminState>) -> impl IntoRes
 pub async fn rollback_image_update(State(state): State<AdminState>) -> impl IntoResponse {
     match state.service.rollback_image_update().await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -968,7 +968,7 @@ pub async fn start_social_relogin(
 ) -> impl IntoResponse {
     match state.service.start_social_relogin(id, payload).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -980,7 +980,7 @@ pub async fn poll_social_relogin(
 ) -> impl IntoResponse {
     match state.service.poll_social_login(&session_id).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -1003,7 +1003,7 @@ pub async fn complete_social_relogin(
         .await
     {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -1016,7 +1016,7 @@ pub async fn start_idc_relogin(
 ) -> impl IntoResponse {
     match state.service.start_idc_relogin(id, payload).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
@@ -1028,7 +1028,7 @@ pub async fn poll_idc_relogin(
 ) -> impl IntoResponse {
     match state.service.poll_idc_login(&session_id).await {
         Ok(response) => Json(response).into_response(),
-        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+        Err(e) => e.into_http_response(),
     }
 }
 
