@@ -23,13 +23,16 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, macOS, ARM64]
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
 
       # rust-embed 的 #[folder = "admin-ui/dist"] 在编译期要求目录存在。
       # 测试只验证后端逻辑、不需要真实前端产物，建一个空目录即可，避免拉起 bun build。
