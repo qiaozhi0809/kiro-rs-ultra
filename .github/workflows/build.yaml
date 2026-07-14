@@ -1,18 +1,10 @@
 name: Build Artifacts
 
 on:
-  push:
-    branches:
-      - master
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-      - '.gitignore'
-      - '.gitattributes'
-      - 'LICENSE'
-      - 'config.example.json'
-      - '.vscode/**'
-      - '.idea/**'
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
+    branches: [master]
   workflow_dispatch:
     inputs:
       version:
@@ -25,18 +17,22 @@ permissions:
 
 jobs:
   pre-check:
+    # 仅当 Test 工作流成功完成时才进入构建；手动 dispatch 直通
+    if: >-
+      github.event_name != 'workflow_run' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
     steps:
       - uses: actions/checkout@v4
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
         with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
       - name: Check if commit has release tag
         id: check
         run: |
-          if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == refs/heads/* ]] && git tag --points-at HEAD | grep -q '^v'; then
+          if git tag --points-at HEAD | grep -q '^v'; then
             echo "should_build=false" >> $GITHUB_OUTPUT
             echo "::notice::Skipping beta build: commit already has a release tag"
           else
@@ -50,6 +46,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -116,6 +114,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Determine version
         id: version
