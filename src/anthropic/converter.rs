@@ -203,6 +203,9 @@ const PASSTHROUGH_MODELS: &[&str] = &[
     "minimax-m2.1",
     "glm-5",
     "qwen3-coder-next",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
 ];
 
 pub fn map_model(model: &str) -> Option<String> {
@@ -1899,8 +1902,12 @@ mod tests {
             map_model("qwen3-coder-next"),
             Some("qwen3-coder-next".to_string())
         );
+        assert_eq!(map_model("gpt-5.6-sol"), Some("gpt-5.6-sol".to_string()));
+        assert_eq!(map_model("gpt-5.6-terra"), Some("gpt-5.6-terra".to_string()));
+        assert_eq!(map_model("gpt-5.6-luna"), Some("gpt-5.6-luna".to_string()));
         // 大小写不敏感
         assert_eq!(map_model("DeepSeek-3.2"), Some("deepseek-3.2".to_string()));
+        assert_eq!(map_model("GPT-5.6-Sol"), Some("gpt-5.6-sol".to_string()));
     }
 
     #[test]
