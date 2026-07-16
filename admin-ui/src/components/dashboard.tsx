@@ -1213,12 +1213,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           <div className="mx-auto max-w-[1400px] flex h-16 items-center justify-between px-4 md:px-8">
             <div className="flex items-center gap-2.5">
               <img
-                src="/admin/kirors.png"
-                alt="Kiro"
+                src="/admin/claude-code.svg"
+                alt="kirors-ultra"
                 className="h-10 w-10 object-contain"
                 draggable={false}
               />
-              <span className="font-semibold tracking-tight">Kiro Admin</span>
+              <span className="font-semibold tracking-tight">kirors-ultra</span>
             </div>
             <div className="flex items-center gap-1.5">
               <Button

@@ -44,13 +44,13 @@ export function LoginPage({ onLogin }: LoginPageProps) {
         <div className="rounded-2xl border border-border/60 bg-card/80 backdrop-blur-2xl backdrop-saturate-150 shadow-apple-lg p-8">
           <div className="flex flex-col items-center text-center mb-7">
             <img
-              src="/admin/kirors.png"
-              alt="Kiro"
+              src="/admin/claude-code.svg"
+              alt="kirors-ultra"
               className="mb-4 h-20 w-20 object-contain"
               draggable={false}
             />
             <h1 className="text-[22px] font-semibold tracking-tight">
-              Kiro Admin
+              kirors-ultra
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">
               使用登录API密钥登录管理面板

@@ -232,13 +232,13 @@ function HeaderBrand({
   return (
     <div className="flex min-w-0 flex-1 items-center gap-2 xl:gap-3">
       <img
-        src="/admin/kirors.png"
-        alt="Kiro"
+        src="/admin/claude-code.svg"
+        alt="kirors-ultra"
         className="size-8 shrink-0 object-contain xl:size-9"
         draggable={false}
       />
       <span className="min-w-0 truncate text-sm font-semibold tracking-tight min-[380px]:text-base">
-        Kiro Admin
+        kirors-ultra
       </span>
       <DesktopTabs tab={tab} onSwitchTab={onSwitchTab} />
     </div>
