@@ -1238,6 +1238,12 @@ impl AdminService {
             .await
             .map_err(|e| self.classify_add_error(e))?;
 
+        // 自动纠正 apiRegion：KAM 导出的 region 只代表 IdC 签发 region，profile 常在
+        // 别的 region（token=eu-central-1 / profile=us-east-1 是常见分裂）。落库后探测
+        // profile 真实 region 并对齐，避免请求打到错误 runtime.{region} 触发 400。
+        // 失败不影响导入本身。在取余额之前做，确保验活走对 region。
+        self.token_manager.autocorrect_api_region(credential_id).await;
+
         // 主动获取余额（含订阅等级 / 邮箱）并写入缓存，添加后立即可见，
         // 同时避免首次请求时 Free 账号绕过 Opus 模型过滤。
         // 仅验活路径需要；"直接导入"路径跳过以省掉这次上游往返。

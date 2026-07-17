@@ -676,6 +676,12 @@ pub(crate) async fn get_available_models(
 ///
 /// 与 [`get_usage_limits`] 一样仅在 `us-east-1` / `eu-central-1` 提供服务，
 /// 依据凭据 SSO 区域选择主端点，主端点未返回 profile 时回退到另一个端点。
+/// 从 profile ARN 解析 region 段：`arn:aws:codewhisperer:<region>:<acct>:profile/<id>`
+pub(crate) fn profile_arn_region(arn: &str) -> Option<&str> {
+    let parts: Vec<&str> = arn.split(':').collect();
+    parts.get(3).copied().filter(|r| !r.is_empty())
+}
+
 pub(crate) async fn list_available_profiles(
     credentials: &KiroCredentials,
     config: &Config,
@@ -3066,6 +3072,67 @@ impl MultiTokenManager {
         Ok(Some(arn))
     }
 
+    /// 导入后自动纠正 apiRegion。
+    ///
+    /// 背景：KAM 导出的 `region` 只代表 IdC 签发 region（authRegion），profile ARN
+    /// 常在别的 region（如 token 在 eu-central-1、profile 在 us-east-1）。前端 KAM
+    /// 导入把 `region` 同时塞给 authRegion 和 apiRegion，region 分裂的号 apiRegion
+    /// 就错了，请求打到错误的 `runtime.{apiRegion}.kiro.dev` → 400 Improperly formed。
+    ///
+    /// 本方法在落库后探测 profile 真实 region，与当前 apiRegion 不一致则自动改并持久化。
+    /// - 仅对 OAuth（非 API Key）凭据生效。
+    /// - 解析出真实 Enterprise profile ARN → 用其 region。
+    /// - 解析为空（BuilderID 等占位符账号）→ 用占位符 ARN 的 region（us-east-1）。
+    /// 返回 `Some((old, new))` 表示做了纠正，`None` 表示无需改动。
+    pub async fn autocorrect_api_region(&self, id: u64) -> Option<(String, String)> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())?
+        };
+        if credentials.is_api_key_credential() {
+            return None;
+        }
+
+        // 拿有效 token（必要时刷新），失败就放弃纠正（不影响导入本身）
+        let token = match self.try_ensure_token(id, &credentials).await {
+            Ok(ctx) => ctx.token,
+            Err(e) => {
+                tracing::warn!("apiRegion 自动纠正：凭据 #{} 取 token 失败，跳过: {}", id, e);
+                return None;
+            }
+        };
+
+        // 解析真实 profile ARN；解析不到则用占位符（BuilderID 落 us-east-1）
+        let resolved = self.resolve_profile_arn_for(id, &token).await.ok().flatten();
+        let target_region = resolved
+            .as_deref()
+            .and_then(profile_arn_region)
+            .or_else(|| profile_arn_region(crate::kiro::model::credentials::BUILDER_ID_PROFILE_ARN))?
+            .to_string();
+
+        let current = credentials.effective_api_region(&self.config).to_string();
+        if current == target_region {
+            return None;
+        }
+
+        {
+            let mut entries = self.entries.lock();
+            let entry = entries.iter_mut().find(|e| e.id == id)?;
+            entry.credentials.api_region = Some(target_region.clone());
+        }
+        if let Err(e) = self.persist_credentials() {
+            tracing::warn!("apiRegion 自动纠正后持久化失败: {}", e);
+        }
+        tracing::info!(
+            "凭据 #{} apiRegion 自动纠正: {} → {}（对齐 profile 所在 region）",
+            id, current, target_region
+        );
+        Some((current, target_region))
+    }
+
     /// 获取指定凭据的使用额度（Admin API）
     pub async fn get_usage_limits_for(&self, id: u64) -> anyhow::Result<UsageLimitsResponse> {
         let credentials = {
@@ -4429,6 +4496,21 @@ mod tests {
         let mut credentials = KiroCredentials::default();
         credentials.expires_at = Some("2020-01-01T00:00:00Z".to_string());
         assert!(is_token_expired(&credentials));
+    }
+
+    #[test]
+    fn test_profile_arn_region_parse() {
+        assert_eq!(
+            profile_arn_region("arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"),
+            Some("us-east-1")
+        );
+        assert_eq!(
+            profile_arn_region("arn:aws:codewhisperer:eu-central-1:155119901513:profile/ACPYXKUPYE3H"),
+            Some("eu-central-1")
+        );
+        // 缺段 / 空 region → None
+        assert_eq!(profile_arn_region("not-an-arn"), None);
+        assert_eq!(profile_arn_region("arn:aws:codewhisperer::acct:profile/x"), None);
     }
 
     #[test]
