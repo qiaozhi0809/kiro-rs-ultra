@@ -302,6 +302,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           (c.email ?? "").toLowerCase().includes(q),
       );
     }
+    // 禁用号一律沉底：活跃号排前面、禁用号沉到最后。
+    // 稳定排序（仅按 disabled 分区），同状态内保持原有 priority 顺序 →
+    // 不打乱手动拖拽的结果，只是把死号统一挪到末尾，方便一眼看到活号。
+    // 在分页之前排序，确保活跃号集中在前几页而非散落各页。
+    out = out
+      .map((c, i) => [c, i] as const)
+      .sort((a, b) => {
+        const da = a[0].disabled ? 1 : 0;
+        const db = b[0].disabled ? 1 : 0;
+        if (da !== db) return da - db;
+        return a[1] - b[1]; // 同状态内保持稳定（原顺序 = priority 顺序）
+      })
+      .map(([c]) => c);
     return out;
   })();
 
