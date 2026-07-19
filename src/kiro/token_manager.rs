@@ -932,6 +932,8 @@ struct CredentialEntry {
     /// 最近一次预热完成的时刻。用于前端展示「已预热」临时标签（10 分钟内）。
     /// 运行时易失指标，不持久化。
     last_warmup_at: Option<Instant>,
+    /// 凭据级 Token 刷新锁。各号独立，避免全局排队。
+    refresh_lock: Arc<TokioMutex<()>>,
 }
 
 /// 禁用原因
@@ -1093,8 +1095,6 @@ pub struct MultiTokenManager {
     /// 下一个待分配凭据 ID。进程内单调递增，避免删除账号后新账号复用旧 ID，
     /// 从而继承旧账号按 credential_id 聚合的 trace/usage 历史。
     next_id: AtomicU64,
-    /// Token 刷新锁，确保同一时间只有一个刷新操作
-    refresh_lock: TokioMutex<()>,
     /// 凭据文件路径（用于回写）
     credentials_path: Option<PathBuf>,
     /// 凭据文件写入锁。`persist_credentials` 用整文件覆写，并发调用会互相踩踏，
@@ -1312,6 +1312,7 @@ impl MultiTokenManager {
                     total_dispatch: 0,
                     dispatch_times: VecDeque::new(),
                     last_warmup_at: None,
+                    refresh_lock: Arc::new(TokioMutex::new(())),
                 }
             })
             .collect();
@@ -1368,7 +1369,6 @@ impl MultiTokenManager {
             entries: Mutex::new(entries),
             current_id: Mutex::new(initial_id),
             next_id: AtomicU64::new(next_id),
-            refresh_lock: TokioMutex::new(()),
             credentials_path,
             persist_lock: Mutex::new(()),
             is_multiple_format: AtomicBool::new(is_multiple_format),
@@ -1909,8 +1909,15 @@ impl MultiTokenManager {
         let needs_refresh = is_token_expired(credentials) || is_token_expiring_soon(credentials);
 
         let creds = if needs_refresh {
-            // 获取刷新锁，确保同一时间只有一个刷新操作
-            let _guard = self.refresh_lock.lock().await;
+            // 获取该凭据的刷新锁（各号独立，互不阻塞）
+            let per_cred_lock = {
+                let entries = self.entries.lock();
+                entries.iter().find(|e| e.id == id).map(|e| e.refresh_lock.clone())
+            };
+            let _guard = match &per_cred_lock {
+                Some(lock) => lock.lock().await,
+                None => anyhow::bail!("凭据 #{} 不存在", id),
+            };
 
             // 第二次检查：获取锁后重新读取凭据，因为其他请求可能已经完成刷新
             let current_creds = {
@@ -3156,7 +3163,14 @@ impl MultiTokenManager {
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
             if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
+                let per_cred_lock = {
+                    let entries = self.entries.lock();
+                    entries.iter().find(|e| e.id == id).map(|e| e.refresh_lock.clone())
+                };
+                let _guard = match &per_cred_lock {
+                    Some(lock) => lock.lock().await,
+                    None => anyhow::bail!("凭据 #{} 不存在", id),
+                };
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -3316,7 +3330,14 @@ impl MultiTokenManager {
                 .clone()
                 .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
         } else if is_token_expired(&credentials) || is_token_expiring_soon(&credentials) {
-            let _guard = self.refresh_lock.lock().await;
+            let per_cred_lock = {
+                let entries = self.entries.lock();
+                entries.iter().find(|e| e.id == id).map(|e| e.refresh_lock.clone())
+            };
+            let _guard = match &per_cred_lock {
+                Some(lock) => lock.lock().await,
+                None => anyhow::bail!("凭据 #{} 不存在", id),
+            };
             let current_creds = {
                 let entries = self.entries.lock();
                 entries
@@ -3562,7 +3583,14 @@ impl MultiTokenManager {
                 is_token_expired(&credentials) || is_token_expiring_soon(&credentials);
 
             if needs_refresh {
-                let _guard = self.refresh_lock.lock().await;
+                let per_cred_lock = {
+                    let entries = self.entries.lock();
+                    entries.iter().find(|e| e.id == id).map(|e| e.refresh_lock.clone())
+                };
+                let _guard = match &per_cred_lock {
+                    Some(lock) => lock.lock().await,
+                    None => anyhow::bail!("凭据 #{} 不存在", id),
+                };
                 let current_creds = {
                     let entries = self.entries.lock();
                     entries
@@ -3795,6 +3823,7 @@ impl MultiTokenManager {
                 total_dispatch: 0,
                 dispatch_times: VecDeque::new(),
                 last_warmup_at: None,
+                refresh_lock: Arc::new(TokioMutex::new(())),
             });
         }
 
@@ -4086,7 +4115,14 @@ impl MultiTokenManager {
         };
 
         // 获取刷新锁防止并发刷新
-        let _guard = self.refresh_lock.lock().await;
+        let per_cred_lock = {
+            let entries = self.entries.lock();
+            entries.iter().find(|e| e.id == id).map(|e| e.refresh_lock.clone())
+        };
+        let _guard = match &per_cred_lock {
+            Some(lock) => lock.lock().await,
+            None => anyhow::bail!("凭据 #{} 不存在", id),
+        };
 
         // 无条件调用 refresh_token
         let global_proxy = self.proxy.lock().clone();
