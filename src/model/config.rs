@@ -263,6 +263,15 @@ pub struct Config {
     #[serde(default = "default_cache_mode")]
     pub cache_mode_default: CacheMode,
 
+    /// 真实响应缓存全局默认开关（默认关）。同请求命中直接回放、跳过上游调用。
+    /// per-key 可覆盖；关闭时对所有请求零开销跳过。
+    #[serde(default)]
+    pub response_cache_enabled: bool,
+
+    /// 真实响应缓存全局默认 TTL（秒，默认 180）。per-key ttl>0 时覆盖此值。
+    #[serde(default = "default_response_cache_ttl_secs")]
+    pub response_cache_ttl_secs: u64,
+
     /// runtime → ide 自动降级开关（默认 true，= 升级前行为）。
     ///
     /// 关闭后 runtime 起点请求遇错不再降级到 ide，由账号正常重试逻辑接管。
@@ -398,6 +407,10 @@ fn default_cache_mode() -> CacheMode {
     CacheMode::Low
 }
 
+fn default_response_cache_ttl_secs() -> u64 {
+    180
+}
+
 fn default_runtime_fallback_enabled() -> bool {
     true
 }
@@ -450,6 +463,8 @@ impl Default for Config {
             usage_log_retention_days: default_usage_log_retention_days(),
             default_concurrency_limit: default_concurrency_limit(),
             cache_mode_default: default_cache_mode(),
+            response_cache_enabled: false,
+            response_cache_ttl_secs: default_response_cache_ttl_secs(),
             runtime_fallback_enabled: default_runtime_fallback_enabled(),
             error_cooldown_policy: ErrorCooldownPolicy::default(),
             context_compact_threshold_default: default_context_compact_threshold(),

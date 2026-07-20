@@ -42,6 +42,7 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -55,6 +56,7 @@ pub fn create_router(
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
     cache_meter: Option<SharedCacheMeter>,
+    response_cache: Option<super::response_cache::SharedResponseCache>,
     trace_store: Option<SharedTraceStore>,
 ) -> Router {
     let mut state = AppState::new(extract_thinking, tool_compatibility_mode);
@@ -63,6 +65,7 @@ pub fn create_router(
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_cache_meter(cache_meter);
+    state = state.with_response_cache(response_cache);
     state = state.with_trace_store(trace_store);
 
     // 需要认证的 /v1 路由

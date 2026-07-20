@@ -819,7 +819,13 @@ fn process_message_content_dedup(
         _ => {}
     }
 
-    Ok((text_parts.join("\n"), images, tool_results))
+    // 单字段截断:合并后的 message 文本(user / 历史 assistant 纯文本、粘贴大 blob)也可能撑爆单字段限额。
+    let joined = crate::text_truncate::truncate_field(
+        &crate::text_truncate::TextLimitConfig::from_env(),
+        "message.text",
+        text_parts.join("\n"),
+    );
+    Ok((joined, images, tool_results))
 }
 
 /// 从 media_type 获取图片格式
@@ -869,7 +875,7 @@ fn extract_tool_result_content(
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
 ) -> String {
-    match content {
+    let result = match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
@@ -895,7 +901,14 @@ fn extract_tool_result_content(
         }
         Some(v) => v.to_string(),
         None => String::new(),
-    }
+    };
+    // 单字段截断：tool_result.content 是 AWS Q CONTENT_LENGTH_EXCEEDS_THRESHOLD 的头号来源
+    // （读大文件 / 命令大输出 / 粘贴大 blob）。转换期本地截断,早于并发槽,零 failover 成本。
+    crate::text_truncate::truncate_field(
+        &crate::text_truncate::TextLimitConfig::from_env(),
+        "tool_result.text",
+        result,
+    )
 }
 
 /// 验证并过滤 tool_use/tool_result 配对

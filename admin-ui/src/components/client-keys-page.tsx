@@ -7,6 +7,7 @@ import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
 } from '@/components/ui/dropdown-menu'
@@ -64,6 +65,17 @@ export function ClientKeysPage() {
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
+  // 标准计费模式（固定形状 + 超报 read 利润）
+  const [editBilling, setEditBilling] = useState(false)
+  const [editInflation, setEditInflation] = useState('') // 空 = 用默认 0.2
+  const [editPinned, setEditPinned] = useState('') // 空 = 用默认 2
+  // prompt 过滤三开关
+  const [editSimplifyCc, setEditSimplifyCc] = useState(false)
+  const [editStripBoundary, setEditStripBoundary] = useState(false)
+  const [editStripEnv, setEditStripEnv] = useState(false)
+  // 响应缓存
+  const [editRespCache, setEditRespCache] = useState(false)
+  const [editRespCacheTtl, setEditRespCacheTtl] = useState('') // 空 = 跟随全局
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -164,6 +176,14 @@ export function ClientKeysPage() {
     setEditName(item.name)
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
+    setEditBilling(item.anthropicBillingMode ?? false)
+    setEditInflation(item.cacheReadInflation != null ? String(item.cacheReadInflation) : '')
+    setEditPinned(item.cachePinnedInput != null ? String(item.cachePinnedInput) : '')
+    setEditSimplifyCc(item.simplifyCcPrompt ?? false)
+    setEditStripBoundary(item.stripBoundaryMarkers ?? false)
+    setEditStripEnv(item.stripEnvNoise ?? false)
+    setEditRespCache(item.responseCacheEnabled ?? false)
+    setEditRespCacheTtl(item.responseCacheTtlSecs != null ? String(item.responseCacheTtlSecs) : '')
     setEditOpen(true)
   }
 
@@ -171,9 +191,33 @@ export function ClientKeysPage() {
     e.preventDefault()
     if (!editTarget) return
     try {
+      // 超报系数/钉 input：空串表示回默认（后端 clamp）。开启标准模式时才带这两个参数。
+      const inflationNum = editInflation.trim() === '' ? undefined : Number(editInflation)
+      const pinnedNum = editPinned.trim() === '' ? undefined : Number(editPinned)
       await updateKey.mutateAsync({
         id: editTarget.id,
-        req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
+        req: {
+          name: editName.trim(),
+          description: editDesc.trim(),
+          group: editGroup.trim(),
+          anthropicBillingMode: editBilling,
+          cacheReadInflation:
+            editBilling && inflationNum != null && Number.isFinite(inflationNum)
+              ? inflationNum
+              : undefined,
+          cachePinnedInput:
+            editBilling && pinnedNum != null && Number.isFinite(pinnedNum)
+              ? Math.trunc(pinnedNum)
+              : undefined,
+          simplifyCcPrompt: editSimplifyCc,
+          stripBoundaryMarkers: editStripBoundary,
+          stripEnvNoise: editStripEnv,
+          responseCacheEnabled: editRespCache,
+          responseCacheTtlSecs:
+            editRespCache && editRespCacheTtl.trim() !== '' && Number.isFinite(Number(editRespCacheTtl))
+              ? Math.trunc(Number(editRespCacheTtl))
+              : undefined,
+        },
       })
       toast.success('已更新')
       setEditOpen(false)
@@ -484,6 +528,112 @@ export function ClientKeysPage() {
                 绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
               </p>
             </div>
+
+            {/* 标准计费模式（固定形状 + 超报 read 利润） */}
+            <div className="rounded-lg border border-border/60 p-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <label className="text-[13px] font-medium">标准计费模式</label>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">
+                    固定形状（读多写少，像真实 Anthropic）+ 超报 read 出利润。上报量会 &gt; 真实用量。
+                  </p>
+                </div>
+                <Switch
+                  checked={editBilling}
+                  onCheckedChange={setEditBilling}
+                  disabled={updateKey.isPending}
+                />
+              </div>
+              {editBilling && (
+                <div className="mt-3 grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-[11px] text-muted-foreground">read 膨胀系数 p</label>
+                    <Input
+                      type="number"
+                      step="0.05"
+                      min="0"
+                      max="9"
+                      placeholder="默认 0.2 (+20%)"
+                      value={editInflation}
+                      onChange={(e) => setEditInflation(e.target.value)}
+                      disabled={updateKey.isPending}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[11px] text-muted-foreground">钉 input</label>
+                    <Input
+                      type="number"
+                      step="1"
+                      min="1"
+                      placeholder="默认 2"
+                      value={editPinned}
+                      onChange={(e) => setEditPinned(e.target.value)}
+                      disabled={updateKey.isPending}
+                    />
+                  </div>
+                  <p className="col-span-2 text-[11px] text-muted-foreground">
+                    read_final = read0 ×(1+p)。creation 固定占 cacheable 的 3%。留空用默认值。
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* prompt 过滤（省 prefill） */}
+            <div className="rounded-lg border border-border/60 p-3 space-y-2.5">
+              <div>
+                <label className="text-[13px] font-medium">Prompt 过滤</label>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  转换前裁剪客户端 system，省 prefill token。
+                </p>
+              </div>
+              <div className="flex items-center justify-between">
+                <div className="pr-3">
+                  <span className="text-[12px]">简化 Claude Code 提示</span>
+                  <p className="text-[11px] text-muted-foreground">命中 CC 内置 system 时整段换成极小 backend prompt（激进，丢 CC 引导）。</p>
+                </div>
+                <Switch checked={editSimplifyCc} onCheckedChange={setEditSimplifyCc} disabled={updateKey.isPending} />
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-[12px]">删除边界标记行</span>
+                <Switch checked={editStripBoundary} onCheckedChange={setEditStripBoundary} disabled={updateKey.isPending} />
+              </div>
+              <div className="flex items-center justify-between">
+                <div className="pr-3">
+                  <span className="text-[12px]">删除环境噪声</span>
+                  <p className="text-[11px] text-muted-foreground"># Environment / # auto memory 段、gitStatus、cutoff 等行。</p>
+                </div>
+                <Switch checked={editStripEnv} onCheckedChange={setEditStripEnv} disabled={updateKey.isPending} />
+              </div>
+            </div>
+
+            {/* 真实响应缓存 */}
+            <div className="rounded-lg border border-border/60 p-3">
+              <div className="flex items-center justify-between">
+                <div className="pr-3">
+                  <label className="text-[13px] font-medium">响应缓存</label>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">
+                    同请求（同会话/model/messages/tools）命中直接回放，跳过上游。只缓存干净 end_turn 响应。
+                  </p>
+                </div>
+                <Switch checked={editRespCache} onCheckedChange={setEditRespCache} disabled={updateKey.isPending} />
+              </div>
+              {editRespCache && (
+                <div className="mt-3">
+                  <label className="text-[11px] text-muted-foreground">TTL（秒）</label>
+                  <Input
+                    type="number"
+                    step="1"
+                    min="1"
+                    placeholder="默认跟随全局（180）"
+                    value={editRespCacheTtl}
+                    onChange={(e) => setEditRespCacheTtl(e.target.value)}
+                    disabled={updateKey.isPending}
+                  />
+                  <p className="mt-1 text-[11px] text-muted-foreground">留空跟随全局默认。</p>
+                </div>
+              )}
+            </div>
+
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
               <Button type="submit" disabled={updateKey.isPending}>

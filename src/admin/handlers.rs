@@ -1078,6 +1078,14 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         total_cache_read_tokens: k.total_cache_read_tokens,
         group: k.group.clone(),
         is_system: k.is_system,
+        anthropic_billing_mode: k.anthropic_billing_mode,
+        cache_read_inflation: k.cache_read_inflation,
+        cache_pinned_input: k.cache_pinned_input,
+        simplify_cc_prompt: k.simplify_cc_prompt,
+        strip_boundary_markers: k.strip_boundary_markers,
+        strip_env_noise: k.strip_env_noise,
+        response_cache_enabled: k.response_cache_enabled,
+        response_cache_ttl_secs: k.response_cache_ttl_secs,
     }
 }
 
@@ -1172,7 +1180,49 @@ pub async fn update_client_key(
             let t = g.trim();
             if t.is_empty() { None } else { Some(t.to_string()) }
         });
-    if state.client_keys.update_meta(id, payload.name, description, group) {
+    let meta_ok = state.client_keys.update_meta(id, payload.name, description, group);
+    // billing 配置：提供了任一字段就落库。read_inflation/pinned 用外层 Some 包一层表达「设值」，
+    // 内层值即目标（前端传具体数即设，前端可传默认值回填）。开关单独走 billing_mode。
+    let billing_touched = payload.anthropic_billing_mode.is_some()
+        || payload.cache_read_inflation.is_some()
+        || payload.cache_pinned_input.is_some();
+    let billing_ok = if billing_touched {
+        state.client_keys.update_billing(
+            id,
+            payload.anthropic_billing_mode,
+            payload.cache_read_inflation.map(Some),
+            payload.cache_pinned_input.map(Some),
+        )
+    } else {
+        meta_ok
+    };
+    // prompt 过滤三开关：提供了任一就落库。
+    let filters_touched = payload.simplify_cc_prompt.is_some()
+        || payload.strip_boundary_markers.is_some()
+        || payload.strip_env_noise.is_some();
+    let filters_ok = if filters_touched {
+        state.client_keys.update_prompt_filters(
+            id,
+            payload.simplify_cc_prompt,
+            payload.strip_boundary_markers,
+            payload.strip_env_noise,
+        )
+    } else {
+        meta_ok
+    };
+    // 响应缓存 per-key 配置：提供了任一字段就落库。
+    let rc_touched =
+        payload.response_cache_enabled.is_some() || payload.response_cache_ttl_secs.is_some();
+    let rc_ok = if rc_touched {
+        state.client_keys.update_response_cache(
+            id,
+            payload.response_cache_enabled.map(Some),
+            payload.response_cache_ttl_secs.map(Some),
+        )
+    } else {
+        meta_ok
+    };
+    if meta_ok || billing_ok || filters_ok || rc_ok {
         Json(SuccessResponse::new(format!("Key #{} 已更新", id))).into_response()
     } else {
         (

@@ -26,7 +26,7 @@ use crate::kiro::parser::decoder::EventStreamDecoder;
 use crate::kiro::provider::KiroProvider;
 use crate::token;
 
-use super::converter::{ConversionError, convert_request_with_mode, get_context_window_size};
+use super::converter::{ConversionError, get_context_window_size};
 use crate::model::config::ToolCompatibilityMode;
 use super::handlers::{UsageRecordHook, map_provider_error};
 use super::stream::{CompletedToolUse, SseEvent};
@@ -200,7 +200,14 @@ async fn run_round(
     group: Option<&str>,
     tool_compatibility_mode: ToolCompatibilityMode,
 ) -> Result<(RoundOutcome, u64), Response> {
-    let conversion = match convert_request_with_mode(payload, tool_compatibility_mode) {
+    // 整包大小守卫：websearch 轮次也可能累积超上限。克隆本轮快照做截断（原 payload 跨轮累积保持
+    // 完整，每轮各自裁出合规快照）；env 关或未超限时等价一次普通转换。
+    let mut local_payload = payload.clone();
+    let conversion = match super::payload_truncate::convert_within_limit(
+        &mut local_payload,
+        &super::payload_truncate::PayloadLimitConfig::from_env(),
+        tool_compatibility_mode,
+    ) {
         Ok(c) => c,
         Err(e) => {
             let (et, msg) = match &e {

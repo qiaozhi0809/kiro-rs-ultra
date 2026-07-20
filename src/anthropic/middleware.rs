@@ -28,6 +28,22 @@ pub struct KeyContext {
     pub group: Option<String>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
+    /// 该 Key 是否开启 Anthropic 标准计费模式（固定形状 + 超报利润）。默认 false。
+    pub anthropic_billing_mode: bool,
+    /// 标准模式 read 膨胀系数覆盖（None = 用默认 0.2）。
+    pub cache_read_inflation: Option<f64>,
+    /// 标准模式钉 input 覆盖（None = 用默认 2）。
+    pub cache_pinned_input: Option<i32>,
+    /// prompt 过滤：检测到 Claude Code CLI system 时整段替换为极小 backend prompt（省 prefill）。
+    pub simplify_cc_prompt: bool,
+    /// prompt 过滤：删除 `--- SYSTEM PROMPT ---` 边界标记行。
+    pub strip_boundary_markers: bool,
+    /// prompt 过滤：删除 `# Environment` / `# auto memory` 段与个别环境噪声行。
+    pub strip_env_noise: bool,
+    /// 响应缓存 per-key 开关（None = 跟随全局默认）。
+    pub response_cache_enabled: Option<bool>,
+    /// 响应缓存 per-key TTL 秒（None = 跟随全局默认）。
+    pub response_cache_ttl_secs: Option<u32>,
 }
 
 /// 应用共享状态
@@ -48,6 +64,8 @@ pub struct AppState {
     pub usage_aggregator: Option<SharedAggregator>,
     /// 中转层缓存计量（基于 cache_control 断点的内存缓存）
     pub cache_meter: Option<SharedCacheMeter>,
+    /// 中转层真实响应缓存（同请求命中直接回放、跳过上游，可选）
+    pub response_cache: Option<super::response_cache::SharedResponseCache>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
 }
@@ -67,6 +85,7 @@ impl AppState {
             usage_recorder: None,
             usage_aggregator: None,
             cache_meter: None,
+            response_cache: None,
             trace_store: None,
         }
     }
@@ -93,6 +112,15 @@ impl AppState {
     /// 注入缓存计量器
     pub fn with_cache_meter(mut self, cache: Option<SharedCacheMeter>) -> Self {
         self.cache_meter = cache;
+        self
+    }
+
+    /// 注入真实响应缓存
+    pub fn with_response_cache(
+        mut self,
+        cache: Option<super::response_cache::SharedResponseCache>,
+    ) -> Self {
+        self.response_cache = cache;
         self
     }
 
@@ -128,6 +156,14 @@ pub async fn auth_middleware(
                 key_id: id,
                 group,
                 key_source: TraceKeySource::ClientKey,
+                anthropic_billing_mode: mgr.anthropic_billing_mode_of(id),
+                cache_read_inflation: mgr.cache_read_inflation_of(id),
+                cache_pinned_input: mgr.cache_pinned_input_of(id),
+                simplify_cc_prompt: mgr.simplify_cc_prompt_of(id),
+                strip_boundary_markers: mgr.strip_boundary_markers_of(id),
+                strip_env_noise: mgr.strip_env_noise_of(id),
+                response_cache_enabled: mgr.response_cache_enabled_of(id),
+                response_cache_ttl_secs: mgr.response_cache_ttl_secs_of(id),
             });
             return next.run(request).await;
         }

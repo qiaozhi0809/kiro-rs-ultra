@@ -69,7 +69,16 @@ pub struct SegmentResult {
 ///
 /// 调用方据此算 `prefix_ratio = cache_covered_est / prompt_total_est`，再乘到真实
 /// total 上得到缓存覆盖部分，剩余即未缓存的 `input_tokens`，三者互斥相加 == total。
-#[derive(Debug, Clone, Copy, Default)]
+/// 标准计费模式默认钉住的 input token 数（复现真实 Anthropic 暖缓存 input≈1-2 的口径）。
+pub const DEFAULT_PINNED_INPUT: i32 = 2;
+/// read 膨胀系数 p 的上限（read 最多 ×(1+MAX)），防 per-key 配过头。
+pub const MAX_READ_INFLATION: f64 = 9.0;
+/// 标准模式 read 膨胀系数默认值（+20% 利润，藏在最便宜的 read 桶）。
+pub const DEFAULT_READ_INFLATION: f64 = 0.2;
+/// 标准模式 creation 占比默认值（cacheable 的 3%，复现每轮写一小段的自然小值）。
+pub const DEFAULT_CREATION_RATIO: f64 = 0.03;
+
+#[derive(Debug, Clone, Copy)]
 pub struct CacheUsage {
     /// 缓存读取 token（estimate 口径，最深命中段累计）。
     /// creation 部分 = `cache_covered_est − cache_read`，无需单独存储。
@@ -78,6 +87,37 @@ pub struct CacheUsage {
     pub cache_covered_est: i32,
     /// 整个 prompt 的 estimate token 总量（比例分摊的分母）。
     pub prompt_total_est: i32,
+
+    // —— 以下为 per-key「标准计费模式」参数，与上面的哈希链计量结果正交 ——
+    // 关闭（默认）时完全不参与，split_final 走原 split_against_total（零回归）。
+    /// Anthropic 标准计费模式开关（per-key，默认关）。开启后 [`Self::split_final`] 改走
+    /// [`Self::split_anthropic_standard`]：input 钉小常数、creation 取固定占比、read 超报，
+    /// 复现真实 Anthropic 暖缓存「读多写少」形状且把利润藏进最便宜的 read 桶。
+    pub billing_mode: bool,
+    /// 利润控制器·read 膨胀系数 p ≥ 0（仅标准模式生效，默认 0.2）：`read_final = read0 × (1+p)`。
+    /// 多报的 read（0.1x 计价）即利润，上报总量随之 > 真实 total。creation/input 不受其拨动。
+    pub read_inflation: f64,
+    /// 标准模式 creation 占比（仅标准模式生效，默认 0.03）：`creation = cacheable × creation_ratio`，
+    /// 复现真实 Anthropic 每轮写入一小段缓存的自然小值（不塌成 1）。read = cacheable − creation。
+    pub creation_ratio: f64,
+    /// 标准模式钉住的 input token 数（默认 2，可 per-key 覆盖）。剩余 `total − pinned` 落缓存两桶。
+    pub pinned_input: i32,
+}
+
+impl Default for CacheUsage {
+    /// 默认 = 不模拟缓存且标准模式关：`prompt_total_est == 0` 使分摊全量计入 input；
+    /// billing_mode=false 使 [`Self::split_final`] 走原 [`Self::split_against_total`]。
+    fn default() -> Self {
+        Self {
+            cache_read: 0,
+            cache_covered_est: 0,
+            prompt_total_est: 0,
+            billing_mode: false,
+            read_inflation: 0.0,
+            creation_ratio: DEFAULT_CREATION_RATIO,
+            pinned_input: DEFAULT_PINNED_INPUT,
+        }
+    }
 }
 
 impl CacheUsage {
@@ -108,6 +148,68 @@ impl CacheUsage {
         let creation = cache_total - read;
         let input = total - cache_total;
         (input, creation, read)
+    }
+
+    /// 从 per-key 配置注入标准计费模式参数。`billing_mode` 关时其余参数忽略（保持默认），
+    /// [`Self::split_final`] 走原如实分摊。开时 `inflation` / `pinned` 为 `None` 用默认值。
+    /// creation_ratio 不做 per-key 覆盖，恒用 [`DEFAULT_CREATION_RATIO`]。
+    pub fn apply_billing(
+        &mut self,
+        billing_mode: bool,
+        inflation: Option<f64>,
+        pinned: Option<i32>,
+    ) {
+        self.billing_mode = billing_mode;
+        if billing_mode {
+            self.read_inflation = inflation
+                .unwrap_or(DEFAULT_READ_INFLATION)
+                .clamp(0.0, MAX_READ_INFLATION);
+            self.pinned_input = pinned.unwrap_or(DEFAULT_PINNED_INPUT).max(1);
+            // creation_ratio 已由 Default 设为 DEFAULT_CREATION_RATIO。
+        }
+    }
+
+    /// 最终分摊入口：按 `billing_mode` 选择口径。
+    /// - 关（默认）→ [`Self::split_against_total`]：如实还原哈希链命中，`input+creation+read == total`，零回归。
+    /// - 开（per-key）→ [`Self::split_anthropic_standard`]：固定形状 + 利润控制器（上报总量可 > total）。
+    pub fn split_final(&self, total_real: i32) -> (i32, i32, i32) {
+        if self.billing_mode {
+            self.split_anthropic_standard(total_real)
+        } else {
+            self.split_against_total(total_real)
+        }
+    }
+
+    /// Anthropic 标准计费口径 + 利润控制器（仅 `billing_mode` 开启时经 [`Self::split_final`] 调用）。
+    ///
+    /// **与哈希链计量结果正交**：不看 `cache_read` / `cache_covered_est`，只按「固定形状」从
+    /// 真实 total 合成三桶，复现真实 Anthropic 暖缓存的读多写少 + 利润：
+    /// - **input = `pinned_input`（默认 2）**：小常数，像真实暖缓存的未命中碎屑，恒定不参与利润拨动。
+    /// - **creation = `cacheable × creation_ratio`（默认 3%）**：每轮写入一小段缓存的自然小值。
+    /// - **read = (cacheable − creation) × (1 + `read_inflation`)（默认 +20%）**：占比最大的桶 + 超报利润。
+    ///
+    /// 其中 `cacheable = total − pinned`。利润来自超报便宜的 read（0.1x）——`p>0` 时上报总量 > 真实 total。
+    ///
+    /// `total <= pinned_input` 时无法在钉 input 的同时再分缓存桶，全部计入 input（不凭空造缓存计数）。
+    /// 注意：此口径**不依赖哈希链是否命中 / seed 是否存在**，只要 total 够大就产出稳定形状——这正是
+    /// 用户「缓存数字偏小/不好看」的源头解法（哈希链 miss 导致的小值不再传导到上报）。
+    pub fn split_anthropic_standard(&self, total_real: i32) -> (i32, i32, i32) {
+        let total = total_real.max(0);
+        let pinned = self.pinned_input.max(1);
+        if total <= pinned {
+            return (total, 0, 0);
+        }
+        // input 恒钉 pinned；剩余 (total-pinned) 为可缓存部分。
+        let cacheable = total - pinned;
+        // creation = cacheable × creation_ratio（固定占比的自然小值）。
+        let cr = self.creation_ratio.clamp(0.0, 1.0);
+        let creation = ((cacheable as f64) * cr).round() as i32;
+        let creation = creation.clamp(0, cacheable);
+        let read0 = cacheable - creation;
+        // 利润控制器：超报 read（最便宜的桶），read_final = read0 × (1+p)。creation/input 不动。
+        let p = self.read_inflation.clamp(0.0, MAX_READ_INFLATION);
+        let read_final = ((read0 as f64) * (1.0 + p)).round() as i32;
+        (pinned, creation, read_final)
     }
 }
 
@@ -382,6 +484,7 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
         cache_read: cache_read as i32,
         cache_covered_est: covered as i32,
         prompt_total_est: prompt_total_est as i32,
+        ..Default::default()
     }
 }
 
@@ -579,7 +682,10 @@ fn extract_segments(req: &MessagesRequest, key_id: u64) -> (Vec<Segment>, u32) {
 ///
 /// 种子只参与哈希、不计入 token 估算，因此不影响 cache_creation/read 的数值口径。
 /// 返回 `None` 表示本次请求不应模拟缓存（调用方据此产出全 input、零缓存）。
-fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
+///
+/// `pub(crate)`：响应缓存 [`super::response_cache`] 复用同一套会话隔离口径构造缓存键，
+/// 保证两者隔离边界一致（尤其「主 Key 无 session → None 不缓存」的语义）。
+pub(crate) fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
     if let Some(session) = req
         .metadata
         .as_ref()
@@ -591,7 +697,37 @@ fn isolation_seed(req: &MessagesRequest, key_id: u64) -> Option<String> {
     if key_id == 0 {
         return None;
     }
-    Some(format!("key:{key_id}"))
+    // 无 session 的客户端 Key：`key:{id}:root:{对话根哈希}` —— key 级 + 对话根哈希。
+    //
+    // 根因（实测）：生产链路 nginx→new-api→kirors，网关常把客户端 metadata.user_id 洗掉，
+    // 于是 client key 落到本分支。若只用裸 `key:{id}`，同一 key 下**所有并发对话**共享一条
+    // 前缀哈希链 → 不同对话前缀在同一表里互相命中/冲刷 → 命中率抖动 + cache_creation 尖刺。
+    // 以对话根（首条消息，整段对话生命周期不变）哈希入种子，使不同对话天然分到不同链、各自
+    // 独立命中；同一对话后续轮次 messages[0] 不变 → seed 不变 → 仍跨轮命中。
+    match req.messages.first() {
+        Some(root) => Some(format!("key:{key_id}:root:{:016x}", conversation_root_hash(root))),
+        None => Some(format!("key:{key_id}")),
+    }
+}
+
+/// 对话根（首条消息）的稳定哈希（FNV-1a over role + 规范化 content）。
+/// 只取首条：整段对话生命周期内不变 → 同一对话多轮同 seed；不同对话大概率不同 seed。
+fn conversation_root_hash(root: &super::types::Message) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let mut mix = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    };
+    mix(root.role.as_bytes());
+    mix(b"\x00");
+    // content 可能是字符串或块数组；序列化为紧凑 JSON 后哈希（确定性稳定串）。
+    match serde_json::to_string(&root.content) {
+        Ok(s) => mix(s.as_bytes()),
+        Err(_) => mix(b"?"),
+    }
+    h
 }
 
 /// 从 Claude Code 的 user_id 中提取 session 标识。
@@ -890,6 +1026,7 @@ mod tests {
             cache_read: 30,
             cache_covered_est: 80, // creation 部分 = 50
             prompt_total_est: 100,
+            ..Default::default()
         };
         // covered 占 prompt 的 80% → 真实 total=1000 时缓存覆盖 800。
         let (input, creation, read) = u.split_against_total(1000);
@@ -906,8 +1043,115 @@ mod tests {
             cache_read: 0,
             cache_covered_est: 0,
             prompt_total_est: 100,
+            ..Default::default()
         };
         assert_eq!(u.split_against_total(500), (500, 0, 0));
+    }
+
+    // ---- 标准计费模式（固定形状 + 利润控制器）----------------------------------
+
+    #[test]
+    fn std_shape_pinned_input_ratio_and_inflation() {
+        // billing_mode 开：input 恒钉 pinned；creation = cacheable×ratio；read =(余)×(1+p)。
+        let u = CacheUsage {
+            billing_mode: true,
+            pinned_input: 2,
+            creation_ratio: 0.03,
+            read_inflation: 0.2,
+            ..Default::default()
+        };
+        // total=1002 → cacheable=1000；creation=round(1000×0.03)=30；read0=970；read=round(970×1.2)=1164。
+        let (input, creation, read) = u.split_final(1002);
+        assert_eq!(input, 2, "input 恒钉 pinned");
+        assert_eq!(creation, 30, "creation = cacheable×3%");
+        assert_eq!(read, 1164, "read = read0×1.2（超报利润）");
+        // 利润：上报总量 > 真实 total（超报 read）。
+        assert!(input + creation + read > 1002, "超报后上报 > 真实 total");
+    }
+
+    #[test]
+    fn std_zero_inflation_is_conservative_shape() {
+        // p=0：不超报，input+creation+read == total（纯固定形状，无利润）。
+        let u = CacheUsage {
+            billing_mode: true,
+            pinned_input: 2,
+            creation_ratio: 0.03,
+            read_inflation: 0.0,
+            ..Default::default()
+        };
+        let (input, creation, read) = u.split_final(1002);
+        assert_eq!(input, 2);
+        assert_eq!(creation, 30);
+        assert_eq!(read, 970);
+        assert_eq!(input + creation + read, 1002, "p=0 不超报，三桶守恒");
+    }
+
+    #[test]
+    fn std_small_total_all_input() {
+        // total <= pinned：无法钉 input 再分缓存，全计 input。
+        let u = CacheUsage {
+            billing_mode: true,
+            pinned_input: 2,
+            ..Default::default()
+        };
+        assert_eq!(u.split_final(2), (2, 0, 0));
+        assert_eq!(u.split_final(1), (1, 0, 0));
+    }
+
+    #[test]
+    fn split_final_off_falls_back_to_honest() {
+        // billing_mode 关（默认）→ split_final 必须等同 split_against_total（零回归）。
+        let u = CacheUsage {
+            cache_read: 30,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+            ..Default::default()
+        };
+        assert!(!u.billing_mode);
+        assert_eq!(u.split_final(1000), u.split_against_total(1000));
+    }
+
+    #[test]
+    fn std_independent_of_hashchain_state() {
+        // 标准模式产出只依赖 total，不看哈希链命中——哈希链全 miss（小 covered）也照样出稳定形状。
+        // 这正是「缓存数字偏小」的源头解法：miss 的小值不再传导到上报。
+        let miss = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 0, // 哈希链完全没命中
+            prompt_total_est: 0,
+            billing_mode: true,
+            read_inflation: 0.2,
+            ..Default::default()
+        };
+        let (input, creation, read) = miss.split_final(1002);
+        assert_eq!(input, 2);
+        assert!(creation > 0 && read > 0, "即便哈希链 miss，标准模式仍产出读多写少形状");
+    }
+
+    #[test]
+    fn same_key_different_conversation_root_does_not_cross_hit() {
+        // seed 修复：同一 client key、无 session，但两段对话首条消息不同 → 对话根哈希不同
+        // → seed 不同 → 前缀链互不命中（不再互相冲刷）。同根则跨轮命中。
+        let cache = CacheMeter::new(None);
+        let body = "shared long tail that would hash-collide without root isolation ".repeat(20);
+        // 对话 A：首条 = "conversation A opening"。
+        let conv = |root_text: &str| {
+            req_with_messages(vec![
+                msg_with_cc("user", root_text, false),
+                msg_with_cc("assistant", &body, false),
+                msg_with_cc("user", &body, false),
+            ])
+        };
+        // A 首次：miss → 建缓存。
+        let a1 = compute_cache_usage(&cache, &conv("conversation A opening"), 7);
+        assert!(a1.cache_covered_est > 0);
+        assert_eq!(a1.cache_read, 0);
+        // B（同 key=7）首条不同 → 不同对话根 → 不命中 A 的前缀。
+        let b1 = compute_cache_usage(&cache, &conv("conversation B opening"), 7);
+        assert_eq!(b1.cache_read, 0, "不同对话根不应互串");
+        // A 再来（同 key、同首条）→ 命中自己。
+        let a2 = compute_cache_usage(&cache, &conv("conversation A opening"), 7);
+        assert!(a2.cache_read > 0, "同一对话根应跨轮命中");
     }
 
     #[test]

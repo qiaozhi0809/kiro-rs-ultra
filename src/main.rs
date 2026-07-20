@@ -6,6 +6,7 @@ mod http_client;
 mod image_resize;
 mod kiro;
 mod model;
+mod text_truncate;
 pub mod token;
 
 use std::collections::HashMap;
@@ -269,6 +270,15 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
+    // ResponseCache：真实响应缓存（同请求命中回放、跳过上游）。全局默认开关来自 config，
+    // per-key 可覆盖；后台 60s 清理过期条目。默认关，只对显式开启的 Key 生效。
+    let response_cache = std::sync::Arc::new(anthropic::response_cache::ResponseCache::new(
+        anthropic::response_cache::DEFAULT_CAPACITY,
+        config.response_cache_enabled,
+        config.response_cache_ttl_secs,
+    ));
+    response_cache.clone().spawn_background();
+
     let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
         config.extract_thinking,
@@ -277,6 +287,7 @@ async fn main() {
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
         Some(cache_meter.clone()),
+        Some(response_cache.clone()),
         trace_store.clone(),
     );
 

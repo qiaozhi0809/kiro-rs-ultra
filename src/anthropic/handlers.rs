@@ -28,7 +28,7 @@ use std::time::Duration;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use super::converter::{ConversionError, convert_request_with_mode};
+use super::converter::ConversionError;
 use super::middleware::{AppState, KeyContext};
 use super::stream::{BufferedStreamContext, SseEvent, StreamContext};
 use super::types::{
@@ -819,6 +819,8 @@ pub async fn post_messages(
         );
     }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    // per-key prompt 过滤：在转换 / 缓存计量之前对客户端 system 做裁剪（省 prefill）。全关时 no-op。
+    super::prompt_filter::apply(&mut payload.system, &key_ctx);
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
         Some(p) => p.clone(),
@@ -868,7 +870,11 @@ pub async fn post_messages(
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
+    let conversion_result = match super::payload_truncate::convert_within_limit(
+        &mut payload,
+        &super::payload_truncate::PayloadLimitConfig::from_env(),
+        state.tool_compatibility_mode,
+    ) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -938,14 +944,43 @@ pub async fn post_messages(
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
     // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
-    let cache_usage = state
+    let mut cache_usage = state
         .cache_meter
         .as_ref()
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
+    // per-key 标准计费模式：开启则最终 split_final 走固定形状 + 超报利润（与哈希链结果正交，
+    // 即便 cache_meter=None 也生效）；关闭则 split_final 退回如实分摊，零回归。
+    cache_usage.apply_billing(
+        key_ctx.anthropic_billing_mode,
+        key_ctx.cache_read_inflation,
+        key_ctx.cache_pinned_input,
+    );
+
+    // 真实响应缓存：命中直接回放（覆盖流式/非流式两路的命中）；miss 拿写入句柄。
+    // /v1 增量流式路径只查不写（键含 stream=true，仍能命中 /cc/v1 缓冲流写入的同构条目）；
+    // 写入由非流式与 /cc/v1 缓冲流负责。
+    let response_cache_store = match super::response_cache::resolve_response_cache(
+        state.response_cache.as_ref(),
+        &payload,
+        key_ctx.key_id,
+        key_ctx.response_cache_enabled,
+        key_ctx.response_cache_ttl_secs,
+    ) {
+        Some((cache, key, ttl)) => {
+            if let Some(cached) = cache.get(&key) {
+                hook.record(0, 0, 0, 0, 0, 0.0, "success");
+                tracing::debug!("响应缓存命中 (/v1)，跳过上游");
+                return super::response_cache::build_cached_response(cached);
+            }
+            Some(super::response_cache::make_store(cache, key, ttl))
+        }
+        None => None,
+    };
 
     if payload.stream {
-        // 流式响应
+        // 流式响应（增量路径：只查不写，故不接收 store）
+        let _ = &response_cache_store;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
@@ -991,6 +1026,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            response_cache_store,
         )
         .await
     }
@@ -1271,6 +1307,7 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    response_cache_store: Option<super::response_cache::ResponseCacheStore>,
 ) -> Response {
     // 解析当前分组生效的 compact 阈值（百分比形式，用于和 contextUsage 对齐）
     let compact_pct = provider.token_manager().resolve_compact_threshold(group.as_deref()) * 100.0;
@@ -1463,9 +1500,9 @@ async fn handle_non_stream_request(
 
     // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
     let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
-    // 互斥分摊：input + cache_creation + cache_read == total
+    // 分摊：billing_mode 关走如实互斥分摊(input+creation+read==total)；开走固定形状+超报。
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_against_total(total_input_tokens);
+        cache_usage.split_final(total_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1506,6 +1543,16 @@ async fn handle_non_stream_request(
             credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
         },
     );
+    // 响应缓存写入：仅干净终态——非空（output>0，杜绝空响应固化）、stop_reason 为 end_turn
+    // （tool_use / 截断的 stop_reason 不是 end_turn，自然被排除，不会跨会话回放污染配对）。
+    if let Some(store) = &response_cache_store {
+        if output_tokens > 0 && stop_reason == "end_turn" {
+            if let Ok(bytes) = serde_json::to_vec(&response_body) {
+                store.put(bytes, false);
+                tracing::debug!("响应缓存写入 (非流式)");
+            }
+        }
+    }
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1652,6 +1699,8 @@ pub async fn post_messages_cc(
         "Received POST /cc/v1/messages request"
     );
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
+    // per-key prompt 过滤（同 /v1 路径）：转换 / 计量之前裁剪客户端 system。
+    super::prompt_filter::apply(&mut payload.system, &key_ctx);
 
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -1701,7 +1750,11 @@ pub async fn post_messages_cc(
     }
 
     // 转换请求
-    let conversion_result = match convert_request_with_mode(&payload, state.tool_compatibility_mode) {
+    let conversion_result = match super::payload_truncate::convert_within_limit(
+        &mut payload,
+        &super::payload_truncate::PayloadLimitConfig::from_env(),
+        state.tool_compatibility_mode,
+    ) {
         Ok(result) => result,
         Err(e) => {
             let (error_type, message) = match &e {
@@ -1770,11 +1823,36 @@ pub async fn post_messages_cc(
     let known_tool_names = conversion_result.known_tool_names;
 
     // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
-    let cache_usage = state
+    let mut cache_usage = state
         .cache_meter
         .as_ref()
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
+    // per-key 标准计费模式（同主路径）：split_final 据此走固定形状+超报或如实分摊。
+    cache_usage.apply_billing(
+        key_ctx.anthropic_billing_mode,
+        key_ctx.cache_read_inflation,
+        key_ctx.cache_pinned_input,
+    );
+
+    // 真实响应缓存：命中直接回放、跳过上游；miss 则拿到写入句柄传给流/非流 handler。
+    let response_cache_store = match super::response_cache::resolve_response_cache(
+        state.response_cache.as_ref(),
+        &payload,
+        key_ctx.key_id,
+        key_ctx.response_cache_enabled,
+        key_ctx.response_cache_ttl_secs,
+    ) {
+        Some((cache, key, ttl)) => {
+            if let Some(cached) = cache.get(&key) {
+                hook.record(0, 0, 0, 0, 0, 0.0, "success");
+                tracing::debug!("响应缓存命中 (/cc/v1)，跳过上游");
+                return super::response_cache::build_cached_response(cached);
+            }
+            Some(super::response_cache::make_store(cache, key, ttl))
+        }
+        None => None,
+    };
 
     if payload.stream {
         // 流式响应（缓冲模式）
@@ -1798,6 +1876,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            response_cache_store,
         )
         .await
     } else {
@@ -1823,6 +1902,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            response_cache_store,
         )
         .await
     }
@@ -1844,6 +1924,7 @@ async fn handle_stream_request_buffered(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    response_cache_store: Option<super::response_cache::ResponseCacheStore>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
@@ -1870,6 +1951,7 @@ async fn handle_stream_request_buffered(
     ctx.set_compact_threshold_pct(
         (provider.token_manager().resolve_compact_threshold(group.as_deref()) * 100.0) as f64,
     );
+    ctx.set_response_cache_store(response_cache_store);
 
     // 空响应自动重试次数（0 = 关闭）。大上下文下上游偶发空响应流，buffered 路径
     // 在吐给客户端前已全缓冲，可透明重发上游、丢弃空结果，客户端无感知。
@@ -2136,6 +2218,8 @@ fn create_buffered_sse_stream(
                                 } else {
                                     hook.record(credential_id, i, o, cc, cr, credits, "success");
                                     tracer.finalize("success", None, None, None, trace_usage);
+                                    // 响应缓存写入：仅干净 end_turn 非空响应（方法内自守空响应护栏）。
+                                    ctx.write_response_cache_if_clean(&all_events);
                                 }
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()

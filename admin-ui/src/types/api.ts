@@ -429,6 +429,22 @@ export interface ClientKeyItem {
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
   isSystem: boolean
+  /** Anthropic 标准计费模式（固定形状 + 超报 read 利润）是否开启 */
+  anthropicBillingMode?: boolean
+  /** read 膨胀系数 p 覆盖（undefined = 默认 0.2） */
+  cacheReadInflation?: number
+  /** 钉 input 覆盖（undefined = 默认 2） */
+  cachePinnedInput?: number
+  /** prompt 过滤：simplify_cc（把 CC 大 system 换小） */
+  simplifyCcPrompt?: boolean
+  /** prompt 过滤：删除边界标记行 */
+  stripBoundaryMarkers?: boolean
+  /** prompt 过滤：删除环境噪声段/行 */
+  stripEnvNoise?: boolean
+  /** 响应缓存 per-key 开关（undefined = 跟随全局） */
+  responseCacheEnabled?: boolean
+  /** 响应缓存 per-key TTL 秒（undefined = 跟随全局） */
+  responseCacheTtlSecs?: number
 }
 
 export interface ClientKeysResponse {
@@ -454,6 +470,19 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
+  /** 标准计费模式开关（缺省 = 不变） */
+  anthropicBillingMode?: boolean
+  /** read 膨胀系数 p（缺省 = 不变） */
+  cacheReadInflation?: number
+  /** 钉 input（缺省 = 不变） */
+  cachePinnedInput?: number
+  /** prompt 过滤三开关（缺省 = 不变） */
+  simplifyCcPrompt?: boolean
+  stripBoundaryMarkers?: boolean
+  stripEnvNoise?: boolean
+  /** 响应缓存开关/TTL（缺省 = 不变） */
+  responseCacheEnabled?: boolean
+  responseCacheTtlSecs?: number
 }
 
 // ============ 用量统计 ============

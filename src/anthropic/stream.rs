@@ -1427,7 +1427,7 @@ impl StreamContext {
     /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
         let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
-        self.cache_usage.split_against_total(total_real)
+        self.cache_usage.split_final(total_real)
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、
@@ -2525,6 +2525,8 @@ pub struct BufferedStreamContext {
     initial_events_generated: bool,
     /// 重建 inner 所需的原始构造参数（透明重试时用同一份参数重置）。
     rebuild: BufferedRebuildParams,
+    /// 响应缓存写入句柄（None = 该请求不缓存）。收尾干净时把整条 SSE 写入缓存。
+    response_cache_store: Option<super::response_cache::ResponseCacheStore>,
 }
 
 /// `BufferedStreamContext` 透明重试时重建内部 `StreamContext` 所需的原始参数快照。
@@ -2570,7 +2572,38 @@ impl BufferedStreamContext {
             event_buffer: Vec::new(),
             initial_events_generated: false,
             rebuild,
+            response_cache_store: None,
         }
+    }
+
+    /// 注入响应缓存写入句柄（miss 时由 handler 传入；命中时不会走到这条流）。
+    pub fn set_response_cache_store(
+        &mut self,
+        store: Option<super::response_cache::ResponseCacheStore>,
+    ) {
+        self.response_cache_store = store;
+    }
+
+    /// 收尾时把整条 SSE 响应写入缓存——**仅当干净终态**：有写入句柄、非空响应
+    /// （output>0，杜绝空响应被固化后无限回放、复活「被迫点继续」）、stop_reason 为 end_turn
+    /// （tool_use 会让 get_stop_reason 返回 "tool_use"，故已隐含排除工具调用与截断）。
+    /// `all_events` 是 [`finish_and_get_all_events`](Self::finish_and_get_all_events) 的产物。
+    pub fn write_response_cache_if_clean(&self, all_events: &[SseEvent]) {
+        let Some(store) = self.response_cache_store.as_ref() else {
+            return;
+        };
+        if self.is_empty_response() {
+            return; // 空响应绝不入缓存
+        }
+        if self.inner.state_manager.get_stop_reason() != "end_turn" {
+            return; // 仅缓存自洽的 end_turn 终态
+        }
+        let sse_text: Vec<u8> = all_events
+            .iter()
+            .flat_map(|e| e.to_sse_string().into_bytes())
+            .collect();
+        store.put(sse_text, true);
+        tracing::debug!("响应缓存写入 (缓冲流式)");
     }
 
     /// 注入由 CacheMeter 计算的缓存覆盖情况（estimate 口径），最终上报时分摊。
@@ -4867,6 +4900,60 @@ mod tests {
             },
         ));
         assert!(!ctx.is_empty_response());
+    }
+
+    // ---- write_response_cache_if_clean: 响应缓存写入护栏（与空响应兜底的交界）----
+
+    fn make_test_store() -> (
+        std::sync::Arc<crate::anthropic::response_cache::ResponseCache>,
+        crate::anthropic::response_cache::ResponseCacheStore,
+        String,
+    ) {
+        let cache = std::sync::Arc::new(crate::anthropic::response_cache::ResponseCache::new(
+            64, true, 180,
+        ));
+        let key = "test-key".to_string();
+        let store =
+            crate::anthropic::response_cache::make_store(cache.clone(), key.clone(), 180);
+        (cache, store, key)
+    }
+
+    #[test]
+    fn empty_response_is_never_cached() {
+        // 关键护栏：空响应（output=0、裸 end_turn）即便走到写入方法也绝不入缓存——
+        // 否则会把偶发空响应固化、命中期内无限回放，复活"被迫点继续"的 bug。
+        let (cache, store, key) = make_test_store();
+        let mut ctx = empty_ctx();
+        ctx.set_response_cache_store(Some(store));
+        ctx.process_and_buffer(&assistant_event("")); // 空
+        let all_events = ctx.finish_and_get_all_events();
+        assert!(ctx.is_empty_response(), "前提：应判定为空响应");
+        ctx.write_response_cache_if_clean(&all_events);
+        assert!(cache.get(&key).is_none(), "空响应绝不能被缓存");
+    }
+
+    #[test]
+    fn clean_end_turn_response_is_cached_as_sse() {
+        // 干净 end_turn 非空响应：应写入缓存，且标记为 SSE（is_sse=true）。
+        let (cache, store, key) = make_test_store();
+        let mut ctx = empty_ctx();
+        ctx.set_response_cache_store(Some(store));
+        ctx.process_and_buffer(&assistant_event("hello world")); // 有输出
+        let all_events = ctx.finish_and_get_all_events();
+        assert!(!ctx.is_empty_response(), "前提：非空响应");
+        ctx.write_response_cache_if_clean(&all_events);
+        let cached = cache.get(&key).expect("干净 end_turn 响应应入缓存");
+        assert!(cached.is_sse, "流式缓存条目应标记为 SSE");
+        assert!(!cached.body.is_empty());
+    }
+
+    #[test]
+    fn no_store_is_noop() {
+        // 未设置写入句柄（该请求不缓存）→ 写入方法安全 no-op，不 panic。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&assistant_event("hi"));
+        let all_events = ctx.finish_and_get_all_events();
+        ctx.write_response_cache_if_clean(&all_events); // 不应 panic
     }
 
     // ---- reset_for_retry: 透明重试前重置缓冲与上下文 ----

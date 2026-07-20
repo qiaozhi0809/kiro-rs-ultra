@@ -928,6 +928,30 @@ pub struct ClientKeyItem {
     /// 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换）
     #[serde(default)]
     pub is_system: bool,
+    /// Anthropic 标准计费模式（固定形状 + 超报利润）是否开启。
+    #[serde(default)]
+    pub anthropic_billing_mode: bool,
+    /// read 膨胀系数覆盖（null = 用默认 0.2）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_inflation: Option<f64>,
+    /// 钉 input 覆盖（null = 用默认 2）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_pinned_input: Option<i32>,
+    /// prompt 过滤：simplify_cc。
+    #[serde(default)]
+    pub simplify_cc_prompt: bool,
+    /// prompt 过滤：strip_boundary_markers。
+    #[serde(default)]
+    pub strip_boundary_markers: bool,
+    /// prompt 过滤：strip_env_noise。
+    #[serde(default)]
+    pub strip_env_noise: bool,
+    /// 响应缓存 per-key 开关（null = 跟随全局默认）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_cache_enabled: Option<bool>,
+    /// 响应缓存 per-key TTL 秒（null = 跟随全局默认）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_cache_ttl_secs: Option<u32>,
 }
 
 /// 客户端 Key 列表响应
@@ -967,6 +991,28 @@ pub struct UpdateClientKeyRequest {
     pub description: Option<String>,
     #[serde(default)]
     pub group: Option<String>,
+    /// 标准计费模式开关（缺省 = 不变）。
+    #[serde(default)]
+    pub anthropic_billing_mode: Option<bool>,
+    /// read 膨胀系数 p（缺省 = 不变；显式给 null 见 handler 处理为「不变」）。
+    /// 前端约定：关闭标准模式时一并清空回默认，用负数或缺省表达；实际以传值为准。
+    #[serde(default)]
+    pub cache_read_inflation: Option<f64>,
+    /// 钉 input（缺省 = 不变）。
+    #[serde(default)]
+    pub cache_pinned_input: Option<i32>,
+    /// prompt 过滤三开关（缺省 = 不变）。
+    #[serde(default)]
+    pub simplify_cc_prompt: Option<bool>,
+    #[serde(default)]
+    pub strip_boundary_markers: Option<bool>,
+    #[serde(default)]
+    pub strip_env_noise: Option<bool>,
+    /// 响应缓存 per-key 开关/TTL（缺省 = 不变）。
+    #[serde(default)]
+    pub response_cache_enabled: Option<bool>,
+    #[serde(default)]
+    pub response_cache_ttl_secs: Option<u32>,
 }
 
 // ============ IdC 设备授权登录 ============

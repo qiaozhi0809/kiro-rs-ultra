@@ -59,6 +59,37 @@ pub struct ClientKey {
     /// 老数据无此字段，默认 false。
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
+
+    /// Anthropic 标准计费模式（per-key，默认关）。开启后该 Key 的请求走
+    /// [`crate::anthropic::cache_metering::CacheUsage::split_anthropic_standard`]：
+    /// 固定形状（input 钉小常数、creation 取固定占比、read 超报），复现真实 Anthropic
+    /// 暖缓存「读多写少」且把利润藏进 read 桶。**开启的 Key 会对多报的 token 计费。**
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub anthropic_billing_mode: bool,
+    /// 标准模式 read 膨胀系数 p（None = 用默认 0.2）。`read_final = read0 × (1+p)`，
+    /// 多报的 read 即利润。仅 `anthropic_billing_mode` 开启时生效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_inflation: Option<f64>,
+    /// 标准模式钉住的 input token 数（None = 用默认 2）。仅 `anthropic_billing_mode` 开启时生效。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_pinned_input: Option<i32>,
+
+    /// prompt 过滤：检测到 Claude Code CLI system 时整段换成极小 backend prompt（省 prefill）。默认关。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub simplify_cc_prompt: bool,
+    /// prompt 过滤：删除 `--- SYSTEM PROMPT ---` 边界标记行。默认关。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strip_boundary_markers: bool,
+    /// prompt 过滤：删除 `# Environment` / `# auto memory` 段与个别环境噪声行。默认关。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub strip_env_noise: bool,
+
+    /// 真实响应缓存 per-key 开关（None = 跟随全局默认）。同请求命中直接回放、跳过上游。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_cache_enabled: Option<bool>,
+    /// 真实响应缓存 per-key TTL 秒（None 或 0 = 跟随全局默认）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_cache_ttl_secs: Option<u32>,
 }
 
 /// 客户端 Key 管理器
@@ -191,6 +222,14 @@ impl ClientKeyManager {
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
+            anthropic_billing_mode: false,
+            cache_read_inflation: None,
+            cache_pinned_input: None,
+            simplify_cc_prompt: false,
+            strip_boundary_markers: false,
+            strip_env_noise: false,
+            response_cache_enabled: None,
+            response_cache_ttl_secs: None,
         };
         inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
@@ -264,6 +303,14 @@ impl ClientKeyManager {
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
+                    anthropic_billing_mode: false,
+                    cache_read_inflation: None,
+                    cache_pinned_input: None,
+                    simplify_cc_prompt: false,
+                    strip_boundary_markers: false,
+                    strip_env_noise: false,
+                    response_cache_enabled: None,
+                    response_cache_ttl_secs: None,
                 };
                 inner.by_key.insert(plaintext, id);
                 inner.entries.insert(id, entry);
@@ -338,6 +385,142 @@ impl ClientKeyManager {
     /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
     pub fn group_of(&self, id: u64) -> Option<String> {
         self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+    }
+
+    /// 该 Key 是否开启 Anthropic 标准计费模式（Key 不存在时默认 false）。
+    pub fn anthropic_billing_mode_of(&self, id: u64) -> bool {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| e.anthropic_billing_mode)
+            .unwrap_or(false)
+    }
+
+    /// 该 Key 的 read 膨胀系数覆盖（None = 用默认；Key 不存在也返回 None）。
+    pub fn cache_read_inflation_of(&self, id: u64) -> Option<f64> {
+        self.inner.read().entries.get(&id).and_then(|e| e.cache_read_inflation)
+    }
+
+    /// 该 Key 的钉 input 覆盖（None = 用默认；Key 不存在也返回 None）。
+    pub fn cache_pinned_input_of(&self, id: u64) -> Option<i32> {
+        self.inner.read().entries.get(&id).and_then(|e| e.cache_pinned_input)
+    }
+
+    /// prompt 过滤：simplify_cc（Key 不存在默认 false）。
+    pub fn simplify_cc_prompt_of(&self, id: u64) -> bool {
+        self.inner.read().entries.get(&id).map(|e| e.simplify_cc_prompt).unwrap_or(false)
+    }
+
+    /// prompt 过滤：strip_boundary_markers（Key 不存在默认 false）。
+    pub fn strip_boundary_markers_of(&self, id: u64) -> bool {
+        self.inner.read().entries.get(&id).map(|e| e.strip_boundary_markers).unwrap_or(false)
+    }
+
+    /// prompt 过滤：strip_env_noise（Key 不存在默认 false）。
+    pub fn strip_env_noise_of(&self, id: u64) -> bool {
+        self.inner.read().entries.get(&id).map(|e| e.strip_env_noise).unwrap_or(false)
+    }
+
+    /// 响应缓存 per-key 开关（None = 跟随全局；Key 不存在也 None）。
+    pub fn response_cache_enabled_of(&self, id: u64) -> Option<bool> {
+        self.inner.read().entries.get(&id).and_then(|e| e.response_cache_enabled)
+    }
+
+    /// 响应缓存 per-key TTL 秒（None = 跟随全局；Key 不存在也 None）。
+    pub fn response_cache_ttl_secs_of(&self, id: u64) -> Option<u32> {
+        self.inner.read().entries.get(&id).and_then(|e| e.response_cache_ttl_secs)
+    }
+
+    /// 更新响应缓存 per-key 配置。任一参数为 `None` 表示该项不变；内层 `Option` 为「设值/清空」。
+    pub fn update_response_cache(
+        &self,
+        id: u64,
+        enabled: Option<Option<bool>>,
+        ttl_secs: Option<Option<u32>>,
+    ) -> bool {
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(e) => {
+                if let Some(v) = enabled {
+                    e.response_cache_enabled = v;
+                }
+                if let Some(v) = ttl_secs {
+                    // 0 归一成 None（跟随全局），避免存无意义的 0。
+                    e.response_cache_ttl_secs = v.filter(|n| *n > 0);
+                }
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_locked(&inner);
+        }
+        updated
+    }
+
+    /// 更新 prompt 过滤三开关。任一参数为 `None` 表示该项不变。
+    pub fn update_prompt_filters(
+        &self,
+        id: u64,
+        simplify_cc: Option<bool>,
+        strip_boundaries: Option<bool>,
+        strip_env: Option<bool>,
+    ) -> bool {
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(e) => {
+                if let Some(v) = simplify_cc {
+                    e.simplify_cc_prompt = v;
+                }
+                if let Some(v) = strip_boundaries {
+                    e.strip_boundary_markers = v;
+                }
+                if let Some(v) = strip_env {
+                    e.strip_env_noise = v;
+                }
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_locked(&inner);
+        }
+        updated
+    }
+
+    /// 更新 Key 的标准计费模式配置。任一参数为 `None` 表示该项不变。
+    /// `read_inflation` / `pinned_input` 的内层 `Option` 是「设为该值 / 清空回默认」。
+    pub fn update_billing(
+        &self,
+        id: u64,
+        billing_mode: Option<bool>,
+        read_inflation: Option<Option<f64>>,
+        pinned_input: Option<Option<i32>>,
+    ) -> bool {
+        let mut inner = self.inner.write();
+        let updated = match inner.entries.get_mut(&id) {
+            Some(e) => {
+                if let Some(v) = billing_mode {
+                    e.anthropic_billing_mode = v;
+                }
+                if let Some(v) = read_inflation {
+                    // clamp 到 [0, MAX]，避免 per-key 配出越界值。
+                    e.cache_read_inflation = v.map(|p| {
+                        p.clamp(0.0, crate::anthropic::cache_metering::MAX_READ_INFLATION)
+                    });
+                }
+                if let Some(v) = pinned_input {
+                    e.cache_pinned_input = v.map(|n| n.max(1));
+                }
+                true
+            }
+            None => false,
+        };
+        if updated {
+            self.save_locked(&inner);
+        }
+        updated
     }
 
     /// 列出所有当前被引用的分组名（仅去重，不带计数）。
