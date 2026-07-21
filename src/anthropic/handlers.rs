@@ -949,12 +949,12 @@ pub async fn post_messages(
         .as_ref()
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
-    // per-key 标准计费模式：开启则最终 split_final 走固定形状 + 超报利润（与哈希链结果正交，
-    // 即便 cache_meter=None 也生效）；关闭则 split_final 退回如实分摊，零回归。
-    cache_usage.apply_billing(
-        key_ctx.anthropic_billing_mode,
-        key_ctx.cache_read_inflation,
-        key_ctx.cache_pinned_input,
+    // per-key 检测安全计费参数：注入 read_ratio(R 阻尼)+multiplier_cap(护栏)。与哈希链结果
+    // 正交，即便 cache_meter=None 也可注入护栏。恒满足 input+creation+read==total（绝不超报）。
+    super::cache_metering::apply_key_billing(
+        &mut cache_usage,
+        key_ctx.cache_read_ratio,
+        key_ctx.cache_multiplier_cap,
     );
 
     // 真实响应缓存：命中直接回放（覆盖流式/非流式两路的命中）；miss 拿写入句柄。
@@ -1500,9 +1500,9 @@ async fn handle_non_stream_request(
 
     // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
     let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
-    // 分摊：billing_mode 关走如实互斥分摊(input+creation+read==total)；开走固定形状+超报。
+    // 检测安全分摊：哈希链比例 → R 阻尼 → multiplier 护栏，恒 input+creation+read==total。
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
-        cache_usage.split_final(total_input_tokens);
+        cache_usage.split_against_total(total_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1828,11 +1828,11 @@ pub async fn post_messages_cc(
         .as_ref()
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
-    // per-key 标准计费模式（同主路径）：split_final 据此走固定形状+超报或如实分摊。
-    cache_usage.apply_billing(
-        key_ctx.anthropic_billing_mode,
-        key_ctx.cache_read_inflation,
-        key_ctx.cache_pinned_input,
+    // per-key 检测安全计费参数（同主路径）：注入 read_ratio(R 阻尼)+multiplier_cap(护栏)。
+    super::cache_metering::apply_key_billing(
+        &mut cache_usage,
+        key_ctx.cache_read_ratio,
+        key_ctx.cache_multiplier_cap,
     );
 
     // 真实响应缓存：命中直接回放、跳过上游；miss 则拿到写入句柄传给流/非流 handler。

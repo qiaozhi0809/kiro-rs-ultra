@@ -429,12 +429,10 @@ export interface ClientKeyItem {
   group?: string
   /** 是否系统密钥（config.json apiKey 导入，不可删除 / 不可轮换） */
   isSystem: boolean
-  /** Anthropic 标准计费模式（固定形状 + 超报 read 利润）是否开启 */
-  anthropicBillingMode?: boolean
-  /** read 膨胀系数 p 覆盖（undefined = 默认 0.2） */
-  cacheReadInflation?: number
-  /** 钉 input 覆盖（undefined = 默认 2） */
-  cachePinnedInput?: number
+  /** 检测安全计费·read 留存阻尼 R 覆盖（undefined = 默认 1.0=不挪）。安全 margin 旋钮，非超报 */
+  cacheReadRatio?: number
+  /** 检测安全计费·multiplier 护栏上限覆盖（undefined = 默认 1.25） */
+  cacheMultiplierCap?: number
   /** prompt 过滤：simplify_cc（把 CC 大 system 换小） */
   simplifyCcPrompt?: boolean
   /** prompt 过滤：删除边界标记行 */
@@ -470,12 +468,10 @@ export interface UpdateClientKeyRequest {
   name?: string
   description?: string
   group?: string
-  /** 标准计费模式开关（缺省 = 不变） */
-  anthropicBillingMode?: boolean
-  /** read 膨胀系数 p（缺省 = 不变） */
-  cacheReadInflation?: number
-  /** 钉 input（缺省 = 不变） */
-  cachePinnedInput?: number
+  /** 检测安全计费·read 留存阻尼 R（缺省 = 不变）。clamp [0,1] */
+  cacheReadRatio?: number
+  /** 检测安全计费·multiplier 护栏上限（缺省 = 不变）。clamp [0.1,1.25] */
+  cacheMultiplierCap?: number
   /** prompt 过滤三开关（缺省 = 不变） */
   simplifyCcPrompt?: boolean
   stripBoundaryMarkers?: boolean

@@ -65,10 +65,9 @@ export function ClientKeysPage() {
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
   const [editGroup, setEditGroup] = useState('')
-  // 标准计费模式（固定形状 + 超报 read 利润）
-  const [editBilling, setEditBilling] = useState(false)
-  const [editInflation, setEditInflation] = useState('') // 空 = 用默认 0.2
-  const [editPinned, setEditPinned] = useState('') // 空 = 用默认 2
+  // 检测安全计费（R 阻尼 + multiplier 护栏，恒 sum==total，非超报）
+  const [editReadRatio, setEditReadRatio] = useState('') // 空 = 用默认 1.0（不挪）
+  const [editMultiplierCap, setEditMultiplierCap] = useState('') // 空 = 用默认 1.25
   // prompt 过滤三开关
   const [editSimplifyCc, setEditSimplifyCc] = useState(false)
   const [editStripBoundary, setEditStripBoundary] = useState(false)
@@ -176,9 +175,8 @@ export function ClientKeysPage() {
     setEditName(item.name)
     setEditDesc(item.description ?? '')
     setEditGroup(item.group ?? '')
-    setEditBilling(item.anthropicBillingMode ?? false)
-    setEditInflation(item.cacheReadInflation != null ? String(item.cacheReadInflation) : '')
-    setEditPinned(item.cachePinnedInput != null ? String(item.cachePinnedInput) : '')
+    setEditReadRatio(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
+    setEditMultiplierCap(item.cacheMultiplierCap != null ? String(item.cacheMultiplierCap) : '')
     setEditSimplifyCc(item.simplifyCcPrompt ?? false)
     setEditStripBoundary(item.stripBoundaryMarkers ?? false)
     setEditStripEnv(item.stripEnvNoise ?? false)
@@ -191,24 +189,19 @@ export function ClientKeysPage() {
     e.preventDefault()
     if (!editTarget) return
     try {
-      // 超报系数/钉 input：空串表示回默认（后端 clamp）。开启标准模式时才带这两个参数。
-      const inflationNum = editInflation.trim() === '' ? undefined : Number(editInflation)
-      const pinnedNum = editPinned.trim() === '' ? undefined : Number(editPinned)
+      // R / 护栏：空串表示回默认（后端 clamp）。
+      const ratioNum = editReadRatio.trim() === '' ? undefined : Number(editReadRatio)
+      const capNum = editMultiplierCap.trim() === '' ? undefined : Number(editMultiplierCap)
       await updateKey.mutateAsync({
         id: editTarget.id,
         req: {
           name: editName.trim(),
           description: editDesc.trim(),
           group: editGroup.trim(),
-          anthropicBillingMode: editBilling,
-          cacheReadInflation:
-            editBilling && inflationNum != null && Number.isFinite(inflationNum)
-              ? inflationNum
-              : undefined,
-          cachePinnedInput:
-            editBilling && pinnedNum != null && Number.isFinite(pinnedNum)
-              ? Math.trunc(pinnedNum)
-              : undefined,
+          cacheReadRatio:
+            ratioNum != null && Number.isFinite(ratioNum) ? ratioNum : undefined,
+          cacheMultiplierCap:
+            capNum != null && Number.isFinite(capNum) ? capNum : undefined,
           simplifyCcPrompt: editSimplifyCc,
           stripBoundaryMarkers: editStripBoundary,
           stripEnvNoise: editStripEnv,
@@ -529,53 +522,45 @@ export function ClientKeysPage() {
               </p>
             </div>
 
-            {/* 标准计费模式（固定形状 + 超报 read 利润） */}
+            {/* 检测安全计费（R 阻尼 + multiplier 护栏，sum 恒==total，非超报） */}
             <div className="rounded-lg border border-border/60 p-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <label className="text-[13px] font-medium">标准计费模式</label>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">
-                    固定形状（读多写少，像真实 Anthropic）+ 超报 read 出利润。上报量会 &gt; 真实用量。
-                  </p>
-                </div>
-                <Switch
-                  checked={editBilling}
-                  onCheckedChange={setEditBilling}
-                  disabled={updateKey.isPending}
-                />
+              <div>
+                <label className="text-[13px] font-medium">检测安全计费</label>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  上报恒 == 真实用量（不超报）。R&lt;1 把便宜的 read 挪回 input 出 margin，护栏保证 multiplier 永不越上限。
+                </p>
               </div>
-              {editBilling && (
-                <div className="mt-3 grid grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-[11px] text-muted-foreground">read 膨胀系数 p</label>
-                    <Input
-                      type="number"
-                      step="0.05"
-                      min="0"
-                      max="9"
-                      placeholder="默认 0.2 (+20%)"
-                      value={editInflation}
-                      onChange={(e) => setEditInflation(e.target.value)}
-                      disabled={updateKey.isPending}
-                    />
-                  </div>
-                  <div>
-                    <label className="text-[11px] text-muted-foreground">钉 input</label>
-                    <Input
-                      type="number"
-                      step="1"
-                      min="1"
-                      placeholder="默认 2"
-                      value={editPinned}
-                      onChange={(e) => setEditPinned(e.target.value)}
-                      disabled={updateKey.isPending}
-                    />
-                  </div>
-                  <p className="col-span-2 text-[11px] text-muted-foreground">
-                    read_final = read0 ×(1+p)。creation 固定占 cacheable 的 3%。留空用默认值。
-                  </p>
+              <div className="mt-3 grid grid-cols-2 gap-3">
+                <div>
+                  <label className="text-[11px] text-muted-foreground">read 留存 R (0~1)</label>
+                  <Input
+                    type="number"
+                    step="0.05"
+                    min="0"
+                    max="1"
+                    placeholder="默认 1.0（不挪）"
+                    value={editReadRatio}
+                    onChange={(e) => setEditReadRatio(e.target.value)}
+                    disabled={updateKey.isPending}
+                  />
                 </div>
-              )}
+                <div>
+                  <label className="text-[11px] text-muted-foreground">护栏上限 (0.1~1.25)</label>
+                  <Input
+                    type="number"
+                    step="0.05"
+                    min="0.1"
+                    max="1.25"
+                    placeholder="默认 1.25"
+                    value={editMultiplierCap}
+                    onChange={(e) => setEditMultiplierCap(e.target.value)}
+                    disabled={updateKey.isPending}
+                  />
+                </div>
+                <p className="col-span-2 text-[11px] text-muted-foreground">
+                  R 越低 margin 越高、命中率显示越低；护栏兜底 weighted/total ≤ 上限。留空用默认值（纯真实形状）。
+                </p>
+              </div>
             </div>
 
             {/* prompt 过滤（省 prefill） */}

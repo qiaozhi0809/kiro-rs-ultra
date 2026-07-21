@@ -60,19 +60,15 @@ pub struct ClientKey {
     #[serde(default, skip_serializing_if = "is_false")]
     pub is_system: bool,
 
-    /// Anthropic 标准计费模式（per-key，默认关）。开启后该 Key 的请求走
-    /// [`crate::anthropic::cache_metering::CacheUsage::split_anthropic_standard`]：
-    /// 固定形状（input 钉小常数、creation 取固定占比、read 超报），复现真实 Anthropic
-    /// 暖缓存「读多写少」且把利润藏进 read 桶。**开启的 Key 会对多报的 token 计费。**
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub anthropic_billing_mode: bool,
-    /// 标准模式 read 膨胀系数 p（None = 用默认 0.2）。`read_final = read0 × (1+p)`，
-    /// 多报的 read 即利润。仅 `anthropic_billing_mode` 开启时生效。
+    /// 检测安全计费·read 留存阻尼 R ∈[0,1] per-key 覆盖（None = 用默认 1.0=不挪）。read 桶保留
+    /// `read×R`，被砍部分推回 input（1.0x）——安全 margin 旋钮。`sum` 恒等 total（**非超报**），
+    /// 且受 `cache_multiplier_cap` 护栏兜底，multiplier 永不越 1.25。R 越低 margin 越高、命中率显示越低。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_read_inflation: Option<f64>,
-    /// 标准模式钉住的 input token 数（None = 用默认 2）。仅 `anthropic_billing_mode` 开启时生效。
+    pub cache_read_ratio: Option<f64>,
+    /// 检测安全计费·multiplier 护栏上限 C per-key 覆盖（None = 用默认 1.25）。分摊后 `weighted/baseline`
+    /// 超此值时把 input→read 压回。收紧到 1.0 留足检测余量；clamp 到 [0.1, 1.25]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_pinned_input: Option<i32>,
+    pub cache_multiplier_cap: Option<f64>,
 
     /// prompt 过滤：检测到 Claude Code CLI system 时整段换成极小 backend prompt（省 prefill）。默认关。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -222,9 +218,8 @@ impl ClientKeyManager {
             total_credits: 0.0,
             group: group.filter(|g| !g.trim().is_empty()),
             is_system: false,
-            anthropic_billing_mode: false,
-            cache_read_inflation: None,
-            cache_pinned_input: None,
+            cache_read_ratio: None,
+            cache_multiplier_cap: None,
             simplify_cc_prompt: false,
             strip_boundary_markers: false,
             strip_env_noise: false,
@@ -303,9 +298,8 @@ impl ClientKeyManager {
                     total_credits: 0.0,
                     group: None,
                     is_system: true,
-                    anthropic_billing_mode: false,
-                    cache_read_inflation: None,
-                    cache_pinned_input: None,
+                    cache_read_ratio: None,
+                    cache_multiplier_cap: None,
                     simplify_cc_prompt: false,
                     strip_boundary_markers: false,
                     strip_env_noise: false,
@@ -387,24 +381,14 @@ impl ClientKeyManager {
         self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
     }
 
-    /// 该 Key 是否开启 Anthropic 标准计费模式（Key 不存在时默认 false）。
-    pub fn anthropic_billing_mode_of(&self, id: u64) -> bool {
-        self.inner
-            .read()
-            .entries
-            .get(&id)
-            .map(|e| e.anthropic_billing_mode)
-            .unwrap_or(false)
+    /// 该 Key 的 read 留存阻尼 R 覆盖（None = 用默认 1.0；Key 不存在也返回 None）。
+    pub fn cache_read_ratio_of(&self, id: u64) -> Option<f64> {
+        self.inner.read().entries.get(&id).and_then(|e| e.cache_read_ratio)
     }
 
-    /// 该 Key 的 read 膨胀系数覆盖（None = 用默认；Key 不存在也返回 None）。
-    pub fn cache_read_inflation_of(&self, id: u64) -> Option<f64> {
-        self.inner.read().entries.get(&id).and_then(|e| e.cache_read_inflation)
-    }
-
-    /// 该 Key 的钉 input 覆盖（None = 用默认；Key 不存在也返回 None）。
-    pub fn cache_pinned_input_of(&self, id: u64) -> Option<i32> {
-        self.inner.read().entries.get(&id).and_then(|e| e.cache_pinned_input)
+    /// 该 Key 的 multiplier 护栏上限覆盖（None = 用默认 1.25；Key 不存在也返回 None）。
+    pub fn cache_multiplier_cap_of(&self, id: u64) -> Option<f64> {
+        self.inner.read().entries.get(&id).and_then(|e| e.cache_multiplier_cap)
     }
 
     /// prompt 过滤：simplify_cc（Key 不存在默认 false）。
@@ -489,29 +473,29 @@ impl ClientKeyManager {
         updated
     }
 
-    /// 更新 Key 的标准计费模式配置。任一参数为 `None` 表示该项不变。
-    /// `read_inflation` / `pinned_input` 的内层 `Option` 是「设为该值 / 清空回默认」。
+    /// 更新 Key 的检测安全计费配置。任一参数为 `None` 表示该项不变。
+    /// `read_ratio` / `multiplier_cap` 的内层 `Option` 是「设为该值 / 清空回默认」。
     pub fn update_billing(
         &self,
         id: u64,
-        billing_mode: Option<bool>,
-        read_inflation: Option<Option<f64>>,
-        pinned_input: Option<Option<i32>>,
+        read_ratio: Option<Option<f64>>,
+        multiplier_cap: Option<Option<f64>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
             Some(e) => {
-                if let Some(v) = billing_mode {
-                    e.anthropic_billing_mode = v;
+                if let Some(v) = read_ratio {
+                    // R clamp 到 [0,1]，避免 per-key 配出越界值。
+                    e.cache_read_ratio = v.map(|r| r.clamp(0.0, 1.0));
                 }
-                if let Some(v) = read_inflation {
-                    // clamp 到 [0, MAX]，避免 per-key 配出越界值。
-                    e.cache_read_inflation = v.map(|p| {
-                        p.clamp(0.0, crate::anthropic::cache_metering::MAX_READ_INFLATION)
+                if let Some(v) = multiplier_cap {
+                    // 护栏 clamp 到 [WEIGHT_READ, DEFAULT_MULTIPLIER_CAP]=[0.1, 1.25]。
+                    e.cache_multiplier_cap = v.map(|c| {
+                        c.clamp(
+                            crate::anthropic::cache_metering::WEIGHT_READ,
+                            crate::anthropic::cache_metering::DEFAULT_MULTIPLIER_CAP,
+                        )
                     });
-                }
-                if let Some(v) = pinned_input {
-                    e.cache_pinned_input = v.map(|n| n.max(1));
                 }
                 true
             }

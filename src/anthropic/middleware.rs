@@ -28,12 +28,10 @@ pub struct KeyContext {
     pub group: Option<String>,
     /// 命中的入口 Key 类型。
     pub key_source: TraceKeySource,
-    /// 该 Key 是否开启 Anthropic 标准计费模式（固定形状 + 超报利润）。默认 false。
-    pub anthropic_billing_mode: bool,
-    /// 标准模式 read 膨胀系数覆盖（None = 用默认 0.2）。
-    pub cache_read_inflation: Option<f64>,
-    /// 标准模式钉 input 覆盖（None = 用默认 2）。
-    pub cache_pinned_input: Option<i32>,
+    /// 检测安全计费·read 留存阻尼 R 覆盖（None = 用默认 1.0=不挪）。安全 margin 旋钮，非超报。
+    pub cache_read_ratio: Option<f64>,
+    /// 检测安全计费·multiplier 护栏上限覆盖（None = 用默认 1.25）。保证 multiplier 永不越检测线。
+    pub cache_multiplier_cap: Option<f64>,
     /// prompt 过滤：检测到 Claude Code CLI system 时整段替换为极小 backend prompt（省 prefill）。
     pub simplify_cc_prompt: bool,
     /// prompt 过滤：删除 `--- SYSTEM PROMPT ---` 边界标记行。
@@ -156,9 +154,8 @@ pub async fn auth_middleware(
                 key_id: id,
                 group,
                 key_source: TraceKeySource::ClientKey,
-                anthropic_billing_mode: mgr.anthropic_billing_mode_of(id),
-                cache_read_inflation: mgr.cache_read_inflation_of(id),
-                cache_pinned_input: mgr.cache_pinned_input_of(id),
+                cache_read_ratio: mgr.cache_read_ratio_of(id),
+                cache_multiplier_cap: mgr.cache_multiplier_cap_of(id),
                 simplify_cc_prompt: mgr.simplify_cc_prompt_of(id),
                 strip_boundary_markers: mgr.strip_boundary_markers_of(id),
                 strip_env_noise: mgr.strip_env_noise_of(id),

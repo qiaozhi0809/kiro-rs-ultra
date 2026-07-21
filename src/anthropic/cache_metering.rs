@@ -31,9 +31,9 @@ use std::sync::Arc;
 const DEFAULT_CAPACITY: usize = 65536;
 /// 最长 TTL（2h）。抬高上限，给显式 ttl="1h" 及默认 TTL 抬升留头寸。
 const MAX_TTL_SECS: i64 = 2 * 3600;
-/// 默认 TTL（15min，客户端未显式声明 cache_control ttl 时的基线）。
-/// 5min→15min：配合 30min grace，有效命中窗口 ~45min，救回「两轮间隔略长即变冷」的对话。
-const DEFAULT_TTL_SECS: i64 = 15 * 60;
+/// 默认 TTL（5min，客户端未显式声明 cache_control ttl 时的基线）。
+/// 15min→5min：回退到贴近真实上游 5m 缓存桶的基线；配合 30min grace，有效命中窗口 ~35min。
+const DEFAULT_TTL_SECS: i64 = 5 * 60;
 
 /// 软过期宽限期：条目过期后仍在此窗口内视为命中。
 /// 原理：上游 Anthropic 的 TTL 是滑动窗口（每次命中续期），本地 TTL 过期不代表
@@ -61,6 +61,19 @@ pub struct SegmentResult {
     pub tokens: u32,
 }
 
+/// 三桶计价权重（对齐真实 Anthropic：input 1.0 / cache_creation 1.25 / cache_read 0.1）。
+/// 护栏据此算 `weighted = Σ 桶×权重`，与检测方 `weighted/baseline` 口径一致。
+pub const WEIGHT_INPUT: f64 = 1.0;
+/// cache_creation 计价权重（写入缓存 5m ephemeral，贵桶）。
+pub const WEIGHT_CREATION: f64 = 1.25;
+/// cache_creation 计价权重（写入缓存 1h ephemeral，最贵桶——真实 Anthropic 1h 写入 2.0×）。
+pub const WEIGHT_CREATION_1H: f64 = 2.0;
+/// cache_read 计价权重（命中缓存，便宜桶）。
+pub const WEIGHT_READ: f64 = 0.1;
+/// multiplier 护栏默认上限。1.25 = 真实 Anthropic 暖缓存自然上限（round1 缓存写就是 1.25x），
+/// 默认不扭曲正常形状、仅兜底保证绝不越异常线；per-key 可收紧到 1.0 留足检测余量。
+pub const DEFAULT_MULTIPLIER_CAP: f64 = 1.25;
+
 /// `compute_cache_usage` 的结果：缓存计费量 + 比例分摊所需的 estimate 口径基准。
 ///
 /// `cache_creation` / `cache_read` 是按 `estimate_tokens` 口径算出的「被缓存覆盖
@@ -72,15 +85,6 @@ pub struct SegmentResult {
 ///
 /// 调用方据此算 `prefix_ratio = cache_covered_est / prompt_total_est`，再乘到真实
 /// total 上得到缓存覆盖部分，剩余即未缓存的 `input_tokens`，三者互斥相加 == total。
-/// 标准计费模式默认钉住的 input token 数（复现真实 Anthropic 暖缓存 input≈1-2 的口径）。
-pub const DEFAULT_PINNED_INPUT: i32 = 2;
-/// read 膨胀系数 p 的上限（read 最多 ×(1+MAX)），防 per-key 配过头。
-pub const MAX_READ_INFLATION: f64 = 9.0;
-/// 标准模式 read 膨胀系数默认值（+20% 利润，藏在最便宜的 read 桶）。
-pub const DEFAULT_READ_INFLATION: f64 = 0.2;
-/// 标准模式 creation 占比默认值（cacheable 的 3%，复现每轮写一小段的自然小值）。
-pub const DEFAULT_CREATION_RATIO: f64 = 0.03;
-
 #[derive(Debug, Clone, Copy)]
 pub struct CacheUsage {
     /// 缓存读取 token（estimate 口径，最深命中段累计）。
@@ -91,34 +95,31 @@ pub struct CacheUsage {
     /// 整个 prompt 的 estimate token 总量（比例分摊的分母）。
     pub prompt_total_est: i32,
 
-    // —— 以下为 per-key「标准计费模式」参数，与上面的哈希链计量结果正交 ——
-    // 关闭（默认）时完全不参与，split_final 走原 split_against_total（零回归）。
-    /// Anthropic 标准计费模式开关（per-key，默认关）。开启后 [`Self::split_final`] 改走
-    /// [`Self::split_anthropic_standard`]：input 钉小常数、creation 取固定占比、read 超报，
-    /// 复现真实 Anthropic 暖缓存「读多写少」形状且把利润藏进最便宜的 read 桶。
-    pub billing_mode: bool,
-    /// 利润控制器·read 膨胀系数 p ≥ 0（仅标准模式生效，默认 0.2）：`read_final = read0 × (1+p)`。
-    /// 多报的 read（0.1x 计价）即利润，上报总量随之 > 真实 total。creation/input 不受其拨动。
-    pub read_inflation: f64,
-    /// 标准模式 creation 占比（仅标准模式生效，默认 0.03）：`creation = cacheable × creation_ratio`，
-    /// 复现真实 Anthropic 每轮写入一小段缓存的自然小值（不塌成 1）。read = cacheable − creation。
-    pub creation_ratio: f64,
-    /// 标准模式钉住的 input token 数（默认 2，可 per-key 覆盖）。剩余 `total − pinned` 落缓存两桶。
-    pub pinned_input: i32,
+    // —— 以下为「检测安全」计费口径参数，与哈希链命中结果正交 ——
+    // 全部有安全默认值，`split_against_total` 恒满足 input+creation+read==total（绝不超报）。
+    /// read 留存阻尼 R ∈[0,1]（利润档，默认 1.0=不挪）：read 桶保留 `read×R`，被砍部分推回
+    /// input（1.0x，无缓存折扣），creation 不动。R 越低 → 越多 read 挪 input → 加权收入越高、
+    /// 命中率显示越低。**sum 恒等 total（非超报）**，且受 `multiplier_cap` 护栏兜底。
+    pub read_ratio: f64,
+    /// multiplier 护栏上限 C（默认 [`DEFAULT_MULTIPLIER_CAP`]=1.25）：分摊后 `weighted/baseline`
+    /// 超此值时把 input→read 压回（见 [`Self::apply_multiplier_cap`]），保证绝不越检测异常线。
+    pub multiplier_cap: f64,
+    /// 本轮 creation 是否记入 1h ephemeral 桶（默认 false=5m）。由入站 `cache_control.ttl` 决定，
+    /// 仅影响护栏加权时 creation 的计价权重（5m=1.25× / 1h=2.0×），不改三桶 token 总数。
+    pub creation_is_1h: bool,
 }
 
 impl Default for CacheUsage {
-    /// 默认 = 不模拟缓存且标准模式关：`prompt_total_est == 0` 使分摊全量计入 input；
-    /// billing_mode=false 使 [`Self::split_final`] 走原 [`Self::split_against_total`]。
+    /// 默认 = 不模拟缓存 + 无阻尼 + 默认护栏：`prompt_total_est == 0` 使分摊全量计入 input；
+    /// `read_ratio=1.0` 不挪桶；`multiplier_cap=1.25` 兜底。
     fn default() -> Self {
         Self {
             cache_read: 0,
             cache_covered_est: 0,
             prompt_total_est: 0,
-            billing_mode: false,
-            read_inflation: 0.0,
-            creation_ratio: DEFAULT_CREATION_RATIO,
-            pinned_input: DEFAULT_PINNED_INPUT,
+            read_ratio: 1.0,
+            multiplier_cap: DEFAULT_MULTIPLIER_CAP,
+            creation_is_1h: false,
         }
     }
 }
@@ -147,72 +148,52 @@ impl CacheUsage {
         } else {
             0
         };
-        let read = read.clamp(0, cache_total);
-        let creation = cache_total - read;
-        let input = total - cache_total;
-        (input, creation, read)
+        let read_base = read.clamp(0, cache_total);
+        let creation = cache_total - read_base;
+        let mut input = total - cache_total;
+
+        // read 留存阻尼 R（利润档）：保留 read_base×R，被砍部分推回 input（1.0x，无缓存折扣），
+        // creation 不动。R=1.0（默认）时 read 全留、input 不增（零回归）。sum 恒等 total。
+        let r = self.read_ratio.clamp(0.0, 1.0);
+        let read = ((read_base as f64) * r).round() as i32;
+        let read = read.clamp(0, read_base);
+        input += read_base - read;
+
+        self.apply_multiplier_cap(total, input, creation, read)
     }
 
-    /// 从 per-key 配置注入标准计费模式参数。`billing_mode` 关时其余参数忽略（保持默认），
-    /// [`Self::split_final`] 走原如实分摊。开时 `inflation` / `pinned` 为 `None` 用默认值。
-    /// creation_ratio 不做 per-key 覆盖，恒用 [`DEFAULT_CREATION_RATIO`]。
-    pub fn apply_billing(
-        &mut self,
-        billing_mode: bool,
-        inflation: Option<f64>,
-        pinned: Option<i32>,
-    ) {
-        self.billing_mode = billing_mode;
-        if billing_mode {
-            self.read_inflation = inflation
-                .unwrap_or(DEFAULT_READ_INFLATION)
-                .clamp(0.0, MAX_READ_INFLATION);
-            self.pinned_input = pinned.unwrap_or(DEFAULT_PINNED_INPUT).max(1);
-            // creation_ratio 已由 Default 设为 DEFAULT_CREATION_RATIO。
+    /// multiplier 护栏（C）：`weighted/baseline` 超 `multiplier_cap` 时，把 input(1.0x) 闭式挪去
+    /// read(0.1x) 压回上限，**不碰 creation**（creation=本轮真实新增，挪它=伪造暖轮 read → 因果违规）。
+    ///
+    /// 每挪 1 token input→read，weighted 降 `WEIGHT_INPUT − WEIGHT_READ = 0.9`。需挪
+    /// `x = ceil((weighted − cap·baseline) / 0.9)`，钳到 `[0, input]`。三桶和不变（仍恒等 total）。
+    /// 若 creation 单独就超 cap（input 已挪空仍压不下，如手动把 cap 设到 <1.25 的纯 creation 冷轮）：
+    /// 保持 creation 诚实、宁可略高于该激进 cap，也不伪造 read。默认 cap=1.25 时此路径不触发。
+    fn apply_multiplier_cap(&self, total: i32, input: i32, creation: i32, read: i32) -> (i32, i32, i32) {
+        let cap = self.multiplier_cap;
+        if cap <= 0.0 || total <= 0 {
+            return (input, creation, read);
         }
+        let baseline = total as f64;
+        let weighted = WEIGHT_INPUT * input as f64
+            + self.creation_weight() * creation as f64
+            + WEIGHT_READ * read as f64;
+        if weighted <= cap * baseline {
+            return (input, creation, read);
+        }
+        let excess = weighted - cap * baseline;
+        let mv = (excess / (WEIGHT_INPUT - WEIGHT_READ)).ceil() as i32;
+        let mv = mv.clamp(0, input);
+        (input - mv, creation, read + mv)
     }
 
-    /// 最终分摊入口：按 `billing_mode` 选择口径。
-    /// - 关（默认）→ [`Self::split_against_total`]：如实还原哈希链命中，`input+creation+read == total`，零回归。
-    /// - 开（per-key）→ [`Self::split_anthropic_standard`]：固定形状 + 利润控制器（上报总量可 > total）。
-    pub fn split_final(&self, total_real: i32) -> (i32, i32, i32) {
-        if self.billing_mode {
-            self.split_anthropic_standard(total_real)
+    /// 本轮 creation 桶的计价权重：1h → [`WEIGHT_CREATION_1H`]（2.0），否则 5m → [`WEIGHT_CREATION`]（1.25）。
+    fn creation_weight(&self) -> f64 {
+        if self.creation_is_1h {
+            WEIGHT_CREATION_1H
         } else {
-            self.split_against_total(total_real)
+            WEIGHT_CREATION
         }
-    }
-
-    /// Anthropic 标准计费口径 + 利润控制器（仅 `billing_mode` 开启时经 [`Self::split_final`] 调用）。
-    ///
-    /// **与哈希链计量结果正交**：不看 `cache_read` / `cache_covered_est`，只按「固定形状」从
-    /// 真实 total 合成三桶，复现真实 Anthropic 暖缓存的读多写少 + 利润：
-    /// - **input = `pinned_input`（默认 2）**：小常数，像真实暖缓存的未命中碎屑，恒定不参与利润拨动。
-    /// - **creation = `cacheable × creation_ratio`（默认 3%）**：每轮写入一小段缓存的自然小值。
-    /// - **read = (cacheable − creation) × (1 + `read_inflation`)（默认 +20%）**：占比最大的桶 + 超报利润。
-    ///
-    /// 其中 `cacheable = total − pinned`。利润来自超报便宜的 read（0.1x）——`p>0` 时上报总量 > 真实 total。
-    ///
-    /// `total <= pinned_input` 时无法在钉 input 的同时再分缓存桶，全部计入 input（不凭空造缓存计数）。
-    /// 注意：此口径**不依赖哈希链是否命中 / seed 是否存在**，只要 total 够大就产出稳定形状——这正是
-    /// 用户「缓存数字偏小/不好看」的源头解法（哈希链 miss 导致的小值不再传导到上报）。
-    pub fn split_anthropic_standard(&self, total_real: i32) -> (i32, i32, i32) {
-        let total = total_real.max(0);
-        let pinned = self.pinned_input.max(1);
-        if total <= pinned {
-            return (total, 0, 0);
-        }
-        // input 恒钉 pinned；剩余 (total-pinned) 为可缓存部分。
-        let cacheable = total - pinned;
-        // creation = cacheable × creation_ratio（固定占比的自然小值）。
-        let cr = self.creation_ratio.clamp(0.0, 1.0);
-        let creation = ((cacheable as f64) * cr).round() as i32;
-        let creation = creation.clamp(0, cacheable);
-        let read0 = cacheable - creation;
-        // 利润控制器：超报 read（最便宜的桶），read_final = read0 × (1+p)。creation/input 不动。
-        let p = self.read_inflation.clamp(0.0, MAX_READ_INFLATION);
-        let read_final = ((read0 as f64) * (1.0 + p)).round() as i32;
-        (pinned, creation, read_final)
     }
 }
 
@@ -441,6 +422,7 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
         // 无断点：仍带出 prompt_total_est 以便调用方将来扩展，但 covered=0 → 全入 input。
         return CacheUsage {
             prompt_total_est: prompt_total_est as i32,
+            creation_is_1h: request_marks_1h_cache(req),
             ..Default::default()
         };
     }
@@ -487,7 +469,63 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
         cache_read: cache_read as i32,
         cache_covered_est: covered as i32,
         prompt_total_est: prompt_total_est as i32,
+        creation_is_1h: request_marks_1h_cache(req),
         ..Default::default()
+    }
+}
+
+/// 从 per-key 配置注入检测安全计费参数。`read_ratio` / `multiplier_cap` 为 `None` 时保持
+/// [`CacheUsage::default`] 的安全值（R=1.0 不挪、cap=1.25 兜底）。与哈希链命中结果正交，
+/// 即便 `cache_meter=None`（走空段默认）也可注入护栏。
+pub fn apply_key_billing(usage: &mut CacheUsage, read_ratio: Option<f64>, multiplier_cap: Option<f64>) {
+    if let Some(r) = read_ratio {
+        usage.read_ratio = r.clamp(0.0, 1.0);
+    }
+    if let Some(c) = multiplier_cap {
+        usage.multiplier_cap = c.clamp(WEIGHT_READ, DEFAULT_MULTIPLIER_CAP);
+    }
+}
+
+/// 请求里是否有任一 `cache_control` 断点标了 `ttl == "1h"`（大小写不敏感）。
+/// 扫 system / tools 的强类型 `cache_control`，以及 message content blocks 里 JSON 形态的
+/// `cache_control.ttl`（`Message.content` 是自由 `serde_json::Value`）。命中任一即 true——
+/// creation 整段归 1h 桶（2.0× 权重）；否则默认 5m（1.25×）。仅影响护栏加权，不改 token 总数。
+fn request_marks_1h_cache(req: &MessagesRequest) -> bool {
+    fn is_1h(cc: &Option<super::types::CacheControl>) -> bool {
+        cc.as_ref()
+            .and_then(|c| c.ttl.as_deref())
+            .is_some_and(|t| t.trim().eq_ignore_ascii_case("1h"))
+    }
+    if let Some(systems) = req.system.as_ref() {
+        if systems.iter().any(|s| is_1h(&s.cache_control)) {
+            return true;
+        }
+    }
+    if let Some(tools) = req.tools.as_ref() {
+        if tools.iter().any(|t| is_1h(&t.cache_control)) {
+            return true;
+        }
+    }
+    req.messages.iter().any(|m| json_has_1h_cache_control(&m.content))
+}
+
+/// 递归扫 JSON 里任一 `cache_control.ttl == "1h"`（用于 `Message.content` 的自由形态）。
+fn json_has_1h_cache_control(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some(cc) = map.get("cache_control") {
+                if cc
+                    .get("ttl")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("1h"))
+                {
+                    return true;
+                }
+            }
+            map.values().any(json_has_1h_cache_control)
+        }
+        serde_json::Value::Array(arr) => arr.iter().any(json_has_1h_cache_control),
+        _ => false,
     }
 }
 
@@ -1053,84 +1091,104 @@ mod tests {
         assert_eq!(u.split_against_total(500), (500, 0, 0));
     }
 
-    // ---- 标准计费模式（固定形状 + 利润控制器）----------------------------------
+    // ---- 检测安全计费口径（R 阻尼 + multiplier 护栏 + 1h 桶）----------------------
 
     #[test]
-    fn std_shape_pinned_input_ratio_and_inflation() {
-        // billing_mode 开：input 恒钉 pinned；creation = cacheable×ratio；read =(余)×(1+p)。
-        let u = CacheUsage {
-            billing_mode: true,
-            pinned_input: 2,
-            creation_ratio: 0.03,
-            read_inflation: 0.2,
-            ..Default::default()
+    fn read_ratio_moves_read_to_input_sum_preserved() {
+        // R<1：read 桶按 R 留存，被砍部分推回 input，creation 不动，sum 恒等 total。
+        // covered=80/100 → cache_total=800；read_base=800×30/80=300；creation=500；input=200。
+        let base = CacheUsage {
+            cache_read: 30,
+            cache_covered_est: 80,
+            prompt_total_est: 100,
+            ..Default::default() // R=1.0, cap=1.25
         };
-        // total=1002 → cacheable=1000；creation=round(1000×0.03)=30；read0=970；read=round(970×1.2)=1164。
-        let (input, creation, read) = u.split_final(1002);
-        assert_eq!(input, 2, "input 恒钉 pinned");
-        assert_eq!(creation, 30, "creation = cacheable×3%");
-        assert_eq!(read, 1164, "read = read0×1.2（超报利润）");
-        // 利润：上报总量 > 真实 total（超报 read）。
-        assert!(input + creation + read > 1002, "超报后上报 > 真实 total");
+        let (i1, c1, r1) = base.split_against_total(1000);
+        assert_eq!((i1, c1, r1), (200, 500, 300), "R=1.0 零回归纯比例分摊");
+        assert_eq!(i1 + c1 + r1, 1000);
+
+        let damped = CacheUsage { read_ratio: 0.5, ..base };
+        let (i2, c2, r2) = damped.split_against_total(1000);
+        assert_eq!(c2, 500, "creation 不受 R 拨动");
+        assert_eq!(r2, 150, "read 按 R=0.5 减半 (300→150)");
+        assert_eq!(i2, 350, "被砍的 150 read 推回 input (200→350)");
+        assert_eq!(i2 + c2 + r2, 1000, "sum 恒等 total（非超报）");
     }
 
     #[test]
-    fn std_zero_inflation_is_conservative_shape() {
-        // p=0：不超报，input+creation+read == total（纯固定形状，无利润）。
+    fn multiplier_cap_caps_weighted_and_preserves_creation() {
+        // cap=1.0（收紧）：creation 占比高使 weighted 超上限 → 把 input 挪向 read 压回，creation 不动。
+        // covered=50/100 → cache_total=500；read_base=0；creation=500；input=500。
+        // weighted=500×1.0+500×1.25=1125 > 1.0×1000 → 触发护栏。
         let u = CacheUsage {
-            billing_mode: true,
-            pinned_input: 2,
-            creation_ratio: 0.03,
-            read_inflation: 0.0,
+            cache_read: 0,
+            cache_covered_est: 50,
+            prompt_total_est: 100,
+            multiplier_cap: 1.0,
             ..Default::default()
         };
-        let (input, creation, read) = u.split_final(1002);
-        assert_eq!(input, 2);
-        assert_eq!(creation, 30);
-        assert_eq!(read, 970);
-        assert_eq!(input + creation + read, 1002, "p=0 不超报，三桶守恒");
+        let (input, creation, read) = u.split_against_total(1000);
+        assert_eq!(creation, 500, "护栏绝不触碰 creation");
+        assert_eq!(input + creation + read, 1000, "sum 仍恒等 total");
+        let weighted = input as f64 * WEIGHT_INPUT
+            + creation as f64 * WEIGHT_CREATION
+            + read as f64 * WEIGHT_READ;
+        assert!(weighted <= 1.0 * 1000.0 + 1.0, "weighted/total 被压回 cap=1.0（含舍入容差）");
     }
 
     #[test]
-    fn std_small_total_all_input() {
-        // total <= pinned：无法钉 input 再分缓存，全计 input。
-        let u = CacheUsage {
-            billing_mode: true,
-            pinned_input: 2,
-            ..Default::default()
-        };
-        assert_eq!(u.split_final(2), (2, 0, 0));
-        assert_eq!(u.split_final(1), (1, 0, 0));
-    }
-
-    #[test]
-    fn split_final_off_falls_back_to_honest() {
-        // billing_mode 关（默认）→ split_final 必须等同 split_against_total（零回归）。
+    fn default_cap_125_never_triggers_on_normal_split() {
+        // 默认 cap=1.25 = Anthropic 自然上限：正常比例分摊（creation 最多占 cache_total）
+        // 的 weighted/total 恒 ≤ 1.25，护栏不改动结果。
         let u = CacheUsage {
             cache_read: 30,
             cache_covered_est: 80,
             prompt_total_est: 100,
             ..Default::default()
         };
-        assert!(!u.billing_mode);
-        assert_eq!(u.split_final(1000), u.split_against_total(1000));
+        let (input, creation, read) = u.split_against_total(1000);
+        assert_eq!((input, creation, read), (200, 500, 300), "默认护栏不触发，等同纯比例分摊");
     }
 
     #[test]
-    fn std_independent_of_hashchain_state() {
-        // 标准模式产出只依赖 total，不看哈希链命中——哈希链全 miss（小 covered）也照样出稳定形状。
-        // 这正是「缓存数字偏小」的源头解法：miss 的小值不再传导到上报。
-        let miss = CacheUsage {
-            cache_read: 0,
-            cache_covered_est: 0, // 哈希链完全没命中
-            prompt_total_est: 0,
-            billing_mode: true,
-            read_inflation: 0.2,
-            ..Default::default()
+    fn creation_weight_1h_is_double_bucket() {
+        let m5 = CacheUsage { creation_is_1h: false, ..Default::default() };
+        let h1 = CacheUsage { creation_is_1h: true, ..Default::default() };
+        assert_eq!(m5.creation_weight(), WEIGHT_CREATION, "5m 桶 = 1.25×");
+        assert_eq!(h1.creation_weight(), WEIGHT_CREATION_1H, "1h 桶 = 2.0×");
+    }
+
+    #[test]
+    fn request_marks_1h_cache_detects_all_sites() {
+        use super::super::types::{CacheControl, Message, MessagesRequest, SystemMessage};
+        let cc_1h = || Some(CacheControl { cache_type: "ephemeral".into(), ttl: Some("1h".into()) });
+        let base = || MessagesRequest {
+            model: "m".into(),
+            max_tokens: 8,
+            messages: vec![],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
         };
-        let (input, creation, read) = miss.split_final(1002);
-        assert_eq!(input, 2);
-        assert!(creation > 0 && read > 0, "即便哈希链 miss，标准模式仍产出读多写少形状");
+        // 无任何 1h 标记 → false。
+        let mut req = base();
+        req.messages = vec![Message { role: "user".into(), content: serde_json::json!("hi") }];
+        assert!(!request_marks_1h_cache(&req));
+        // system 带 ttl=1h → true。
+        let mut req_sys = base();
+        req_sys.system = Some(vec![SystemMessage { text: "s".into(), cache_control: cc_1h() }]);
+        assert!(request_marks_1h_cache(&req_sys), "system 断点 1h 命中");
+        // message content block JSON 里 cache_control.ttl=1h（大小写不敏感）→ true。
+        let mut req_msg = base();
+        req_msg.messages = vec![Message {
+            role: "user".into(),
+            content: serde_json::json!([{"type": "text", "text": "x", "cache_control": {"ttl": "1H"}}]),
+        }];
+        assert!(request_marks_1h_cache(&req_msg), "message JSON 断点 1h 命中（大小写不敏感）");
     }
 
     #[test]
