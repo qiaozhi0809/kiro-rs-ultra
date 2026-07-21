@@ -349,8 +349,7 @@ impl KiroProvider {
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
+                .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_mcp(base, &rctx);
 
             let response = match request.send().await {
@@ -613,8 +612,7 @@ impl KiroProvider {
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body)
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
+                .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_api(base, &rctx);
 
             // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
@@ -713,8 +711,7 @@ impl KiroProvider {
                         .client_for(&ctx.credentials)?
                         .post(&fb_url)
                         .body(fb_body)
-                        .header("content-type", fallback.content_type())
-                        .header("Connection", "close");
+                        .header("content-type", fallback.content_type());
                     let fb_request = fallback.decorate_api(fb_base, &fb_rctx);
                     let fb_request = fb_request
                         .build()

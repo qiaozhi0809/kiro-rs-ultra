@@ -51,11 +51,12 @@ pub fn build_client(
 ) -> anyhow::Result<Client> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
-        // 防止 HTTP/2 连接退化后堆积：空闲 90 秒回收、每主机最多 4 条空闲连接。
-        // 不设的话旧 H2 连接会被反复复用，AWS 那边流已半死但 TCP 还在，
-        // 新请求挂在上面等几十秒才超时，表现为"首字极慢、重启秒好"。
+        .connect_timeout(Duration::from_secs(10))
         .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(4);
+        .pool_max_idle_per_host(4)
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_timeout(Duration::from_secs(20))
+        .http2_adaptive_window(true);
 
     match tls_backend {
         TlsBackend::Rustls => {
