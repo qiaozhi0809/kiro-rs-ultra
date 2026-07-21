@@ -25,12 +25,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 默认条目上限（防止内存无限增长）
-const DEFAULT_CAPACITY: usize = 4096;
-/// 最长 TTL（1h，与 Anthropic ttl="1h" 对齐）
-const MAX_TTL_SECS: i64 = 3600;
-/// 默认 TTL（5min，ephemeral 默认值）
-const DEFAULT_TTL_SECS: i64 = 5 * 60;
+/// 默认条目上限（防止内存无限增长）。
+/// 4096 → 65536：生产实测活跃并发对话的前缀段数远超 4096，老段被 LRU 挤掉后再来即判冷
+/// （冷启动率一度 ~70%）。每条约 50B，65536 约 3-4MB 内存 / ~5MB 落盘，代价可接受。
+const DEFAULT_CAPACITY: usize = 65536;
+/// 最长 TTL（2h）。抬高上限，给显式 ttl="1h" 及默认 TTL 抬升留头寸。
+const MAX_TTL_SECS: i64 = 2 * 3600;
+/// 默认 TTL（15min，客户端未显式声明 cache_control ttl 时的基线）。
+/// 5min→15min：配合 30min grace，有效命中窗口 ~45min，救回「两轮间隔略长即变冷」的对话。
+const DEFAULT_TTL_SECS: i64 = 15 * 60;
 
 /// 软过期宽限期：条目过期后仍在此窗口内视为命中。
 /// 原理：上游 Anthropic 的 TTL 是滑动窗口（每次命中续期），本地 TTL 过期不代表
@@ -947,10 +950,12 @@ mod tests {
 
     #[test]
     fn parse_ttl_handles_known_values() {
+        // 显式声明按声明走。
         assert_eq!(parse_ttl(Some("1h")), 3600);
         assert_eq!(parse_ttl(Some("5m")), 300);
-        assert_eq!(parse_ttl(None), 300);
-        assert_eq!(parse_ttl(Some("garbage")), 300);
+        // 未声明 / 非法值回退默认 TTL（用常量引用，避免默认值调整后断言漂移）。
+        assert_eq!(parse_ttl(None), DEFAULT_TTL_SECS);
+        assert_eq!(parse_ttl(Some("garbage")), DEFAULT_TTL_SECS);
     }
 
     #[test]
