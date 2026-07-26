@@ -538,34 +538,63 @@ export function ClientKeysPage() {
                   上报恒 == 真实用量（不超报）。R&lt;1 把便宜的 read 挪回 input 出 margin，护栏保证 multiplier 永不越上限。
                 </p>
               </div>
-              <div className="mt-3 grid grid-cols-2 gap-3">
-                <div>
-                  <label className="text-[11px] text-muted-foreground">read 留存 R (0~1)</label>
-                  <Input
-                    type="number"
-                    step="0.05"
-                    min="0"
-                    max="1"
-                    placeholder="默认 1.0（不挪）"
-                    value={editReadRatio}
-                    onChange={(e) => setEditReadRatio(e.target.value)}
-                    disabled={updateKey.isPending}
-                  />
-                </div>
-                <div>
-                  <label className="text-[11px] text-muted-foreground">护栏上限 (0.1~1.25)</label>
-                  <Input
-                    type="number"
-                    step="0.05"
-                    min="0.1"
-                    max="1.25"
-                    placeholder="默认 1.25"
-                    value={editMultiplierCap}
-                    onChange={(e) => setEditMultiplierCap(e.target.value)}
-                    disabled={updateKey.isPending}
-                  />
-                </div>
-                <p className="col-span-2 text-[11px] text-muted-foreground">
+              {/* 利润档滑块（复用 R）：命中率≈R，multiplier≈1−0.9R；越左命中越高利润越低 */}
+              {(() => {
+                const rParsed = editReadRatio.trim() === '' ? 1.0 : parseFloat(editReadRatio)
+                const rv = Number.isFinite(rParsed) ? Math.min(1, Math.max(0, rParsed)) : 1.0
+                const capParsed = editMultiplierCap.trim() === '' ? 1.25 : parseFloat(editMultiplierCap)
+                const cap = Number.isFinite(capParsed) ? Math.min(1.25, Math.max(0.1, capParsed)) : 1.25
+                const hit = Math.round(rv * 100)
+                const mult = Math.min(cap, 1 - 0.9 * rv)
+                const band: [string, string] = mult <= 1.0
+                  ? ['正常', 'text-emerald-600']
+                  : mult <= 1.25
+                  ? ['临界', 'text-amber-600']
+                  : ['异常', 'text-red-600']
+                return (
+                  <div className="mt-3">
+                    <div className="mb-1 flex items-center justify-between">
+                      <div className="text-sm">利润档（read 留存 R）</div>
+                      <span className="text-[11px] text-muted-foreground">
+                        {editReadRatio.trim() === '' ? '默认 1.0' : `R=${rv.toFixed(2)}`}
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={rv}
+                      onChange={(e) => setEditReadRatio(e.target.value)}
+                      disabled={updateKey.isPending}
+                      className="w-full accent-primary disabled:opacity-50"
+                    />
+                    <div className="mt-1 flex items-center justify-between text-[11px] text-muted-foreground">
+                      <span>← 命中率高·利润低</span>
+                      <span>利润高·命中率低 →</span>
+                    </div>
+                    <div className="mt-2 flex items-center gap-3 rounded bg-muted/60 px-2 py-1 text-[11px]">
+                      <span>预计命中率 <b>{hit}%</b></span>
+                      <span>multiplier <b>{mult.toFixed(2)}×</b></span>
+                      <span>检测带 <b className={band[1]}>{band[0]}</b></span>
+                    </div>
+                  </div>
+                )
+              })()}
+              <div className="mt-3">
+                <label className="text-[11px] text-muted-foreground">护栏上限 (0.1~1.25)</label>
+                <Input
+                  type="number"
+                  step="0.05"
+                  min="0.1"
+                  max="1.25"
+                  placeholder="默认 1.25"
+                  value={editMultiplierCap}
+                  onChange={(e) => setEditMultiplierCap(e.target.value)}
+                  disabled={updateKey.isPending}
+                  className="mt-1 h-8 w-32"
+                />
+                <p className="mt-2 text-[11px] text-muted-foreground">
                   R 越低 margin 越高、命中率显示越低；护栏兜底 weighted/total ≤ 上限。留空用默认值（纯真实形状）。
                 </p>
               </div>
