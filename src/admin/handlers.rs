@@ -1080,6 +1080,8 @@ fn key_to_item(k: &super::client_keys::ClientKey) -> ClientKeyItem {
         is_system: k.is_system,
         cache_read_ratio: k.cache_read_ratio,
         cache_multiplier_cap: k.cache_multiplier_cap,
+        cache_billing_mode: k.cache_billing_mode,
+        cache_creation_ratio: k.cache_creation_ratio,
         simplify_cc_prompt: k.simplify_cc_prompt,
         strip_boundary_markers: k.strip_boundary_markers,
         strip_env_noise: k.strip_env_noise,
@@ -1183,16 +1185,16 @@ pub async fn update_client_key(
     // 检测安全计费配置：提供了任一字段就落库。read_ratio/multiplier_cap 用外层 Some 包一层
     // 表达「设值」，内层值即目标（前端传具体数即设，传默认值回填）。
     let billing_touched = payload.cache_read_ratio.is_some()
-        || payload.cache_multiplier_cap.is_some();
+        || payload.cache_multiplier_cap.is_some()
+        || payload.cache_billing_mode.is_some()
+        || payload.cache_creation_ratio.is_some();
     let billing_ok = if billing_touched {
-        // TODO(Task 7): 末两参临时 None（不改动），DTO 加字段后替换为
-        // payload.cache_billing_mode.map(Some) / payload.cache_creation_ratio.map(Some)。
         state.client_keys.update_billing(
             id,
             payload.cache_read_ratio.map(Some),
             payload.cache_multiplier_cap.map(Some),
-            None,
-            None,
+            payload.cache_billing_mode.map(Some),
+            payload.cache_creation_ratio.map(Some),
         )
     } else {
         meta_ok
