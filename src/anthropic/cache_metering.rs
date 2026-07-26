@@ -1303,6 +1303,31 @@ mod tests {
     }
 
     #[test]
+    fn billing_mode_empty_guard() {
+        // 空守卫: cache_covered_est=0 或 prompt_total_est=0 时,直接返回 (total, 0, 0)。
+        // 常见于 cache_meter=None 走 CacheUsage::default() 的空段场景。billing_mode=true 也不能凭空造 read。
+        let usage = CacheUsage {
+            cache_read: 0,
+            cache_covered_est: 0,
+            prompt_total_est: 0,
+            read_ratio: 0.3,
+            multiplier_cap: DEFAULT_MULTIPLIER_CAP,
+            billing_mode: true,
+            creation_ratio: DEFAULT_CREATION_RATIO,
+            creation_is_1h: false,
+        };
+        assert_eq!(usage.split_final(1000), (1000, 0, 0));
+
+        // prompt_total_est=0 单独 case
+        let usage2 = CacheUsage {
+            cache_covered_est: 500,
+            prompt_total_est: 0,
+            ..usage
+        };
+        assert_eq!(usage2.split_final(1000), (1000, 0, 0));
+    }
+
+    #[test]
     fn billing_mode_no_cap_when_r_low() {
         // billing_mode=true 时,即便 multiplier_cap 收得很紧,也不触发护栏(护栏不生效)。
         // R=0 → 全部 read 挪去 input → weighted/baseline 应比默认路径显著更高。
