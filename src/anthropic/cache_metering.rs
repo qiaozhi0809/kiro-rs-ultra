@@ -110,8 +110,8 @@ pub struct CacheUsage {
     /// 互斥三桶口径（sum 恒等 total，绝不超报），**不施加** `multiplier_cap` 护栏（接受更高检测
     /// 风险换 margin）。默认关走现行 [`Self::split_against_total`]（零回归）。
     pub billing_mode: bool,
-    /// 标准模式 creation 占比（默认 [`DEFAULT_CREATION_RATIO`]=0.03，仅 `billing_mode=true` 生效）：
-    /// `creation = cacheable × ratio`，定「每轮写多少缓存」的形状。与 `read_ratio` 正交，
+    /// 标准模式 creation 占比 ∈[0,1]（默认 [`DEFAULT_CREATION_RATIO`]=0.03，仅 `billing_mode=true`
+    /// 生效）：`creation = cacheable × ratio`，定「每轮写多少缓存」的形状。与 `read_ratio` 正交，
     /// 不破坏 sum==total。
     pub creation_ratio: f64,
     /// 本轮 creation 是否记入 1h ephemeral 桶（默认 false=5m）。由入站 `cache_control.ttl` 决定，
@@ -211,6 +211,16 @@ impl CacheUsage {
         // 恒等断言：任何未来改动破坏 sum==total 契约都在 debug/测试期炸出来。
         debug_assert_eq!(input + creation + read, total);
         (input, creation, read)
+    }
+
+    /// 最终分摊入口：按 `billing_mode` 分流。默认 false 走 [`Self::split_against_total`]（含护栏），
+    /// true 走 [`Self::split_anthropic_standard`]（无护栏，sum 恒等 total）。
+    pub fn split_final(&self, total_real: i32) -> (i32, i32, i32) {
+        if self.billing_mode {
+            self.split_anthropic_standard(total_real)
+        } else {
+            self.split_against_total(total_real)
+        }
     }
 
     /// multiplier 护栏（C）：`weighted/baseline` 超 `multiplier_cap` 时，把 input(1.0x) 闭式挪去
@@ -525,15 +535,27 @@ pub fn compute_cache_usage(cache: &CacheMeter, req: &MessagesRequest, key_id: u6
     }
 }
 
-/// 从 per-key 配置注入检测安全计费参数。`read_ratio` / `multiplier_cap` 为 `None` 时保持
-/// [`CacheUsage::default`] 的安全值（R=1.0 不挪、cap=1.25 兜底）。与哈希链命中结果正交，
-/// 即便 `cache_meter=None`（走空段默认）也可注入护栏。
-pub fn apply_key_billing(usage: &mut CacheUsage, read_ratio: Option<f64>, multiplier_cap: Option<f64>) {
+/// 从 per-key 配置注入检测安全计费参数。任一参数为 `None` 时保持 [`CacheUsage::default`] 的安全值
+/// （R=1.0 不挪、cap=1.25 兜底、billing_mode=false、creation_ratio=0.03）。与哈希链命中结果正交，
+/// 即便 `cache_meter=None`（走空段默认）也可注入。
+pub fn apply_key_billing(
+    usage: &mut CacheUsage,
+    read_ratio: Option<f64>,
+    multiplier_cap: Option<f64>,
+    billing_mode: Option<bool>,
+    creation_ratio: Option<f64>,
+) {
     if let Some(r) = read_ratio {
         usage.read_ratio = r.clamp(0.0, 1.0);
     }
     if let Some(c) = multiplier_cap {
         usage.multiplier_cap = c.clamp(WEIGHT_READ, DEFAULT_MULTIPLIER_CAP);
+    }
+    if let Some(b) = billing_mode {
+        usage.billing_mode = b;
+    }
+    if let Some(cr) = creation_ratio {
+        usage.creation_ratio = cr.clamp(0.0, 1.0);
     }
 }
 
@@ -1259,6 +1281,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn billing_mode_exact_values() {
+        // 锁具体数值,防未来重构悄悄改语义。
+        // cache_covered_est=500, prompt_total_est=1000, total=1000 → cacheable=500
+        // creation_ratio=0.03 → creation = round(500*0.03) = 15
+        // read0 = 500 - 15 = 485; R=1.0 → read = 485; input = 1000-15-485 = 500
+        let usage = CacheUsage {
+            cache_read: 400,
+            cache_covered_est: 500,
+            prompt_total_est: 1000,
+            read_ratio: 1.0,
+            multiplier_cap: DEFAULT_MULTIPLIER_CAP,
+            billing_mode: true,
+            creation_ratio: DEFAULT_CREATION_RATIO,
+            creation_is_1h: false,
+        };
+        assert_eq!(usage.split_final(1000), (500, 15, 485));
     }
 
     #[test]
