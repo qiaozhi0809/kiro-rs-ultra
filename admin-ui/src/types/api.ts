@@ -433,6 +433,10 @@ export interface ClientKeyItem {
   cacheReadRatio?: number
   /** 检测安全计费·multiplier 护栏上限覆盖（undefined = 默认 1.25） */
   cacheMultiplierCap?: number
+  /** 标准计费模式覆盖(undefined = 默认 false=走比例分摊+护栏) */
+  cacheBillingMode?: boolean
+  /** creation 占比覆盖(undefined = 默认 0.03),仅 cacheBillingMode=true 生效 */
+  cacheCreationRatio?: number
   /** prompt 过滤：simplify_cc（把 CC 大 system 换小） */
   simplifyCcPrompt?: boolean
   /** prompt 过滤：删除边界标记行 */
@@ -472,6 +476,10 @@ export interface UpdateClientKeyRequest {
   cacheReadRatio?: number
   /** 检测安全计费·multiplier 护栏上限（缺省 = 不变）。clamp [0.1,1.25] */
   cacheMultiplierCap?: number
+  /** 标准计费模式(缺省 = 不变) */
+  cacheBillingMode?: boolean
+  /** creation 占比(缺省 = 不变)。clamp [0,1] */
+  cacheCreationRatio?: number
   /** prompt 过滤三开关（缺省 = 不变） */
   simplifyCcPrompt?: boolean
   stripBoundaryMarkers?: boolean

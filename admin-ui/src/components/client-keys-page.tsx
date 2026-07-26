@@ -68,6 +68,8 @@ export function ClientKeysPage() {
   // 检测安全计费（R 阻尼 + multiplier 护栏，恒 sum==total，非超报）
   const [editReadRatio, setEditReadRatio] = useState('') // 空 = 用默认 1.0（不挪）
   const [editMultiplierCap, setEditMultiplierCap] = useState('') // 空 = 用默认 1.25
+  const [editBillingMode, setEditBillingMode] = useState(false) // 默认关
+  const [editCreationRatio, setEditCreationRatio] = useState('') // 空 = 用默认 0.03
   // prompt 过滤三开关
   const [editSimplifyCc, setEditSimplifyCc] = useState(false)
   const [editStripBoundary, setEditStripBoundary] = useState(false)
@@ -177,6 +179,8 @@ export function ClientKeysPage() {
     setEditGroup(item.group ?? '')
     setEditReadRatio(item.cacheReadRatio != null ? String(item.cacheReadRatio) : '')
     setEditMultiplierCap(item.cacheMultiplierCap != null ? String(item.cacheMultiplierCap) : '')
+    setEditBillingMode(item.cacheBillingMode ?? false)
+    setEditCreationRatio(item.cacheCreationRatio != null ? String(item.cacheCreationRatio) : '')
     setEditSimplifyCc(item.simplifyCcPrompt ?? false)
     setEditStripBoundary(item.stripBoundaryMarkers ?? false)
     setEditStripEnv(item.stripEnvNoise ?? false)
@@ -192,6 +196,7 @@ export function ClientKeysPage() {
       // R / 护栏：空串表示回默认（后端 clamp）。
       const ratioNum = editReadRatio.trim() === '' ? undefined : Number(editReadRatio)
       const capNum = editMultiplierCap.trim() === '' ? undefined : Number(editMultiplierCap)
+      const creationRatioNum = editCreationRatio.trim() === '' ? undefined : Number(editCreationRatio)
       await updateKey.mutateAsync({
         id: editTarget.id,
         req: {
@@ -202,6 +207,9 @@ export function ClientKeysPage() {
             ratioNum != null && Number.isFinite(ratioNum) ? ratioNum : undefined,
           cacheMultiplierCap:
             capNum != null && Number.isFinite(capNum) ? capNum : undefined,
+          cacheBillingMode: editBillingMode,
+          cacheCreationRatio:
+            creationRatioNum != null && Number.isFinite(creationRatioNum) ? creationRatioNum : undefined,
           simplifyCcPrompt: editSimplifyCc,
           stripBoundaryMarkers: editStripBoundary,
           stripEnvNoise: editStripEnv,
