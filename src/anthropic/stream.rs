@@ -950,6 +950,73 @@ impl std::fmt::Display for ToolJsonAccumulatorError {
 
 impl std::error::Error for ToolJsonAccumulatorError {}
 
+/// 上游在流中途下发的失败信号（event-stream 的 `:message-type: error` / `exception` 帧）。
+///
+/// 这类帧不是内容事件，而是上游对**本次响应**的中断通告（限流、内部错误、服务不可用等）。
+/// 它可能出现在任意位置：文本写到一半、tool_use 参数写到一半、甚至所有内容块都已正常
+/// 关闭之后。
+///
+/// 必须显式暴露：否则流会走到「上游正常 EOF」分支，被 `generate_final_events` 用
+/// `stop_reason: end_turn / tool_use` 正常收尾，客户端拿到一个**格式合法、看不出异常的
+/// 截断响应**——不会重试，直接把残缺结果当成模型的最终答复写进对话历史。
+///
+/// 与 [`ToolJsonAccumulatorError`] 的分工：后者只覆盖「tool_use 的 JSON 没收完」这一种
+/// 截断形态；断流发生在纯文本输出中途、或发生在工具块已 `stop=true` 之后时，累积器是
+/// 干净的，只有本类型能捕获。
+#[derive(Debug, Clone)]
+pub enum UpstreamStreamError {
+    /// `:message-type: error` 帧，携带 `:error-code` 头。
+    Error {
+        error_code: String,
+        error_message: String,
+    },
+    /// `:message-type: exception` 帧，携带 `:exception-type` 头。
+    ///
+    /// 注意 `ContentLengthExceededException` **不**走这里——它是上游的合法终止信号
+    /// （上下文/输出长度到顶），已被映射为 `stop_reason: max_tokens`。
+    Exception {
+        exception_type: String,
+        message: String,
+    },
+}
+
+impl UpstreamStreamError {
+    /// Anthropic error 事件里统一的 error.type。
+    ///
+    /// 用 `api_error` 而非自定义类型：Claude Code 等客户端据此判定「上游故障、可重试」，
+    /// 自定义 type 会被当成未知错误直接抛给用户。
+    pub fn error_type(&self) -> &'static str {
+        "api_error"
+    }
+
+    pub fn message(&self) -> String {
+        match self {
+            Self::Error {
+                error_code,
+                error_message,
+            } => format!(
+                "Upstream interrupted the response stream: {} - {}. The response is incomplete and was not committed.",
+                error_code, error_message
+            ),
+            Self::Exception {
+                exception_type,
+                message,
+            } => format!(
+                "Upstream raised {} mid-stream: {}. The response is incomplete and was not committed.",
+                exception_type, message
+            ),
+        }
+    }
+}
+
+impl std::fmt::Display for UpstreamStreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message())
+    }
+}
+
+impl std::error::Error for UpstreamStreamError {}
+
 /// 工具调用参数（JSON）累积器。
 ///
 /// Kiro 把 tool_use 的 `input` JSON 拆成多个 `toolUseEvent` 分片下发，最后一片
@@ -1416,6 +1483,10 @@ pub struct StreamContext {
     /// 工具调用 JSON 错误（非法 / 半截）。一旦置位，收尾时补发 `error` 事件，
     /// 上层据此把本次请求记为 error 而非 success。
     tool_json_error: Option<ToolJsonAccumulatorError>,
+    /// 上游流中途下发的失败帧（error / exception）。一旦置位，收尾时补发 `error`
+    /// 事件、`stop_reason` 记 `error`，上层据此把本次请求记为 error 而非 success。
+    /// 详见 [`UpstreamStreamError`]。
+    upstream_error: Option<UpstreamStreamError>,
     /// 跨 chunk 过滤混入 assistant 文本的字面 `<tool_use>` XML 泄漏。
     tool_use_xml_filter: ToolUseXmlLeakFilter,
 }
@@ -1435,6 +1506,25 @@ impl StreamContext {
     /// 或在非流式路径返回 502。无错误时返回 `None`。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.tool_json_error.as_ref().map(|err| err.message())
+    }
+
+    /// 上游中途断流的错误信息。上层据此把本次请求记为 error、或在非流式路径返回 502。
+    /// 无错误时返回 `None`。
+    pub fn upstream_error_message(&self) -> Option<String> {
+        self.upstream_error.as_ref().map(|err| err.message())
+    }
+
+    /// 记录上游中途断流，并把 `stop_reason` 定为 `error`。
+    ///
+    /// 只保留**第一个**错误：断流后上游可能连发多帧，首帧才是根因。
+    /// `stop_reason` 覆写为 `error` 是关键——否则 `get_stop_reason()` 会按
+    /// `has_tool_use` 回落到 `tool_use` / `end_turn`，客户端就看不出这是失败。
+    fn set_upstream_error(&mut self, err: UpstreamStreamError) {
+        if self.upstream_error.is_some() {
+            return;
+        }
+        self.upstream_error = Some(err);
+        self.state_manager.set_stop_reason("error");
     }
 
     /// 创建 StreamContext
@@ -1474,6 +1564,7 @@ impl StreamContext {
             repeat_guard_tripped: false,
             tool_json_accumulator: ToolJsonAccumulator::new(),
             tool_json_error: None,
+            upstream_error: None,
             tool_use_xml_filter: ToolUseXmlLeakFilter::default(),
         }
     }
@@ -1575,18 +1666,32 @@ impl StreamContext {
                 error_code,
                 error_message,
             } => {
+                // 上游中途断流：**不能**只记日志。吞掉的话流会走「上游正常 EOF」分支，
+                // 被正常 stop_reason 收尾，客户端拿到一个格式合法的截断响应（不重试、
+                // 直接把残缺内容写进历史）。置位后收尾时补发 error 事件。
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                self.set_upstream_error(UpstreamStreamError::Error {
+                    error_code: error_code.clone(),
+                    error_message: error_message.clone(),
+                });
                 Vec::new()
             }
             Event::Exception {
                 exception_type,
                 message,
             } => {
-                // 处理 ContentLengthExceededException
+                // ContentLengthExceededException 是上游的**合法终止**（长度到顶），
+                // 保持映射为 max_tokens，不当断流处理。其余 exception 均为中途失败。
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                    tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                } else {
+                    tracing::error!("收到异常事件: {} - {}", exception_type, message);
+                    self.set_upstream_error(UpstreamStreamError::Exception {
+                        exception_type: exception_type.clone(),
+                        message: message.clone(),
+                    });
                 }
-                tracing::warn!("收到异常事件: {} - {}", exception_type, message);
                 Vec::new()
             }
             _ => Vec::new(),
@@ -2503,6 +2608,23 @@ impl StreamContext {
             ));
         }
 
+        // 上游中途断流：同理补发 `error` 事件。客户端据此知道这条响应不完整、
+        // 应当重试，而不是把截断内容当成模型的最终答复提交进对话历史。
+        // 与上面的 tool_json_error 互不排斥（断流点恰在 tool 参数中间时两者都会置位），
+        // 但客户端只需看到任一 error 事件即可判定失败，重复发出无害。
+        if let Some(err) = &self.upstream_error {
+            events.push(SseEvent::new(
+                "error",
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": err.error_type(),
+                        "message": err.message()
+                    }
+                }),
+            ));
+        }
+
         events
     }
 }
@@ -2717,14 +2839,26 @@ impl BufferedStreamContext {
     /// 即只捕获那种 stop_reason 会兜底成裸 `end_turn` 的空响应（生产实测：大上下文
     /// 偶发，客户端见 end_turn 即停、用户被迫手动"继续"）。
     pub fn is_empty_response(&self) -> bool {
-        self.inner.output_tokens == 0
-            && !self.inner.state_manager.has_tool_use()
-            && !self.inner.state_manager.has_explicit_stop_reason()
+        if self.inner.output_tokens != 0 || self.inner.state_manager.has_tool_use() {
+            return false;
+        }
+        // 上游中途断流且零输出：这是**最该重试**的形态（还没吐出任何内容）。
+        // 断流会把 stop_reason 置为 `error`，若只看 has_explicit_stop_reason 会把它
+        // 误判成「上游合法终止、不可重试」，反而关掉兜底。故显式放行。
+        if self.inner.upstream_error.is_some() {
+            return true;
+        }
+        !self.inner.state_manager.has_explicit_stop_reason()
     }
 
     /// 工具调用 JSON 错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn tool_json_error_message(&self) -> Option<String> {
         self.inner.tool_json_error_message()
+    }
+
+    /// 上游中途断流的错误信息（转发内部 StreamContext）。缓冲流据此记 error。
+    pub fn upstream_error_message(&self) -> Option<String> {
+        self.inner.upstream_error_message()
     }
 }
 
@@ -4901,6 +5035,123 @@ mod tests {
             },
         ));
         assert!(!ctx.is_empty_response());
+    }
+
+    // ---- 上游中途断流（error / exception 帧）不再被静默吞掉 ----
+
+    fn upstream_error_event(code: &str, msg: &str) -> crate::kiro::model::events::Event {
+        crate::kiro::model::events::Event::Error {
+            error_code: code.to_string(),
+            error_message: msg.to_string(),
+        }
+    }
+
+    #[test]
+    fn mid_stream_error_after_text_is_not_reported_as_success() {
+        // 回归核心：上游先吐了文本、然后中途下发 error 帧。
+        // 旧行为 = 只记日志 → 流走「正常 EOF」分支 → stop_reason 兜底成 end_turn，
+        // 客户端拿到格式合法的截断响应，不重试、直接把残缺内容写进历史（丢上下文）。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&assistant_event("部分回答"));
+        ctx.process_and_buffer(&upstream_error_event(
+            "ThrottlingException",
+            "Too many requests",
+        ));
+
+        // 必须暴露错误，且不能被判成可重试的空响应（已经吐过字节了）。
+        let message = ctx
+            .upstream_error_message()
+            .expect("中途 error 帧必须被记录，不能静默吞掉");
+        assert!(message.contains("ThrottlingException"));
+        assert!(!ctx.is_empty_response(), "已有输出，不能重试（会重复扣费）");
+
+        // 收尾事件里必须有 error 事件，且 stop_reason 是 error 而非 end_turn。
+        let events = ctx.finish_and_get_all_events();
+        let err_evt = events
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("收尾必须补发 error 事件");
+        assert_eq!(err_evt.data["error"]["type"], "api_error");
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert_eq!(
+            delta.data["delta"]["stop_reason"], "error",
+            "绝不能兜底成 end_turn —— 那正是客户端把截断当成成功的原因"
+        );
+    }
+
+    #[test]
+    fn mid_stream_error_with_zero_output_stays_retryable() {
+        // 断流发生在任何输出之前：这是最该走透明重试的形态。
+        // set_upstream_error 会把 stop_reason 置为 error（has_explicit_stop_reason 变真），
+        // 若 is_empty_response 只看该标志就会误判成「合法终止、不可重试」，反而关掉兜底。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&upstream_error_event("InternalServerException", "boom"));
+        assert!(
+            ctx.is_empty_response(),
+            "零输出断流必须仍可重试，否则等于把空响应兜底关掉了"
+        );
+    }
+
+    #[test]
+    fn mid_stream_error_keeps_first_frame_only() {
+        // 断流后上游可能连发多帧，首帧才是根因。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&upstream_error_event("ThrottlingException", "first"));
+        ctx.process_and_buffer(&upstream_error_event("InternalServerException", "second"));
+        let message = ctx.upstream_error_message().unwrap();
+        assert!(message.contains("first"), "应保留首帧");
+        assert!(!message.contains("second"));
+    }
+
+    #[test]
+    fn content_length_exceeded_is_still_a_legal_termination() {
+        // ContentLengthExceededException 是上游合法终止（长度到顶），
+        // 不是断流：不置 upstream_error、保持映射为 max_tokens。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&crate::kiro::model::events::Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        });
+        assert!(
+            ctx.upstream_error_message().is_none(),
+            "长度到顶不是断流，不能记成上游失败"
+        );
+        assert!(!ctx.is_empty_response());
+    }
+
+    #[test]
+    fn other_exception_types_are_treated_as_interruptions() {
+        // 除 ContentLengthExceededException 外的 exception 都是中途失败。
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&assistant_event("half"));
+        ctx.process_and_buffer(&crate::kiro::model::events::Event::Exception {
+            exception_type: "ServiceUnavailableException".to_string(),
+            message: "upstream down".to_string(),
+        });
+        let message = ctx
+            .upstream_error_message()
+            .expect("非长度类 exception 必须记为断流");
+        assert!(message.contains("ServiceUnavailableException"));
+    }
+
+    #[test]
+    fn interrupted_stream_is_never_written_to_response_cache() {
+        // 断流响应绝不能进响应缓存 —— 否则命中期内每次回放都是残缺内容。
+        // 护栏来自 write_response_cache_if_clean 的 stop_reason != end_turn 检查。
+        let (cache, store, key) = make_test_store();
+        let mut ctx = empty_ctx();
+        ctx.set_response_cache_store(Some(store));
+        ctx.process_and_buffer(&assistant_event("部分回答"));
+        ctx.process_and_buffer(&upstream_error_event("ThrottlingException", "boom"));
+        let events = ctx.finish_and_get_all_events();
+        ctx.write_response_cache_if_clean(&events);
+        assert!(
+            cache.get(&key).is_none(),
+            "断流响应入缓存会把残缺内容固化、每次命中都回放"
+        );
     }
 
     // ---- write_response_cache_if_clean: 响应缓存写入护栏（与空响应兜底的交界）----

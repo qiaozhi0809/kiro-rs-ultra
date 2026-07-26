@@ -418,12 +418,24 @@ pub(super) fn map_provider_error_with_context(
     is_stream: bool,
     input_tokens: i32,
 ) -> Response {
-    let s = err.to_string();
-    if s.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
+    if is_context_full_error(&err.to_string()) {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满 → 改写为 200 + model_context_window_exceeded（客户端可触发 auto-compact）");
         return build_context_full_response(model, is_stream, input_tokens);
     }
     map_provider_error(err)
+}
+
+/// 上游「这次请求装不下了」的两种口径。
+///
+/// - `CONTENT_LENGTH_EXCEEDS_THRESHOLD`：对话历史累积超出模型上下文窗口。
+/// - `Input is too long`：单次请求体本身超出上游限制。
+///
+/// 两者的**客户端补救动作是同一个**：摘要 / 裁剪历史后重发。所以都要走
+/// `build_context_full_response`（200 + `model_context_window_exceeded`）——
+/// 回 400 的话 Claude Code 只会当成普通请求失败直接报错，不进 auto-compact 链路，
+/// 用户只能手动 `/compact`。
+fn is_context_full_error(err_str: &str) -> bool {
+    err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || err_str.contains("Input is too long")
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -1236,7 +1248,21 @@ fn create_sse_stream(
                             // 流结束，发送最终事件（generate_final_events 内部会 finish()
                             // 累积器，据此判定是否有半截 / 非法工具调用 JSON）。
                             let final_events = ctx.generate_final_events();
-                            if let Some(message) = ctx.tool_json_error_message() {
+                            if let Some(message) = ctx.upstream_error_message() {
+                                // 上游中途下发 error / exception 帧：这不是正常 EOF。实时流已回
+                                // 200 且已吐字节，无法改状态码，只能记 error 并让
+                                // generate_final_events 补发的 `error` 事件透传给客户端，
+                                // 由客户端判定重试——绝不能当 success 收尾（那会让客户端把
+                                // 截断内容当成模型的最终答复写进历史）。
+                                record_stream_usage(&hook, &ctx, credential_id, "error");
+                                tracer.finalize(
+                                    "interrupted",
+                                    Some(outcome::STREAM_INTERRUPTED),
+                                    Some(&message),
+                                    Some(sent_bytes),
+                                    stream_trace_usage(&ctx),
+                                );
+                            } else if let Some(message) = ctx.tool_json_error_message() {
                                 // 工具调用 JSON 半截 / 非法：实时流已回 200，无法改状态码，
                                 // 只能记 error 并让 generate_final_events 补发的 `error` 事件透传给客户端。
                                 record_stream_usage(&hook, &ctx, credential_id, "error");
@@ -1392,6 +1418,9 @@ async fn handle_non_stream_request(
     // 半截 / 非法 JSON 显式暴露为错误（返回 502），不再静默回退 {} 或丢弃。
     let mut tool_accumulator = super::stream::ToolJsonAccumulator::new();
     let mut tool_json_error: Option<super::stream::ToolJsonAccumulatorError> = None;
+    // 上游中途下发的失败帧（error / exception）。非流式路径尚未发字节，可直接回 502。
+    // 不捕获的话会把截断内容当成完整响应返回，客户端无从判断。
+    let mut upstream_error: Option<super::stream::UpstreamStreamError> = None;
 
     for result in decoder.decode_iter() {
         match result {
@@ -1455,10 +1484,37 @@ async fn handle_non_stream_request(
                             credits += metering.usage;
                             tracing::debug!("metering credits +{:.6}", metering.usage);
                         }
-                        Event::Exception { exception_type, .. } => {
+                        Event::Exception {
+                            exception_type,
+                            message,
+                        } => {
+                            // ContentLengthExceededException 是合法终止（长度到顶）；
+                            // 其余 exception 是中途失败，必须暴露。
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
+                            } else if upstream_error.is_none() {
+                                tracing::error!(
+                                    "收到异常事件: {} - {}",
+                                    exception_type,
+                                    message
+                                );
+                                upstream_error =
+                                    Some(super::stream::UpstreamStreamError::Exception {
+                                        exception_type,
+                                        message,
+                                    });
                             }
+                        }
+                        // 只留第一帧（断流后上游可能连发多帧，首帧才是根因）。
+                        Event::Error {
+                            error_code,
+                            error_message,
+                        } if upstream_error.is_none() => {
+                            tracing::error!("收到错误事件: {} - {}", error_code, error_message);
+                            upstream_error = Some(super::stream::UpstreamStreamError::Error {
+                                error_code,
+                                error_message,
+                            });
                         }
                         _ => {}
                     }
@@ -1468,6 +1524,25 @@ async fn handle_non_stream_request(
                 tracing::warn!("解码事件失败: {}", e);
             }
         }
+    }
+
+    // 上游中途断流：非流式路径尚未发送任何字节，直接回 502。优先于工具 JSON 错误判定
+    // ——断流是根因，半截 JSON 只是它的一种表现。
+    if let Some(err) = upstream_error {
+        let message = err.message();
+        hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+        tracer.finalize(
+            "interrupted",
+            Some(outcome::STREAM_INTERRUPTED),
+            Some(&message),
+            None,
+            TraceUsage::zero(),
+        );
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse::new("api_error", message)),
+        )
+            .into_response();
     }
 
     // 收尾：若仍有未收到 stop=true 的工具调用缓冲（上游在参数写到一半时截断），
@@ -2231,7 +2306,19 @@ fn create_buffered_sse_stream(
                                     cache_read_tokens: cr.max(0) as u64,
                                     credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
                                 };
-                                if let Some(message) = ctx.tool_json_error_message() {
+                                if let Some(message) = ctx.upstream_error_message() {
+                                    // 上游中途断流（重试额度已用尽或有部分输出不可重试）：
+                                    // 记 error 并透传 `error` 事件，不写响应缓存
+                                    // （write_response_cache_if_clean 也会因 stop_reason != end_turn 自守）。
+                                    hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                    tracer.finalize(
+                                        "interrupted",
+                                        Some(outcome::STREAM_INTERRUPTED),
+                                        Some(&message),
+                                        None,
+                                        trace_usage,
+                                    );
+                                } else if let Some(message) = ctx.tool_json_error_message() {
                                     hook.record(credential_id, i, o, cc, cr, credits, "error");
                                     tracer.finalize(
                                         "error",
@@ -2295,6 +2382,41 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn input_too_long_maps_to_200_context_window_exceeded() {
+        // 「Input is too long」与 CONTENT_LENGTH_EXCEEDS_THRESHOLD 的客户端补救动作相同
+        // （摘要/裁剪历史后重发），必须同走 200 + model_context_window_exceeded。
+        // 回 400 的话 Claude Code 只当普通失败报错，不进 auto-compact，用户被迫手动 /compact。
+        for needle in [
+            "Input is too long",
+            "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+        ] {
+            let resp = map_provider_error_with_context(
+                anyhow::anyhow!(needle.to_string()),
+                "claude-opus-5",
+                false,
+                12345,
+            );
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{needle} 必须回 200 才能触发客户端 auto-compact"
+            );
+        }
+    }
+
+    #[test]
+    fn is_context_full_error_does_not_overmatch() {
+        // 护栏：别把无关错误误判成上下文满（那会把真故障伪装成 200 成功响应）。
+        assert!(is_context_full_error("Input is too long"));
+        assert!(is_context_full_error(
+            "ValidationException: CONTENT_LENGTH_EXCEEDS_THRESHOLD"
+        ));
+        assert!(!is_context_full_error("connection reset by peer"));
+        assert!(!is_context_full_error("ThrottlingException"));
+        assert!(!is_context_full_error("input is too short"));
     }
 
     #[test]
