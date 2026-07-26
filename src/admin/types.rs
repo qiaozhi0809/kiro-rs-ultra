@@ -934,6 +934,12 @@ pub struct ClientKeyItem {
     /// 检测安全计费·multiplier 护栏上限覆盖（null = 用默认 1.25）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_multiplier_cap: Option<f64>,
+    /// 标准计费模式开关覆盖（null = 用默认 false）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_billing_mode: Option<bool>,
+    /// creation 占比覆盖（null = 用默认 0.03），仅 `cache_billing_mode=true` 生效。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_ratio: Option<f64>,
     /// prompt 过滤：simplify_cc。
     #[serde(default)]
     pub simplify_cc_prompt: bool,
@@ -994,6 +1000,12 @@ pub struct UpdateClientKeyRequest {
     /// 检测安全计费·multiplier 护栏上限覆盖（缺省 = 不变）。clamp [0.1,1.25]。
     #[serde(default)]
     pub cache_multiplier_cap: Option<f64>,
+    /// 标准计费模式覆盖（缺省 = 不变）。
+    #[serde(default)]
+    pub cache_billing_mode: Option<bool>,
+    /// creation 占比覆盖（缺省 = 不变）。clamp [0,1]。
+    #[serde(default)]
+    pub cache_creation_ratio: Option<f64>,
     /// prompt 过滤三开关（缺省 = 不变）。
     #[serde(default)]
     pub simplify_cc_prompt: Option<bool>,
