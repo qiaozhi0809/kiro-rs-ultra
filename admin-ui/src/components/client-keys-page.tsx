@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw,
+  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw, ChevronRight,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -531,13 +531,16 @@ export function ClientKeysPage() {
             </div>
 
             {/* 检测安全计费（R 阻尼 + multiplier 护栏，sum 恒==total，非超报） */}
-            <div className="rounded-lg border border-border/60 p-3">
-              <div>
-                <label className="text-[13px] font-medium">检测安全计费</label>
-                <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  三桶 token 总数恒等真实用量（sum 不超）。R&lt;1 把便宜 read（0.1×）挪到贵 input（1.0×），加权收入变高即 margin；护栏兜住 multiplier 上限（默认 1.25）。
-                </p>
-              </div>
+            <details className="group rounded-lg border border-border/60">
+              <summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2 marker:hidden [&::-webkit-details-marker]:hidden">
+                <div className="flex-1 pr-2">
+                  <span className="text-[13px] font-medium">计费策略</span>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">R 阻尼(超报总旋钮) + 护栏 + Anthropic 标准计费模式</p>
+                </div>
+                <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
+              </summary>
+              <div className="border-t border-border/60 p-3 space-y-3">
+                <p className="text-[11px] text-muted-foreground">三桶 token 总数恒等真实用量（sum 不超）。R&lt;1 把便宜 read（0.1×）挪到贵 input（1.0×），加权收入变高即 margin；护栏兜住 multiplier 上限（默认 1.25）。</p>
               {/* 利润档滑块（复用 R）：R 越低越激进——挪桶幅度越大、加权收入倍数越高、展示命中率越低 */}
               {(() => {
                 const rParsed = editReadRatio.trim() === '' ? 1.0 : parseFloat(editReadRatio)
@@ -640,15 +643,18 @@ export function ClientKeysPage() {
                 </div>
               </div>
             </div>
+            </details>
 
             {/* prompt 过滤（省 prefill） */}
-            <div className="rounded-lg border border-border/60 p-3 space-y-2.5">
-              <div>
-                <label className="text-[13px] font-medium">Prompt 过滤</label>
-                <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  转换前裁剪客户端 system，省 prefill token。
-                </p>
-              </div>
+            <details className="group rounded-lg border border-border/60">
+              <summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2 marker:hidden [&::-webkit-details-marker]:hidden">
+                <div className="flex-1 pr-2">
+                  <span className="text-[13px] font-medium">Prompt 过滤</span>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">转换前裁剪客户端 system，省 prefill token。</p>
+                </div>
+                <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
+              </summary>
+              <div className="border-t border-border/60 p-3 space-y-2.5">
               <div className="flex items-center justify-between">
                 <div className="pr-3">
                   <span className="text-[12px]">简化 Claude Code 提示</span>
@@ -668,18 +674,21 @@ export function ClientKeysPage() {
                 <Switch checked={editStripEnv} onCheckedChange={setEditStripEnv} disabled={updateKey.isPending} />
               </div>
             </div>
+            </details>
 
             {/* 真实响应缓存 */}
-            <div className="rounded-lg border border-border/60 p-3">
-              <div className="flex items-center justify-between">
-                <div className="pr-3">
-                  <label className="text-[13px] font-medium">响应缓存</label>
-                  <p className="mt-0.5 text-[11px] text-muted-foreground">
-                    同请求（同会话/model/messages/tools）命中直接回放，跳过上游。只缓存干净 end_turn 响应。
-                  </p>
+            <details className="group rounded-lg border border-border/60">
+              <summary className="flex cursor-pointer list-none items-center justify-between px-3 py-2 marker:hidden [&::-webkit-details-marker]:hidden">
+                <div className="flex-1 pr-2">
+                  <span className="text-[13px] font-medium">响应缓存</span>
+                  <p className="mt-0.5 text-[11px] text-muted-foreground">同请求（同会话/model/messages/tools）命中直接回放，跳过上游。只缓存干净 end_turn 响应。</p>
                 </div>
-                <Switch checked={editRespCache} onCheckedChange={setEditRespCache} disabled={updateKey.isPending} />
-              </div>
+                <div className="flex items-center gap-2">
+                  <Switch checked={editRespCache} onCheckedChange={setEditRespCache} disabled={updateKey.isPending} onClick={(e) => e.stopPropagation()} />
+                  <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
+                </div>
+              </summary>
+              <div className="border-t border-border/60 p-3">
               {editRespCache && (
                 <div className="mt-3">
                   <label className="text-[11px] text-muted-foreground">TTL（秒）</label>
@@ -696,6 +705,7 @@ export function ClientKeysPage() {
                 </div>
               )}
             </div>
+            </details>
 
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>
