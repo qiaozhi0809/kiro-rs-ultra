@@ -538,19 +538,22 @@ export function ClientKeysPage() {
                   上报恒 == 真实用量（不超报）。R&lt;1 把便宜的 read 挪回 input 出 margin，护栏保证 multiplier 永不越上限。
                 </p>
               </div>
-              {/* 利润档滑块（复用 R）：命中率≈R，multiplier≈1−0.9R；越左命中越高利润越低 */}
+              {/* 利润档滑块（复用 R）：R 越低越激进——挪桶幅度越大、加权收入倍数越高、展示命中率越低 */}
               {(() => {
                 const rParsed = editReadRatio.trim() === '' ? 1.0 : parseFloat(editReadRatio)
                 const rv = Number.isFinite(rParsed) ? Math.min(1, Math.max(0, rParsed)) : 1.0
-                const capParsed = editMultiplierCap.trim() === '' ? 1.25 : parseFloat(editMultiplierCap)
-                const cap = Number.isFinite(capParsed) ? Math.min(1.25, Math.max(0.1, capParsed)) : 1.25
+                // 命中率上限估计：假设 prefix 全部覆盖（暖轮上界）；实际展示命中率 ≈ R × prefix_coverage，前端拿不到 coverage 精确值
                 const hit = Math.round(rv * 100)
-                const mult = Math.min(cap, 1 - 0.9 * rv)
-                const band: [string, string] = mult <= 1.0
-                  ? ['正常', 'text-emerald-600']
-                  : mult <= 1.25
+                // 加权收入倍数估计（暖轮 baseline=1，1.0=无护栏上界）：
+                // R=1 → read 全留，weighted ≈ read×0.1 → 0.1× baseline（最低）
+                // R=0 → read 全挪 input，weighted ≈ input×1.0 → 1.0× baseline（最高，差 10 倍）
+                const mult = 0.1 + 0.9 * (1 - rv)
+                // 检测带按 R 激进度分档（R 越低 = 挪桶越激进 = 超报幅度越大 = 检测风险越高）
+                const band: [string, string] = rv >= 0.8
+                  ? ['稳健', 'text-emerald-600']
+                  : rv >= 0.5
                   ? ['临界', 'text-amber-600']
-                  : ['异常', 'text-red-600']
+                  : ['激进', 'text-red-600']
                 return (
                   <div className="mt-3">
                     <div className="mb-1 flex items-center justify-between">
@@ -574,10 +577,13 @@ export function ClientKeysPage() {
                       <span>利润高·命中率低 →</span>
                     </div>
                     <div className="mt-2 flex items-center gap-3 rounded bg-muted/60 px-2 py-1 text-[11px]">
-                      <span>预计命中率 <b>{hit}%</b></span>
+                      <span>命中率上限 <b>{hit}%</b></span>
                       <span>multiplier <b>{mult.toFixed(2)}×</b></span>
                       <span>检测带 <b className={band[1]}>{band[0]}</b></span>
                     </div>
+                    <p className="mt-1 text-[10px] text-muted-foreground/70">
+                      预览假设 prefix 全部覆盖（暖轮上界）；冷轮/半覆盖下命中率会按 prefix 比例进一步折算，实际值更低。
+                    </p>
                   </div>
                 )
               })()}
@@ -591,11 +597,11 @@ export function ClientKeysPage() {
                   placeholder="默认 1.25"
                   value={editMultiplierCap}
                   onChange={(e) => setEditMultiplierCap(e.target.value)}
-                  disabled={updateKey.isPending}
+                  disabled={updateKey.isPending || editBillingMode}
                   className="mt-1 h-8 w-32"
                 />
                 <p className="mt-2 text-[11px] text-muted-foreground">
-                  R 越低 margin 越高、命中率显示越低；护栏兜底 weighted/total ≤ 上限。留空用默认值（纯真实形状）。
+                  R 越低 margin 越高、命中率显示越低；护栏兜底 weighted/total ≤ 上限。留空用默认值（纯真实形状）。<b className="text-amber-600">标准计费模式开启时护栏失效，此输入不可编辑</b>。
                 </p>
               </div>
               {/* Anthropic 标准计费模式（互斥于上面的检测安全默认）*/}
