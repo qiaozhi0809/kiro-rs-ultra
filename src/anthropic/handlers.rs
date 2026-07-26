@@ -1227,10 +1227,28 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束（记为 error）
+                            // **关键**：显式置位 upstream_error（Transport 变体），让
+                            // generate_final_events 补发 `event: error` + `stop_reason=error`。
+                            //
+                            // 若不置位：generate_final_events 会按 get_stop_reason() 兜底
+                            // 成 `tool_use` / `end_turn`——客户端拿到"格式合法的截断响应"、
+                            // 无从判定失败，把不完整的 assistant 落进本地 transcript；后续
+                            // 几轮基于错乱历史继续 → **记忆错位**（生产实测：模型看似正常
+                            // 忙碌但方向全错、代码越改越乱）。
+                            //
+                            // 这条分支覆盖生产上最常见的断流形态：reqwest 底层报
+                            // "error decoding response body"（240s/720s 硬边界、CF 踢连接、
+                            // 上游服务端断等）；`Event::Error` 那条分支（上游主动错帧）
+                            // 只是理论路径，同一 fix 复用 set_upstream_error 接线到同一
+                            // 收尾逻辑。
+                            ctx.set_upstream_error(
+                                super::stream::UpstreamStreamError::Transport {
+                                    cause: e.to_string(),
+                                    sent_bytes,
+                                },
+                            );
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
-                            // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
                                 "interrupted",
                                 Some(outcome::STREAM_INTERRUPTED),
@@ -2250,11 +2268,19 @@ fn create_buffered_sse_stream(
                             }
                             Some(Err(e)) => {
                                 tracing::error!("读取响应流失败: {}", e);
-                                // 发生错误，完成处理并返回所有事件
+                                // 与增量流式同样接线：显式暴露断流，让 finish_and_get_all_events
+                                // 补发 `event: error` + `stop_reason=error`，避免客户端把不完整的
+                                // 缓冲响应当成合法答复落进 transcript（详见 stream.rs 中
+                                // `UpstreamStreamError::Transport` 文档）。
+                                ctx.set_upstream_error(
+                                    super::stream::UpstreamStreamError::Transport {
+                                        cause: e.to_string(),
+                                        sent_bytes,
+                                    },
+                                );
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
                                     "interrupted",
                                     Some(outcome::STREAM_INTERRUPTED),

@@ -978,6 +978,17 @@ pub enum UpstreamStreamError {
         exception_type: String,
         message: String,
     },
+    /// HTTP 传输层断流：上游连接被 reset / decode 失败 / 超时（如 `error decoding
+    /// response body`）。**这是生产上最常见的断流形态**（reqwest 底层报错），跟
+    /// 上面两种"上游主动下发错帧"是**不同入口**——那两种由 `process_kiro_event` 触发；
+    /// 这种由 `handle_stream_request` 的 `body_stream.next() == Some(Err(_))` 分支
+    /// 触发，必须显式暴露，否则会走"上游正常 EOF"分支被 `generate_final_events` 用
+    /// `stop_reason: tool_use / end_turn` 兜底成看似合法的截断响应，让客户端把不完整
+    /// 的 assistant 轮落进 transcript → 后续几轮基于错乱历史继续 → 记忆错位。
+    Transport {
+        cause: String,
+        sent_bytes: u64,
+    },
 }
 
 impl UpstreamStreamError {
@@ -1004,6 +1015,11 @@ impl UpstreamStreamError {
             } => format!(
                 "Upstream raised {} mid-stream: {}. The response is incomplete and was not committed.",
                 exception_type, message
+            ),
+            Self::Transport { cause, sent_bytes } => format!(
+                "Upstream connection was interrupted mid-response after {} bytes: {}. \
+                The response is incomplete — do not commit any partial content to the conversation.",
+                sent_bytes, cause
             ),
         }
     }
@@ -1532,7 +1548,7 @@ impl StreamContext {
     /// 只保留**第一个**错误：断流后上游可能连发多帧，首帧才是根因。
     /// `stop_reason` 覆写为 `error` 是关键——否则 `get_stop_reason()` 会按
     /// `has_tool_use` 回落到 `tool_use` / `end_turn`，客户端就看不出这是失败。
-    fn set_upstream_error(&mut self, err: UpstreamStreamError) {
+    pub fn set_upstream_error(&mut self, err: UpstreamStreamError) {
         if self.upstream_error.is_some() {
             return;
         }
@@ -2882,6 +2898,14 @@ impl BufferedStreamContext {
     /// 上游中途断流的错误信息（转发内部 StreamContext）。缓冲流据此记 error。
     pub fn upstream_error_message(&self) -> Option<String> {
         self.inner.upstream_error_message()
+    }
+
+    /// 记录上游中途断流并覆写 stop_reason（转发内部 StreamContext）。
+    /// 用于 handler 层检测到 HTTP 传输失败（reqwest 报 `error decoding response body`
+    /// 等）时接线到统一的 error 事件补发链路，与 `Event::Error` / `Event::Exception`
+    /// 走同一收尾路径。详见 [`UpstreamStreamError`]。
+    pub fn set_upstream_error(&mut self, err: UpstreamStreamError) {
+        self.inner.set_upstream_error(err);
     }
 }
 
@@ -5174,6 +5198,85 @@ mod tests {
         assert!(
             cache.get(&key).is_none(),
             "断流响应入缓存会把残缺内容固化、每次命中都回放"
+        );
+    }
+
+    // ---- HTTP 传输层断流（生产上最常见的断流形态）----
+
+    #[test]
+    fn transport_interrupt_after_text_forces_error_stop_reason() {
+        // 回归核心：reqwest 底层报 "error decoding response body" 时，handler 层
+        // 会调 set_upstream_error(Transport{..})。收尾时必须：
+        //   1) 补发一个 `event: error`（否则客户端见不到失败）
+        //   2) stop_reason 被覆写为 `error`（否则会兜底成 tool_use / end_turn，
+        //      客户端把不完整 assistant 落 transcript → 记忆错位）
+        let mut ctx = empty_ctx();
+        ctx.process_and_buffer(&assistant_event("这是模型开始输出但中途"));
+        ctx.set_upstream_error(UpstreamStreamError::Transport {
+            cause: "error decoding response body".to_string(),
+            sent_bytes: 12345,
+        });
+
+        let message = ctx
+            .upstream_error_message()
+            .expect("Transport 断流必须被记录，不能吞掉");
+        assert!(message.contains("error decoding response body"));
+        assert!(message.contains("12345"), "字节数应体现在错误信息里，供 CC 判定");
+
+        // 有输出 → 不算 empty，不能透明重试（会重复扣费 + 二次输出）
+        assert!(!ctx.is_empty_response(), "已有输出，不重试");
+
+        let events = ctx.finish_and_get_all_events();
+
+        let err_evt = events
+            .iter()
+            .find(|e| e.event == "error")
+            .expect("Transport 断流收尾必须补发 error 事件");
+        assert_eq!(err_evt.data["error"]["type"], "api_error");
+
+        let delta = events
+            .iter()
+            .find(|e| e.event == "message_delta")
+            .expect("应有 message_delta");
+        assert_eq!(
+            delta.data["delta"]["stop_reason"], "error",
+            "绝不能兜底成 tool_use/end_turn —— 那正是造成记忆错位的原因"
+        );
+    }
+
+    #[test]
+    fn transport_interrupt_with_zero_output_stays_retryable() {
+        // 断流发生在任何输出之前：这是唯一该走透明重试的形态。
+        // set_upstream_error 会把 stop_reason 置为 error（has_explicit_stop_reason 变真），
+        // 若 is_empty_response 只看该标志就会误判成「合法终止、不可重试」，把兜底关掉。
+        let mut ctx = empty_ctx();
+        ctx.set_upstream_error(UpstreamStreamError::Transport {
+            cause: "connection reset".to_string(),
+            sent_bytes: 0,
+        });
+        assert!(
+            ctx.is_empty_response(),
+            "零输出的 Transport 断流仍应走空响应透明重试"
+        );
+    }
+
+    #[test]
+    fn transport_interrupt_never_reaches_response_cache() {
+        // 断流响应绝不能进响应缓存 —— stop_reason=error 让 write_response_cache_if_clean
+        // 的 end_turn 护栏自然拒收。守住这条不变量。
+        let (cache, store, key) = make_test_store();
+        let mut ctx = empty_ctx();
+        ctx.set_response_cache_store(Some(store));
+        ctx.process_and_buffer(&assistant_event("部分回答"));
+        ctx.set_upstream_error(UpstreamStreamError::Transport {
+            cause: "peer closed".to_string(),
+            sent_bytes: 100,
+        });
+        let events = ctx.finish_and_get_all_events();
+        ctx.write_response_cache_if_clean(&events);
+        assert!(
+            cache.get(&key).is_none(),
+            "Transport 断流响应入缓存会把残缺内容固化、每次命中都回放"
         );
     }
 
