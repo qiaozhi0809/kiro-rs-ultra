@@ -535,7 +535,7 @@ export function ClientKeysPage() {
               <div>
                 <label className="text-[13px] font-medium">检测安全计费</label>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  上报恒 == 真实用量（不超报）。R&lt;1 把便宜的 read 挪回 input 出 margin，护栏保证 multiplier 永不越上限。
+                  三桶 token 总数恒等真实用量（sum 不超）。R&lt;1 把便宜 read（0.1×）挪到贵 input（1.0×），加权收入变高即 margin；护栏兜住 multiplier 上限（默认 1.25）。
                 </p>
               </div>
               {/* 利润档滑块（复用 R）：R 越低越激进——挪桶幅度越大、加权收入倍数越高、展示命中率越低 */}
@@ -610,7 +610,7 @@ export function ClientKeysPage() {
                   <div>
                     <div className="text-sm">Anthropic 标准计费模式</div>
                     <p className="text-[11px] text-muted-foreground">
-                      开启后 usage 走<b>真实 Anthropic 互斥三桶口径</b>（input+creation+read 恒等真实量，<b className="text-amber-600">绝不超报、不双重收费</b>），利润来自 R 挪桶（read→input）。与默认的唯一区别：<b className="text-amber-600">不施加上面的 multiplier 护栏</b>（接受更高检测风险换 margin）。creation 形状由下方 creation 占比定。默认关=检测安全比例分摊（受护栏）。
+                      开启后走 Anthropic 互斥三桶口径：sum 恒等真实 total，但<b>桶形状由 creation 占比合成，不看真实缓存命中</b>。与默认档的关键区别：<b className="text-amber-600">不施加 multiplier 护栏</b>——想真正比默认档多赚，得把上面的护栏收紧到 ≤1.0；默认 cap=1.25 下开启反而不如默认档。creation 形状由下方 creation 占比定。默认关=默认档（受护栏）。
                     </p>
                   </div>
                   <Switch
