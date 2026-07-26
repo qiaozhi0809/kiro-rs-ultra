@@ -598,6 +598,41 @@ export function ClientKeysPage() {
                   R 越低 margin 越高、命中率显示越低；护栏兜底 weighted/total ≤ 上限。留空用默认值（纯真实形状）。
                 </p>
               </div>
+              {/* Anthropic 标准计费模式（互斥于上面的检测安全默认）*/}
+              <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">Anthropic 标准计费模式</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      开启后 usage 走<b>真实 Anthropic 互斥三桶口径</b>（input+creation+read 恒等真实量，<b className="text-amber-600">绝不超报、不双重收费</b>），利润来自 R 挪桶（read→input）。与默认的唯一区别：<b className="text-amber-600">不施加上面的 multiplier 护栏</b>（接受更高检测风险换 margin）。creation 形状由下方 creation 占比定。默认关=检测安全比例分摊（受护栏）。
+                    </p>
+                  </div>
+                  <Switch
+                    checked={editBillingMode}
+                    onCheckedChange={setEditBillingMode}
+                    disabled={updateKey.isPending}
+                  />
+                </div>
+                <div className="mt-2 flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm">creation 占比</div>
+                    <p className="text-[11px] text-muted-foreground">
+                      留空=默认 3%（0.03）；0~1。creation = cacheable × 占比，定“每轮写多少缓存”的形状。与 R 正交，二者都不破坏 sum==total。仅本模式生效。
+                    </p>
+                  </div>
+                  <Input
+                    type="number"
+                    min="0"
+                    max="1"
+                    step="0.01"
+                    placeholder="默认 0.03"
+                    value={editCreationRatio}
+                    onChange={(e) => setEditCreationRatio(e.target.value)}
+                    disabled={updateKey.isPending || !editBillingMode}
+                    className="h-8 w-28 text-xs"
+                  />
+                </div>
+              </div>
             </div>
 
             {/* prompt 过滤（省 prefill） */}
