@@ -1424,10 +1424,11 @@ impl StreamContext {
     /// 解析最终上报口径的 `(input_tokens, cache_creation, cache_read)`。
     ///
     /// total 真值优先取 contextUsage（上游真实百分比×窗口），否则用客户端估算的
-    /// `input_tokens`；再由 [`CacheUsage::split_against_total`] 做互斥分摊。
+    /// `input_tokens`；再由 [`CacheUsage::split_final`] 按 `billing_mode` 分流做互斥分摊
+    /// （默认 false 走 [`CacheUsage::split_against_total`]，字节一致）。
     pub fn resolved_usage(&self) -> (i32, i32, i32) {
         let total_real = self.context_input_tokens.unwrap_or(self.input_tokens);
-        self.cache_usage.split_against_total(total_real)
+        self.cache_usage.split_final(total_real)
     }
 
     /// 工具调用 JSON 错误信息（非法 / 半截）。上层据此把本次请求记为 error、

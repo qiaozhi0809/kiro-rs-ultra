@@ -69,6 +69,14 @@ pub struct ClientKey {
     /// 超此值时把 input→read 压回。收紧到 1.0 留足检测余量；clamp 到 [0.1, 1.25]。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_multiplier_cap: Option<f64>,
+    /// 标准计费模式 per-key 开关（None = 用默认 false=走比例分摊+护栏）。开启后走互斥三桶
+    /// （sum 恒等 total，不施加护栏），利润来自 R 挪桶。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_billing_mode: Option<bool>,
+    /// 标准计费模式 creation 占比 per-key 覆盖（None = 用默认 0.03）。仅 `billing_mode=true` 生效，
+    /// 与 `cache_read_ratio` 正交。clamp [0,1]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_ratio: Option<f64>,
 
     /// prompt 过滤：检测到 Claude Code CLI system 时整段换成极小 backend prompt（省 prefill）。默认关。
     #[serde(default, skip_serializing_if = "is_false")]
@@ -220,6 +228,8 @@ impl ClientKeyManager {
             is_system: false,
             cache_read_ratio: None,
             cache_multiplier_cap: None,
+            cache_billing_mode: None,
+            cache_creation_ratio: None,
             simplify_cc_prompt: false,
             strip_boundary_markers: false,
             strip_env_noise: false,
@@ -300,6 +310,8 @@ impl ClientKeyManager {
                     is_system: true,
                     cache_read_ratio: None,
                     cache_multiplier_cap: None,
+                    cache_billing_mode: None,
+                    cache_creation_ratio: None,
                     simplify_cc_prompt: false,
                     strip_boundary_markers: false,
                     strip_env_noise: false,
@@ -391,6 +403,16 @@ impl ClientKeyManager {
         self.inner.read().entries.get(&id).and_then(|e| e.cache_multiplier_cap)
     }
 
+    /// 该 Key 的标准计费模式覆盖（None = 用默认 false；Key 不存在也返回 None）。
+    pub fn cache_billing_mode_of(&self, id: u64) -> Option<bool> {
+        self.inner.read().entries.get(&id).and_then(|e| e.cache_billing_mode)
+    }
+
+    /// 该 Key 的 creation 占比覆盖（None = 用默认 0.03；Key 不存在也返回 None）。
+    pub fn cache_creation_ratio_of(&self, id: u64) -> Option<f64> {
+        self.inner.read().entries.get(&id).and_then(|e| e.cache_creation_ratio)
+    }
+
     /// prompt 过滤：simplify_cc（Key 不存在默认 false）。
     pub fn simplify_cc_prompt_of(&self, id: u64) -> bool {
         self.inner.read().entries.get(&id).map(|e| e.simplify_cc_prompt).unwrap_or(false)
@@ -473,13 +495,15 @@ impl ClientKeyManager {
         updated
     }
 
-    /// 更新 Key 的检测安全计费配置。任一参数为 `None` 表示该项不变。
-    /// `read_ratio` / `multiplier_cap` 的内层 `Option` 是「设为该值 / 清空回默认」。
+    /// 更新 Key 的检测安全计费配置。任一外层 `Option` 为 `None` 表示该项不变；
+    /// 内层 `Option` 是「设为该值 / 清空回默认」。
     pub fn update_billing(
         &self,
         id: u64,
         read_ratio: Option<Option<f64>>,
         multiplier_cap: Option<Option<f64>>,
+        billing_mode: Option<Option<bool>>,
+        creation_ratio: Option<Option<f64>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -496,6 +520,14 @@ impl ClientKeyManager {
                             crate::anthropic::cache_metering::DEFAULT_MULTIPLIER_CAP,
                         )
                     });
+                }
+                // 标准计费模式开关：无 clamp，直接赋值（None=清空回默认 false）。
+                if let Some(v) = billing_mode {
+                    e.cache_billing_mode = v;
+                }
+                if let Some(v) = creation_ratio {
+                    // creation 占比 clamp 到 [0,1]，避免 per-key 配出越界值。
+                    e.cache_creation_ratio = v.map(|r| r.clamp(0.0, 1.0));
                 }
                 true
             }

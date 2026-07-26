@@ -32,6 +32,10 @@ pub struct KeyContext {
     pub cache_read_ratio: Option<f64>,
     /// 检测安全计费·multiplier 护栏上限覆盖（None = 用默认 1.25）。保证 multiplier 永不越检测线。
     pub cache_multiplier_cap: Option<f64>,
+    /// 标准计费模式开关覆盖（None = 用默认 false）。开启后走互斥三桶、不施加护栏。
+    pub cache_billing_mode: Option<bool>,
+    /// 标准计费模式 creation 占比覆盖（None = 用默认 0.03）。仅 billing_mode=true 生效。
+    pub cache_creation_ratio: Option<f64>,
     /// prompt 过滤：检测到 Claude Code CLI system 时整段替换为极小 backend prompt（省 prefill）。
     pub simplify_cc_prompt: bool,
     /// prompt 过滤：删除 `--- SYSTEM PROMPT ---` 边界标记行。
@@ -156,6 +160,8 @@ pub async fn auth_middleware(
                 key_source: TraceKeySource::ClientKey,
                 cache_read_ratio: mgr.cache_read_ratio_of(id),
                 cache_multiplier_cap: mgr.cache_multiplier_cap_of(id),
+                cache_billing_mode: mgr.cache_billing_mode_of(id),
+                cache_creation_ratio: mgr.cache_creation_ratio_of(id),
                 simplify_cc_prompt: mgr.simplify_cc_prompt_of(id),
                 strip_boundary_markers: mgr.strip_boundary_markers_of(id),
                 strip_env_noise: mgr.strip_env_noise_of(id),

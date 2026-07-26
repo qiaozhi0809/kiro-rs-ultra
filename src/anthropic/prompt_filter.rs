@@ -168,6 +168,8 @@ mod tests {
             key_source: TraceKeySource::ClientKey,
             cache_read_ratio: None,
             cache_multiplier_cap: None,
+            cache_billing_mode: None,
+            cache_creation_ratio: None,
             simplify_cc_prompt: cc,
             strip_boundary_markers: boundary,
             strip_env_noise: env,

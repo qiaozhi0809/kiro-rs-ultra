@@ -1185,10 +1185,14 @@ pub async fn update_client_key(
     let billing_touched = payload.cache_read_ratio.is_some()
         || payload.cache_multiplier_cap.is_some();
     let billing_ok = if billing_touched {
+        // TODO(Task 7): 末两参临时 None（不改动），DTO 加字段后替换为
+        // payload.cache_billing_mode.map(Some) / payload.cache_creation_ratio.map(Some)。
         state.client_keys.update_billing(
             id,
             payload.cache_read_ratio.map(Some),
             payload.cache_multiplier_cap.map(Some),
+            None,
+            None,
         )
     } else {
         meta_ok
