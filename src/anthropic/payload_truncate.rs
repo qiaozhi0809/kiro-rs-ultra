@@ -24,17 +24,32 @@ use super::types::{Message, MessagesRequest};
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::model::config::ToolCompatibilityMode;
 
-/// 默认整包字节上限。取在失败区中位数(实测 ~685KB)之下,使其在上游 400 之前介入,
-/// 同时不动正常流量。`0` 禁用。
-const DEFAULT_MAX_PAYLOAD_BYTES: usize = 640_000;
+/// 默认整包字节上限。
+///
+/// **历史坑**: 老默认 640KB 是按 200K token 窗口标定的（对齐当年实测的 ~685KB 单字段
+/// 失败线）。搬到 Claude 5 系（opus-5 / sonnet-5 / fable-5，`get_context_window_size`
+/// 报 1_000_000）上就变成"1M 窗口的 ~20% 就开始砍"——真实症状是**断线重连时**
+/// Claude Code 重发全量历史，那一发正好是本次会话最大的 payload，直接被砍到 6 条 +
+/// 占位符，用户侧表现为"重连后完全没记忆"。
+///
+/// 3.5MB ≈ 用本项目 token 估算口径覆盖 1M 窗口的常见负载；上游真放不下时也会先返回
+/// `CONTENT_LENGTH_EXCEEDS_THRESHOLD`，被 `map_provider_error_with_context` 改写为
+/// 200 + `model_context_window_exceeded`，客户端 auto-compact 兜住，绝不会因为放宽
+/// 这个上限而回退成 400。
+///
+/// `0` 禁用。要恢复旧行为改小即可。
+const DEFAULT_MAX_PAYLOAD_BYTES: usize = 3_500_000;
 
-/// 恒保留的最近 `messages` 条数(当前消息 + 最近上下文存活)。
-const MIN_RECENT_TURNS: usize = 6;
+/// 恒保留的最近 `messages` 条数（含当前消息）。
+///
+/// 6 是老值，本意是"总归留一点最新上下文"，但真触发裁剪时会把长会话塌成 6 条 + 占位符——
+/// 相当于强制失忆。20 让裁剪介入时仍能保住最近一段有意义的对话，兜底但不粗暴。
+const MIN_RECENT_TURNS: usize = 20;
 
 /// 裁剪迭代硬上限(每次一次重转换);安全边界,正常 1-2 次即够。
 const MAX_TRIM_ITERS: usize = 12;
 
-/// 裁掉旧消息处插入的占位符(作为一个 user 轮)。
+/// 裁掉旧消息处插入的占位符（作为一个 user 轮）。
 const TRUNCATION_PLACEHOLDER: &str = "[Earlier conversation history was truncated to fit the model's input limit. \
 Older messages and tool activity have been omitted.]";
 
@@ -168,13 +183,39 @@ fn convert_within_limit_counted(
         conversions += 1;
     }
 
-    // 有界修正:若单趟估计仍超(各轮大小不均),逐条再丢。上限 MAX_TRIM_ITERS,正常不进入。
+    // 有界修正：若单趟估计仍超（各轮大小不均），继续裁。
+    //
+    // **原实现的坑**（老默认 MIN=6 时被掩盖，抬到 MIN=20 才暴露）：`drop_oldest_turns`
+    // 会在裁点插回一个占位符，所以「丢 1 条」净减 0 条消息——每次调用后 messages.len()
+    // 不变。老循环每轮只请求丢 1 条，进入这里几乎不推进。此时唯一的进展来自「占位符
+    // 比被替换的旧消息略小」，微不足道，直到触碰 MAX_TRIM_ITERS 上限。
+    //
+    // 正确做法：按仍超字节比例算出一次要跨过去的"旧轮数"，让 split_off 真的把这些内容
+    // 从保留区移走；每轮实打实缩小 payload。仍超且 len 已到 MIN_RECENT_TURNS 时停手——
+    // 后续要么客户端 auto-compact，要么上游返回 CONTENT_LENGTH_EXCEEDS_THRESHOLD 被
+    // 改写成 200 + model_context_window_exceeded，都比在这里死循环强。
     let mut iters = 0;
-    while converted_payload_bytes(&result) > cfg.max_bytes
-        && payload.messages.len() > MIN_RECENT_TURNS
-        && iters < MAX_TRIM_ITERS
-    {
-        if !drop_oldest_turns(&mut payload.messages, 1) {
+    while iters < MAX_TRIM_ITERS {
+        let cur = converted_payload_bytes(&result);
+        if cur <= cfg.max_bytes {
+            break;
+        }
+        // 已经缩到最小保留窗口：停手（配合 map_provider_error_with_context 兜底）。
+        if payload.messages.len() <= MIN_RECENT_TURNS + 1 {
+            break;
+        }
+        let over = cur - cfg.max_bytes;
+        let avg = (cur / payload.messages.len().max(1)).max(1);
+        // 保留区: MIN_RECENT_TURNS。首条如果已是占位符则也不能再裁。
+        // trimmable = 从 index=1 起到 len-MIN_RECENT_TURNS。
+        let trimmable = payload.messages.len().saturating_sub(MIN_RECENT_TURNS).max(1);
+        let want = (over / avg + 1).min(trimmable);
+        let before_len = payload.messages.len();
+        if !drop_oldest_turns(&mut payload.messages, want) {
+            break;
+        }
+        // 无进展兜底：说明占位符与新裁点重合了、insert-back 抵消了减量。停。
+        if payload.messages.len() >= before_len {
             break;
         }
         result = convert_request_with_mode(payload, mode)?;
