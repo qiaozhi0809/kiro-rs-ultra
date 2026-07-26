@@ -175,6 +175,44 @@ impl CacheUsage {
         self.apply_multiplier_cap(total, input, creation, read)
     }
 
+    /// Anthropic 标准计费模式（互斥三桶口径，**不施加护栏**）。
+    ///
+    /// 语义：
+    /// - `cacheable = total × (cache_covered_est / prompt_total_est)`，按 prompt 结构占比推出
+    /// - `creation = cacheable × creation_ratio`
+    /// - `read0 = cacheable − creation`，经 R 挪桶：`read = read0 × R`，被砍部分推回 input
+    /// - `sum = input + creation + read ≡ total`
+    ///
+    /// 与 [`Self::split_against_total`] 唯一区别：不调用 [`Self::apply_multiplier_cap`]
+    /// （接受更高检测风险换 margin）。creation 与 R 正交：`creation_ratio` 定形状，
+    /// R 定 read↔input 挪桶比例，两者都不破坏 `sum == total`。
+    ///
+    /// 无缓存覆盖（`cache_covered_est == 0`）或基准缺失时，直接返回 `(total, 0, 0)`。
+    pub fn split_anthropic_standard(&self, total_real: i32) -> (i32, i32, i32) {
+        let total = total_real.max(0);
+        if self.cache_covered_est <= 0 || self.prompt_total_est <= 0 {
+            return (total, 0, 0);
+        }
+        // 按 prompt 结构比例算 cacheable 部分（与 split_against_total 同分母）。
+        let ratio = (self.cache_covered_est as f64 / self.prompt_total_est as f64).clamp(0.0, 1.0);
+        let cacheable = ((total as f64) * ratio).round() as i32;
+        let cacheable = cacheable.clamp(0, total);
+        // creation 由 creation_ratio 直接定形状（与 R 正交）。
+        let cr = self.creation_ratio.clamp(0.0, 1.0);
+        let creation = ((cacheable as f64) * cr).round() as i32;
+        let creation = creation.clamp(0, cacheable);
+        // read0 = cacheable − creation，再经 R 挪桶。
+        let read0 = cacheable - creation;
+        let r = self.read_ratio.clamp(0.0, 1.0);
+        let read = ((read0 as f64) * r).round() as i32;
+        let read = read.clamp(0, read0);
+        // 被 R 砍的 read 全推回 input（与 split_against_total 同语义）。
+        let input = total - creation - read;
+        // 恒等断言：任何未来改动破坏 sum==total 契约都在 debug/测试期炸出来。
+        debug_assert_eq!(input + creation + read, total);
+        (input, creation, read)
+    }
+
     /// multiplier 护栏（C）：`weighted/baseline` 超 `multiplier_cap` 时，把 input(1.0x) 闭式挪去
     /// read(0.1x) 压回上限，**不碰 creation**（creation=本轮真实新增，挪它=伪造暖轮 read → 因果违规）。
     ///
@@ -1169,6 +1207,91 @@ mod tests {
         let h1 = CacheUsage { creation_is_1h: true, ..Default::default() };
         assert_eq!(m5.creation_weight(), WEIGHT_CREATION, "5m 桶 = 1.25×");
         assert_eq!(h1.creation_weight(), WEIGHT_CREATION_1H, "1h 桶 = 2.0×");
+    }
+
+    // ---- Anthropic 标准计费模式（billing_mode + creation_ratio，不施加护栏）--------
+
+    #[test]
+    fn default_values_locked() {
+        let d = CacheUsage::default();
+        assert!(!d.billing_mode, "default billing_mode must be false — 零回归契约");
+        assert_eq!(d.creation_ratio, DEFAULT_CREATION_RATIO, "default creation_ratio must be DEFAULT_CREATION_RATIO");
+    }
+
+    #[test]
+    fn billing_mode_off_matches_split_against_total() {
+        // billing_mode=false 时 split_final 与 split_against_total 完全一致(零回归)。
+        let usage = CacheUsage {
+            cache_read: 400,
+            cache_covered_est: 500,
+            prompt_total_est: 1000,
+            read_ratio: 0.8,
+            multiplier_cap: DEFAULT_MULTIPLIER_CAP,
+            billing_mode: false,
+            creation_ratio: DEFAULT_CREATION_RATIO,
+            creation_is_1h: false,
+        };
+        let final_split = usage.split_final(1000);
+        let baseline = usage.split_against_total(1000);
+        assert_eq!(final_split, baseline);
+    }
+
+    #[test]
+    fn billing_mode_sum_equals_total() {
+        // billing_mode=true 时,input+creation+read 严格恒等 total(不超报)。
+        for r in [0.0_f64, 0.3, 0.5, 0.8, 1.0] {
+            for creation_ratio in [0.0_f64, 0.03, 0.1, 0.5] {
+                let usage = CacheUsage {
+                    cache_read: 350,
+                    cache_covered_est: 500,
+                    prompt_total_est: 1000,
+                    read_ratio: r,
+                    multiplier_cap: DEFAULT_MULTIPLIER_CAP,
+                    billing_mode: true,
+                    creation_ratio,
+                    creation_is_1h: false,
+                };
+                let (input, creation, read) = usage.split_final(1000);
+                assert_eq!(
+                    input + creation + read,
+                    1000,
+                    "sum 必须恒等 total (R={r} creation_ratio={creation_ratio}): got {input}+{creation}+{read}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn billing_mode_no_cap_when_r_low() {
+        // billing_mode=true 时,即便 multiplier_cap 收得很紧,也不触发护栏(护栏不生效)。
+        // R=0 → 全部 read 挪去 input → weighted/baseline 应比默认路径显著更高。
+        let usage_billing = CacheUsage {
+            cache_read: 400,
+            cache_covered_est: 500,
+            prompt_total_est: 1000,
+            read_ratio: 0.0,
+            multiplier_cap: 0.5, // 明显低于 1.0,若护栏生效则 input→read 会被压回
+            billing_mode: true,
+            creation_ratio: DEFAULT_CREATION_RATIO,
+            creation_is_1h: false,
+        };
+        let (input_b, _creation_b, read_b) = usage_billing.split_final(1000);
+
+        let usage_default = CacheUsage {
+            billing_mode: false,
+            ..usage_billing
+        };
+        let (input_d, _creation_d, read_d) = usage_default.split_final(1000);
+
+        // 默认路径的 input 被护栏压低(挪回 read),billing_mode 路径不受护栏
+        assert!(
+            input_b > input_d,
+            "billing_mode 不应被护栏压低 input: billing={input_b} default={input_d}"
+        );
+        assert!(
+            read_b < read_d,
+            "billing_mode 不应被护栏压回 read: billing={read_b} default={read_d}"
+        );
     }
 
     #[test]
