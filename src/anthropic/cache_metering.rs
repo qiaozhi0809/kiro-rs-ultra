@@ -73,6 +73,8 @@ pub const WEIGHT_READ: f64 = 0.1;
 /// multiplier 护栏默认上限。1.25 = 真实 Anthropic 暖缓存自然上限（round1 缓存写就是 1.25x），
 /// 默认不扭曲正常形状、仅兜底保证绝不越异常线；per-key 可收紧到 1.0 留足检测余量。
 pub const DEFAULT_MULTIPLIER_CAP: f64 = 1.25;
+/// 标准计费模式 creation 占比默认值（3%），对齐真实 Anthropic 稳态「每轮写一小段」。
+pub const DEFAULT_CREATION_RATIO: f64 = 0.03;
 
 /// `compute_cache_usage` 的结果：缓存计费量 + 比例分摊所需的 estimate 口径基准。
 ///
@@ -104,6 +106,14 @@ pub struct CacheUsage {
     /// multiplier 护栏上限 C（默认 [`DEFAULT_MULTIPLIER_CAP`]=1.25）：分摊后 `weighted/baseline`
     /// 超此值时把 input→read 压回（见 [`Self::apply_multiplier_cap`]），保证绝不越检测异常线。
     pub multiplier_cap: f64,
+    /// Anthropic 标准计费模式（默认 false）。开启后 `split_final` 走 `split_anthropic_standard`
+    /// 互斥三桶口径（sum 恒等 total，绝不超报），**不施加** `multiplier_cap` 护栏（接受更高检测
+    /// 风险换 margin）。默认关走现行 [`Self::split_against_total`]（零回归）。
+    pub billing_mode: bool,
+    /// 标准模式 creation 占比（默认 [`DEFAULT_CREATION_RATIO`]=0.03，仅 `billing_mode=true` 生效）：
+    /// `creation = cacheable × ratio`，定「每轮写多少缓存」的形状。与 `read_ratio` 正交，
+    /// 不破坏 sum==total。
+    pub creation_ratio: f64,
     /// 本轮 creation 是否记入 1h ephemeral 桶（默认 false=5m）。由入站 `cache_control.ttl` 决定，
     /// 仅影响护栏加权时 creation 的计价权重（5m=1.25× / 1h=2.0×），不改三桶 token 总数。
     pub creation_is_1h: bool,
@@ -111,7 +121,8 @@ pub struct CacheUsage {
 
 impl Default for CacheUsage {
     /// 默认 = 不模拟缓存 + 无阻尼 + 默认护栏：`prompt_total_est == 0` 使分摊全量计入 input；
-    /// `read_ratio=1.0` 不挪桶；`multiplier_cap=1.25` 兜底。
+    /// `read_ratio=1.0` 不挪桶；`multiplier_cap=1.25` 兜底；`billing_mode=false` 走现行
+    /// `split_against_total`（零回归），`creation_ratio` 仅在标准模式开启后才生效。
     fn default() -> Self {
         Self {
             cache_read: 0,
@@ -119,6 +130,8 @@ impl Default for CacheUsage {
             prompt_total_est: 0,
             read_ratio: 1.0,
             multiplier_cap: DEFAULT_MULTIPLIER_CAP,
+            billing_mode: false,
+            creation_ratio: DEFAULT_CREATION_RATIO,
             creation_is_1h: false,
         }
     }
