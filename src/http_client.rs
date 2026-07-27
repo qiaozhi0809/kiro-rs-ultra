@@ -36,6 +36,22 @@ pub fn resolve_http_timeouts() -> HttpTimeouts {
     }
 }
 
+/// 每账户(每 effective proxy)的 HTTP Client **分片数**。
+///
+/// 背景:单个 `reqwest::Client` 对同一上游 host 走 HTTP/2 时**只保持一条 TCP 连接**,把该账户
+/// 的所有并发请求 multiplex 到这一条连接上——单 hyper 连接任务串行处理所有流的帧、连接级流控
+/// 窗口被众流瓜分、单条 TCP 拥塞域队头阻塞,高并发下直接拖垮首字节延迟(TTFT)。把同账户的并发
+/// **摊到 N 个独立 Client(= N 条独立连接)** 即可复现"多进程各自一条连接"的并行度、根治该瓶颈。
+///
+/// 默认 4,可经 `KIRO_RS_HTTP_SHARDS` 覆盖,clamp 到 `1..=16`(1 = 关闭分片、回退旧行为)。
+pub fn http_shard_count() -> usize {
+    std::env::var("KIRO_RS_HTTP_SHARDS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(4)
+        .clamp(1, 16)
+}
+
 /// 代理配置
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct ProxyConfig {

@@ -8,11 +8,12 @@
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
-use crate::http_client::{ProxyConfig, build_client};
+use crate::http_client::{ProxyConfig, build_client, build_streaming_client, http_shard_count};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::error::UpstreamRateLimitError;
 use crate::kiro::machine_id;
@@ -35,13 +36,53 @@ const MAX_TOTAL_RETRIES: usize = 4;
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
 
+/// 一个账户（一个 effective proxy）的 HTTP Client **分片集**：N 个独立 `Client`，每个各自一条
+/// 到上游 host 的 HTTP/2 连接。`pick()` 按原子游标 round-robin 选一个,把同账户的并发请求摊到
+/// N 条独立连接上——复现"多进程各自一条连接"的并行度,根治单 H2 连接多路复用的首字节瓶颈。
+/// 见 [`crate::http_client::http_shard_count`]。
+struct ShardSet {
+    clients: Vec<Client>,
+    cursor: AtomicUsize,
+}
+
+impl ShardSet {
+    fn new(clients: Vec<Client>) -> Self {
+        debug_assert!(!clients.is_empty(), "ShardSet 至少要有一个 client");
+        Self {
+            clients,
+            cursor: AtomicUsize::new(0),
+        }
+    }
+
+    /// round-robin 取一个 client(clone 廉价,内部是 Arc)。
+    fn pick(&self) -> Client {
+        let n = self.clients.len().max(1);
+        let i = self.cursor.fetch_add(1, Ordering::Relaxed) % n;
+        self.clients[i].clone()
+    }
+}
+
+/// 构建 N 个分片 client(`build` 为单个 client 的构造闭包),组装成 [`ShardSet`]。
+fn build_shard_set<F>(mut build: F) -> anyhow::Result<ShardSet>
+where
+    F: FnMut() -> anyhow::Result<Client>,
+{
+    let n = http_shard_count();
+    let mut clients = Vec::with_capacity(n);
+    for _ in 0..n {
+        clients.push(build()?);
+    }
+    Ok(ShardSet::new(clients))
+}
+
 /// 带容量上限的 HTTP Client 缓存。
 ///
 /// - key 为 effective proxy 配置（None = 直连/全局回退）
+/// - value 为该账户的 [`ShardSet`](N 个独立 Client, round-robin 摊连接)
 /// - 受保护 key（全局代理对应的 effective 配置）永不被淘汰
 /// - 超出容量时按插入顺序淘汰最旧的「非受保护」条目
 struct ClientCache {
-    map: HashMap<Option<ProxyConfig>, Client>,
+    map: HashMap<Option<ProxyConfig>, ShardSet>,
     /// 插入顺序（仅记录可淘汰的非受保护 key）
     order: std::collections::VecDeque<Option<ProxyConfig>>,
     /// 受保护、不参与淘汰的 key（全局代理）
@@ -50,7 +91,7 @@ struct ClientCache {
 }
 
 impl ClientCache {
-    fn new(protected: Option<ProxyConfig>, initial: Client, cap: usize) -> Self {
+    fn new(protected: Option<ProxyConfig>, initial: ShardSet, cap: usize) -> Self {
         let mut map = HashMap::new();
         map.insert(protected.clone(), initial);
         Self {
@@ -61,14 +102,15 @@ impl ClientCache {
         }
     }
 
+    /// round-robin 取该 key 分片集里的一个 client。
     fn get(&self, key: &Option<ProxyConfig>) -> Option<Client> {
-        self.map.get(key).cloned()
+        self.map.get(key).map(|s| s.pick())
     }
 
-    /// 插入新条目，必要时淘汰最旧的非受保护条目
-    fn insert(&mut self, key: Option<ProxyConfig>, client: Client) {
+    /// 插入新分片集,必要时淘汰最旧的非受保护条目
+    fn insert(&mut self, key: Option<ProxyConfig>, shard: ShardSet) {
         if key == self.protected || self.map.contains_key(&key) {
-            self.map.insert(key, client);
+            self.map.insert(key, shard);
             return;
         }
         while self.order.len() >= self.cap {
@@ -79,7 +121,7 @@ impl ClientCache {
             }
         }
         self.order.push_back(key.clone());
-        self.map.insert(key, client);
+        self.map.insert(key, shard);
     }
 }
 
@@ -103,10 +145,13 @@ pub struct KiroProvider {
     token_manager: Arc<MultiTokenManager>,
     /// 全局代理配置（用于凭据无自定义代理时的回退）
     global_proxy: Option<ProxyConfig>,
-    /// Client 缓存：key = effective proxy config, value = reqwest::Client
-    /// 不同代理配置的凭据使用不同的 Client，共享相同代理的凭据复用 Client。
+    /// 非流式 Client 缓存：key = effective proxy config, value = ShardSet(N 条独立 H2 连接)
+    /// 不同代理配置的凭据使用不同的 Client,共享相同代理的凭据复用 Client。
     /// 带容量上限淘汰（全局代理 client 常驻），避免代理数量增长导致内存无界增长。
     client_cache: Mutex<ClientCache>,
+    /// 流式专用 Client 缓存(同结构,用 build_streaming_client 构建,H2 keepalive 保活)。
+    /// 流式路径独立分片,与非流式解耦——同一 credential 的流式和非流式请求走不同的 H2 连接组。
+    streaming_client_cache: Mutex<ClientCache>,
     /// TLS 后端配置
     tls_backend: TlsBackend,
     /// 端点实现注册表（key: endpoint 名称）
@@ -139,30 +184,55 @@ impl KiroProvider {
             default_endpoint
         );
         let tls_backend = token_manager.config().tls_backend;
-        // 预热：构建全局代理对应的 Client（作为受保护的常驻条目）
-        let initial_client = build_client(proxy.as_ref(), 720, tls_backend)
+        // 预热:构建全局代理对应的分片集(N 条独立 H2 连接,作为受保护的常驻条目)。
+        let initial_shard = build_shard_set(|| build_client(proxy.as_ref(), 720, tls_backend))
             .expect("创建 HTTP 客户端失败");
-        let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
+        let client_cache = ClientCache::new(proxy.clone(), initial_shard, CLIENT_CACHE_CAP);
+        // 流式专用分片集同样预热全局代理条目。
+        let initial_streaming_shard =
+            build_shard_set(|| build_streaming_client(proxy.as_ref(), 720, tls_backend))
+                .expect("创建流式 HTTP 客户端失败");
+        let streaming_client_cache =
+            ClientCache::new(proxy.clone(), initial_streaming_shard, CLIENT_CACHE_CAP);
 
         Self {
             token_manager,
             global_proxy: proxy,
             client_cache: Mutex::new(client_cache),
+            streaming_client_cache: Mutex::new(streaming_client_cache),
             tls_backend,
             endpoints,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
         }
     }
 
-    /// 根据凭据的代理配置获取（或创建并缓存）对应的 reqwest::Client
+    /// 根据凭据的代理配置获取（或创建并缓存）对应的**非流式** reqwest::Client。
+    /// 返回的 Client 是从该账户 ShardSet 里 round-robin 取的一个,同账户并发会摊到 N 条独立连接。
     fn client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
         let effective = credentials.effective_proxy(self.global_proxy.as_ref());
         let mut cache = self.client_cache.lock();
         if let Some(client) = cache.get(&effective) {
             return Ok(client);
         }
-        let client = build_client(effective.as_ref(), 720, self.tls_backend)?;
-        cache.insert(effective, client.clone());
+        let shard = build_shard_set(|| build_client(effective.as_ref(), 720, self.tls_backend))?;
+        let client = shard.pick();
+        cache.insert(effective, shard);
+        Ok(client)
+    }
+
+    /// 根据凭据的代理配置获取（或创建并缓存）对应的**流式** reqwest::Client。
+    /// 走 [`build_streaming_client`](H2 keepalive 保活),从独立的 streaming_client_cache 分片集取。
+    /// 与 [`Self::client_for`] 使用完全独立的 H2 连接组,防止流式长时间占用连接影响非流式辅助请求。
+    fn streaming_client_for(&self, credentials: &KiroCredentials) -> anyhow::Result<Client> {
+        let effective = credentials.effective_proxy(self.global_proxy.as_ref());
+        let mut cache = self.streaming_client_cache.lock();
+        if let Some(client) = cache.get(&effective) {
+            return Ok(client);
+        }
+        let shard =
+            build_shard_set(|| build_streaming_client(effective.as_ref(), 720, self.tls_backend))?;
+        let client = shard.pick();
+        cache.insert(effective, shard);
         Ok(client)
     }
 
@@ -608,8 +678,12 @@ impl KiroProvider {
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
 
-            let base = self
-                .client_for(&ctx.credentials)?
+            let base_client = if is_stream {
+                self.streaming_client_for(&ctx.credentials)?
+            } else {
+                self.client_for(&ctx.credentials)?
+            };
+            let base = base_client
                 .post(&url)
                 .body(body)
                 .header("content-type", endpoint.content_type());
@@ -622,7 +696,12 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
-            let response = match self.client_for(&ctx.credentials)?.execute(request).await {
+            let http_client = if is_stream {
+                self.streaming_client_for(&ctx.credentials)?
+            } else {
+                self.client_for(&ctx.credentials)?
+            };
+            let response = match http_client.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
                     tracing::warn!(
@@ -707,8 +786,12 @@ impl KiroProvider {
                     };
                     let fb_url = fallback.api_url(&fb_rctx);
                     let fb_body = fallback.transform_api_body(request_body, &fb_rctx);
-                    let fb_base = self
-                        .client_for(&ctx.credentials)?
+                    let fb_base_client = if is_stream {
+                        self.streaming_client_for(&ctx.credentials)?
+                    } else {
+                        self.client_for(&ctx.credentials)?
+                    };
+                    let fb_base = fb_base_client
                         .post(&fb_url)
                         .body(fb_body)
                         .header("content-type", fallback.content_type());
@@ -717,7 +800,12 @@ impl KiroProvider {
                         .build()
                         .map_err(|e| anyhow::anyhow!("构建降级请求失败: {}", e))?;
 
-                    match self.client_for(&ctx.credentials)?.execute(fb_request).await {
+                    let fb_client = if is_stream {
+                        self.streaming_client_for(&ctx.credentials)?
+                    } else {
+                        self.client_for(&ctx.credentials)?
+                    };
+                    match fb_client.execute(fb_request).await {
                         Ok(fb_resp) if fb_resp.status().is_success() => {
                             Self::emit_attempt(
                                 sink, attempt, ctx.id, fb_name, Some(fb_resp.status().as_u16()),
@@ -1078,5 +1166,50 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ShardSet::pick 严格 round-robin 轮询 N 个 client(游标取模),保证并发被均匀摊到各分片。
+    #[test]
+    fn shard_set_round_robins() {
+        let mk = || build_client(None, 30, TlsBackend::Rustls).unwrap();
+        let shard = ShardSet::new(vec![mk(), mk(), mk()]);
+        // 连续 pick 的游标序列应为 0,1,2,0,1,2... 用 cursor 前后差验证严格递增取模。
+        let start = shard.cursor.load(Ordering::Relaxed);
+        for _ in 0..7 {
+            let _ = shard.pick();
+        }
+        let end = shard.cursor.load(Ordering::Relaxed);
+        assert_eq!(end - start, 7, "每次 pick 游标 +1(round-robin 依据)");
+        // 单分片集也能正常工作(关闭分片 = 退化为单 client)。
+        let one = ShardSet::new(vec![mk()]);
+        let _ = one.pick();
+        let _ = one.pick();
+    }
+
+    /// http_shard_count env var 覆盖 + clamp 边界。
+    #[test]
+    fn shard_count_default_and_clamp() {
+        // SAFETY: 测试进程内串行读写 env; 每个 case 独立。
+        // 默认(未设 env)= 4。
+        // SAFETY: env mutation in tests is allowed on this crate/toolchain.
+        unsafe { std::env::remove_var("KIRO_RS_HTTP_SHARDS"); }
+        assert_eq!(http_shard_count(), 4);
+        unsafe { std::env::set_var("KIRO_RS_HTTP_SHARDS", "8"); }
+        assert_eq!(http_shard_count(), 8);
+        // clamp 上限 16。
+        unsafe { std::env::set_var("KIRO_RS_HTTP_SHARDS", "100"); }
+        assert_eq!(http_shard_count(), 16);
+        // clamp 下限 1(0 也是 1)。
+        unsafe { std::env::set_var("KIRO_RS_HTTP_SHARDS", "0"); }
+        assert_eq!(http_shard_count(), 1);
+        // 非法值 → 默认 4。
+        unsafe { std::env::set_var("KIRO_RS_HTTP_SHARDS", "not_a_number"); }
+        assert_eq!(http_shard_count(), 4);
+        unsafe { std::env::remove_var("KIRO_RS_HTTP_SHARDS"); }
     }
 }
